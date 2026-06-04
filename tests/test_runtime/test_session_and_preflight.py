@@ -14,8 +14,13 @@ from src.runtime.session_factory import create_mitkii_session
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "repo_map_sample"
 
 
-def test_background_build_completes() -> None:
-    service = RepoMapService(FIXTURE, enabled=True, top_k=20)
+def test_background_build_completes(tmp_path: Path) -> None:
+    service = RepoMapService(
+        FIXTURE,
+        enabled=True,
+        top_k=20,
+        cache_path=tmp_path / "symbols.db",
+    )
     service.start_background_build()
     assert service.wait_until_ready(timeout=30.0)
     assert service.build_state == BuildState.READY

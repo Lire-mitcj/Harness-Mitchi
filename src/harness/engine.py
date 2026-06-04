@@ -89,14 +89,8 @@ class HarnessEngine:
         error_trace: list[str],
     ) -> tuple[list[dict[str, Any]], ContextPipelineResult]:
         """Unified context pipeline: digest compact/fold, then probe trim."""
-        import asyncio
-
-        def _prepare() -> tuple[ContextPipelineResult, list[dict[str, Any]]]:
-            cp = session.prepare_before_llm(messages, error_trace)
-            msg_dicts = [m.to_dict() for m in cp.messages]
-            return cp, msg_dicts
-
-        cp, msg_dicts = await asyncio.to_thread(_prepare)
+        cp = session.prepare_before_llm(messages, error_trace)
+        msg_dicts = [m.to_dict() for m in cp.messages]
         if cp.token_est is not None and cp.token_est <= self.probe.budget:
             return msg_dicts, cp
         trimmed = await self.probe.before_call(msg_dicts)

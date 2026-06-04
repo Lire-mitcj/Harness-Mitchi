@@ -49,21 +49,21 @@ def test_post_tool_recovery_splice_anchor_failure_nudge() -> None:
     assert runtime.edit_read_fallback is False
 
 
-def test_post_tool_recovery_duplicate_diagnose_forces_summary_only() -> None:
+def test_post_tool_recovery_duplicate_diagnose_disables_context_search() -> None:
     subtask = SubTaskNode(id="st-1", kind=SubTaskKind.DIAGNOSE, description="find")
     runtime = ExecutorRuntimeState(
         paths_only_mode=False,
         use_paths_only=False,
         preloaded_paths=frozenset(),
         truncated_paths=frozenset(),
-        active_runtime_tools=frozenset({"grep_search", "map_search"}),
+        active_runtime_tools=frozenset({"context_search"}),
         explore_restricted=False,
     )
 
     recovery = apply_post_tool_recovery(
         subtask=subtask,
         runtime=runtime,
-        error_trace=["Blocked duplicate grep_search in diagnose: 'x' in main.py."],
+        error_trace=["Blocked duplicate context_search in diagnose: 'x'."],
         splice_edit=False,
     )
 

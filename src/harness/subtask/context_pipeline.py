@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from src.agent.types import Message
 from src.executor.policy import resolve_executor_tools
@@ -24,6 +25,7 @@ class ExecutorContextConfig:
     whitelist_norm: frozenset[str]
     diag_handoff: bool
     compact_token_threshold: int
+    context_pack: Any | None = None
 
 
 @dataclass
@@ -195,7 +197,7 @@ class ExecutorContextSession:
                 self._apply_paths_only()
                 folded = self._rebuild_after_fold(
                     error_trace,
-                    compact_reason="after read/grep",
+                    compact_reason="after tool evidence",
                 )
                 if folded != messages:
                     out_messages = folded
@@ -204,7 +206,7 @@ class ExecutorContextSession:
                     events.append(
                         ContextPipelineEvent(
                             kind="fold",
-                            content="folded read/grep/map into session summary",
+                            content="folded tool evidence into session summary",
                         )
                     )
 
@@ -283,6 +285,7 @@ class ExecutorContextSession:
             policy=self.config.policy,
             preload_mode="paths_only",
             runtime_tools=self.runtime.active_runtime_tools,
+            context_pack=self.config.context_pack,
         )
         self._paths_only_scope_cache = msg
         self._paths_only_scope_key = tools_key
@@ -319,6 +322,7 @@ class ExecutorContextSession:
             prior_summaries=self.config.prior_summaries,
             preload_mode=preload_mode,
             runtime_tools=self.runtime.active_runtime_tools,
+            context_pack=self.config.context_pack,
         )
         self._base_cache_key_stored = key
         self._base_messages_cache = msgs

@@ -10,11 +10,11 @@ def test_edit_with_preload_only_write_tools() -> None:
         id="st-1",
         kind=SubTaskKind.EDIT,
         description="fix main.py",
-        allowed_tools=["read_file", "edit_file", "write_file", "grep_search"],
+        allowed_tools=["context_search", "edit_file", "write_file"],
         context_files=["main.py"],
     )
     tools = resolve_executor_tools(subtask, preloaded_paths=frozenset({"main.py"}))
-    assert tools == frozenset({"edit_file", "write_file", "map_search"})
+    assert tools == frozenset({"edit_file", "write_file", "context_search"})
     assert "grep_search" not in tools
     assert "read_file" not in tools
 
@@ -24,7 +24,7 @@ def test_edit_paths_only_mode_allows_grep_and_read() -> None:
         id="st-2",
         kind=SubTaskKind.EDIT,
         description="fix",
-        allowed_tools=["read_file", "edit_file", "write_file"],
+        allowed_tools=["context_search", "edit_file", "write_file"],
         context_files=["main.py"],
     )
     tools = resolve_executor_tools(
@@ -32,20 +32,19 @@ def test_edit_paths_only_mode_allows_grep_and_read() -> None:
         preloaded_paths=frozenset(),
         truncated_paths=frozenset({"main.py"}),
     )
-    assert "grep_search" in tools
-    assert "map_search" in tools
-    assert "read_file" in tools
-    assert "read_files" in tools
+    assert "context_search" in tools
+    assert "grep_search" not in tools
+    assert "read_file" not in tools
     assert "edit_file" in tools
 
 
-def test_edit_scoped_explore_granted_without_planner_grep() -> None:
-    """Planner often omits grep_search on edit — Harness still grants scoped explore."""
+def test_edit_scoped_explore_grants_context_search() -> None:
+    """Harness grants context_search for scoped edit discovery."""
     subtask = SubTaskNode(
         id="st-2",
         kind=SubTaskKind.EDIT,
         description="fix sql",
-        allowed_tools=["read_file", "edit_file", "write_file"],
+        allowed_tools=["edit_file", "write_file"],
         context_files=["app.py", "main.py"],
     )
     tools = resolve_executor_tools(
@@ -53,9 +52,8 @@ def test_edit_scoped_explore_granted_without_planner_grep() -> None:
         preloaded_paths=frozenset(),
         truncated_paths=frozenset({"app.py", "main.py"}),
     )
-    assert "grep_search" in tools
-    assert "map_search" in tools
-    assert "read_files" in tools
+    assert "context_search" in tools
+    assert "read_files" not in tools
 
 
 def test_edit_truncated_preload_keeps_grep_and_read() -> None:
@@ -63,7 +61,7 @@ def test_edit_truncated_preload_keeps_grep_and_read() -> None:
         id="st-2",
         kind=SubTaskKind.EDIT,
         description="fix main.py",
-        allowed_tools=["read_file", "edit_file", "write_file", "grep_search"],
+        allowed_tools=["context_search", "edit_file", "write_file"],
         context_files=["main.py", "app.py"],
     )
     tools = resolve_executor_tools(
@@ -74,10 +72,7 @@ def test_edit_truncated_preload_keeps_grep_and_read() -> None:
     assert tools == frozenset({
         "edit_file",
         "write_file",
-        "grep_search",
-        "map_search",
-        "read_file",
-        "read_files",
+        "context_search",
     })
 
 
@@ -86,25 +81,24 @@ def test_edit_without_preload_keeps_read_grep() -> None:
         id="st-1",
         kind=SubTaskKind.EDIT,
         description="fix",
-        allowed_tools=["read_file", "edit_file", "grep_search"],
+        allowed_tools=["edit_file"],
     )
     tools = resolve_executor_tools(subtask, preloaded_paths=frozenset())
-    assert "grep_search" in tools
-    assert "map_search" in tools
-    assert "read_file" in tools
+    assert "context_search" in tools
+    assert "read_file" not in tools
 
 
-def test_diagnose_grants_map_search_even_when_planner_omits() -> None:
+def test_diagnose_grants_context_search_even_when_planner_omits() -> None:
     subtask = SubTaskNode(
         id="st-1",
         kind=SubTaskKind.DIAGNOSE,
         description="find view",
-        allowed_tools=["grep_search", "glob_files"],
+        allowed_tools=[],
         context_files=[],
     )
     tools = resolve_executor_tools(subtask, preloaded_paths=frozenset())
-    assert "map_search" in tools
-    assert "grep_search" in tools
+    assert "context_search" in tools
+    assert "map_search" not in tools
 
 
 def test_edit_splice_mode_tools() -> None:
@@ -112,7 +106,7 @@ def test_edit_splice_mode_tools() -> None:
         id="st-2",
         kind=SubTaskKind.EDIT,
         description="fix",
-        allowed_tools=["read_file", "edit_file"],
+        allowed_tools=["context_search", "edit_file"],
         context_files=["app.py"],
     )
     tools = resolve_executor_tools(
@@ -129,7 +123,7 @@ def test_edit_read_fallback_grants_read_on_full_preload() -> None:
         id="st-2",
         kind=SubTaskKind.EDIT,
         description="fix",
-        allowed_tools=["read_file", "edit_file"],
+        allowed_tools=["context_search", "edit_file"],
         context_files=["app.py"],
     )
     tools = resolve_executor_tools(
@@ -145,7 +139,7 @@ def test_edit_restrict_explore_with_preload_is_write_only() -> None:
         id="st-2",
         kind=SubTaskKind.EDIT,
         description="switch query to view",
-        allowed_tools=["read_file", "edit_file", "grep_search"],
+        allowed_tools=["context_search", "edit_file"],
         context_files=["app.py", "db/init/init.sql"],
     )
     tools = resolve_executor_tools(
@@ -161,7 +155,7 @@ def test_verify_with_preload_shell_only() -> None:
         id="st-2",
         kind=SubTaskKind.VERIFY,
         description="run test",
-        allowed_tools=["shell_exec", "read_file", "grep_search"],
+        allowed_tools=["shell_exec", "context_search"],
         context_files=["test_api.py"],
     )
     tools = resolve_executor_tools(subtask, preloaded_paths=frozenset({"test_api.py"}))
@@ -173,15 +167,12 @@ def test_verify_without_preload_can_use_read_grep_map() -> None:
         id="st-3",
         kind=SubTaskKind.VERIFY,
         description="inspect and run tests",
-        allowed_tools=["shell_exec", "read_file", "read_files", "grep_search", "map_search"],
+        allowed_tools=["shell_exec", "context_search"],
     )
     tools = resolve_executor_tools(subtask, preloaded_paths=frozenset())
     assert tools == frozenset({
         "shell_exec",
-        "read_file",
-        "read_files",
-        "grep_search",
-        "map_search",
+        "context_search",
     })
 
 
@@ -190,7 +181,7 @@ def test_coordinate_handoff_restricts_non_edit_explore_tools() -> None:
         id="st-3",
         kind=SubTaskKind.SHELL,
         description="run focused command",
-        allowed_tools=["shell_exec", "read_file", "read_files", "grep_search", "map_search", "list_dir"],
+        allowed_tools=["shell_exec", "context_search"],
     )
     tools = resolve_executor_tools(
         subtask,
@@ -205,7 +196,7 @@ def test_coordinate_handoff_restricts_diagnose_explore_tools() -> None:
         id="st-2",
         kind=SubTaskKind.DIAGNOSE,
         description="check cited target",
-        allowed_tools=["read_file", "read_files", "grep_search", "map_search"],
+        allowed_tools=["context_search"],
     )
     tools = resolve_executor_tools(
         subtask,

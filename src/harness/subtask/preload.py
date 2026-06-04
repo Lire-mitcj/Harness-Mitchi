@@ -130,7 +130,7 @@ def load_context_file_contents(
         elif len(text) > policy.max_chars_per_file:
             text = (
                 text[: policy.max_chars_per_file]
-                + "\n[truncated — use grep_search on this path for full content]"
+                + "\n[truncated — use context_search on this path for bounded evidence]"
             )
 
         loaded.append((rel, text))

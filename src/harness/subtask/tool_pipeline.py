@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,6 +55,28 @@ from src.tools.base import ToolResult
 from src.tools.registry import ToolRegistry
 
 EDIT_TOOLS = frozenset({"edit_file", "write_file", "delete_file", "replace_symbol"})
+PARALLEL_READ_ONLY_TOOLS = frozenset({
+    "context_search",
+    "read_file",
+    "read_files",
+    "grep_search",
+    "map_search",
+    "glob_files",
+    "list_dir",
+    "git_status",
+})
+
+
+@dataclass
+class _PreparedToolCall:
+    tc: ToolCall
+    call_args: dict
+
+
+@dataclass
+class _ToolExecutionResult:
+    prepared: _PreparedToolCall
+    result: ToolResult
 
 
 @dataclass
@@ -151,6 +174,16 @@ class ExecutorToolPipeline:
     ) -> AsyncIterator[AgentEvent]:
         stats = ToolRoundStats()
         if not response.tool_calls:
+            return
+
+        if _can_parallelize_tool_round(response.tool_calls):
+            async for event in self._process_parallel_read_only_calls(
+                response.tool_calls,
+                ctx,
+                stats,
+            ):
+                yield event
+            ctx.round_stats = stats
             return
 
         whitelist = ctx.whitelist_files
@@ -267,6 +300,101 @@ class ExecutorToolPipeline:
             yield tool_result_event(tc.name, content, success=result.success, phase="executor")
 
         ctx.round_stats = stats
+
+    async def _process_parallel_read_only_calls(
+        self,
+        tool_calls: list[ToolCall],
+        ctx: ToolPipelineContext,
+        stats: ToolRoundStats,
+    ) -> AsyncIterator[AgentEvent]:
+        """Run one all-read-only tool round concurrently, preserving message order."""
+        whitelist = ctx.whitelist_files
+        truncated = ctx.truncated_paths
+        allowed_read_paths = frozenset(_norm_rel_path(p) for p in whitelist)
+        prepared: list[_PreparedToolCall] = []
+
+        for tc in tool_calls:
+            yield tool_call_event(tc.name, tc.arguments, phase="executor")
+
+            if tc.name not in ctx.runtime_tools:
+                deny = _tool_denial_for_context(tc.name, ctx)
+                ctx.error_trace.append(deny)
+                ctx.messages.append(tool_message(tc.id, deny))
+                ctx.tool_failures[0] += 1
+                yield tool_result_event(tc.name, deny, success=False, phase="executor")
+                continue
+
+            if tc.name in EXPLORE_TOOLS:
+                stats.explore_used = True
+
+            deny = self._pre_execute_guards(tc, ctx, allowed_read_paths, truncated, whitelist)
+            if deny is not None:
+                content, success = deny
+                ctx.messages.append(tool_message(tc.id, content))
+                yield tool_result_event(tc.name, content, success=success, phase="executor")
+                if not success:
+                    ctx.tool_failures[0] += 1
+                elif tc.name in EXPLORE_TOOLS:
+                    stats.explore_ok = True
+                continue
+
+            call_args = self._normalize_call_args(tc, ctx)
+            cached = self._serve_explore_cache(tc, call_args, ctx)
+            if cached is not None:
+                ctx.memory.cache_hits += 1
+                duplicate = _duplicate_explore_denial(tc.name, call_args, ctx)
+                content = duplicate or cached
+                success = duplicate is None
+                if duplicate:
+                    ctx.error_trace.append(duplicate)
+                    ctx.tool_failures[0] += 1
+                ctx.messages.append(tool_message(tc.id, content))
+                yield tool_result_event(tc.name, content, success=success, phase="executor")
+                if success and tc.name in EXPLORE_TOOLS:
+                    stats.explore_ok = True
+                continue
+
+            tool = self.tools.get(tc.name)
+            if tool is not None:
+                check = self.permissions.check(tc.name, tool.risk_level)
+                if not check.allowed:
+                    deny = f"Tool '{tc.name}' was denied by policy."
+                    ctx.error_trace.append(deny)
+                    ctx.tool_failures[0] += 1
+                    ctx.messages.append(tool_message(tc.id, deny))
+                    yield tool_result_event(tc.name, deny, success=False, phase="executor")
+                    continue
+
+            prepared.append(_PreparedToolCall(tc=tc, call_args=call_args))
+
+        if not prepared:
+            return
+
+        results = await asyncio.gather(
+            *[
+                self._execute_read_only_tool(prepared_call, ctx)
+                for prepared_call in prepared
+            ]
+        )
+        for item in results:
+            tc = item.prepared.tc
+            result = self._after_execute(tc, item.prepared.call_args, item.result, ctx)
+            content = result.output if result.success else f"Error: {result.error}"
+            if result.success and tc.name in EXPLORE_TOOLS:
+                stats.explore_ok = True
+            if not result.success and result.error:
+                ctx.error_trace.append(f"{tc.name}: {result.error}")
+                ctx.tool_failures[0] += 1
+            ctx.messages.append(tool_message(tc.id, content))
+            yield tool_result_event(tc.name, content, success=result.success, phase="executor")
+
+    async def _execute_read_only_tool(
+        self,
+        prepared: _PreparedToolCall,
+        ctx: ToolPipelineContext,
+    ) -> _ToolExecutionResult:
+        result = await self.tools.call(prepared.tc.name, prepared.call_args)
+        return _ToolExecutionResult(prepared=prepared, result=result)
 
     def last_round_stats(self, ctx: ToolPipelineContext) -> ToolRoundStats:
         return ctx.round_stats
@@ -469,6 +597,26 @@ class ExecutorToolPipeline:
                 ctx.error_trace.append(msg)
                 return msg, False
 
+        if tc.name == "context_search":
+            raw_paths = [
+                p for p in (tc.arguments.get("paths") or []) if isinstance(p, str)
+            ]
+            if raw_paths:
+                blocked = [
+                    p
+                    for p in raw_paths
+                    if not is_path_allowed(project_root, p, whitelist)
+                ]
+                if blocked:
+                    msg = format_whitelist_denial(
+                        tc.name,
+                        blocked,
+                        whitelist,
+                        project_root=project_root,
+                    )
+                    ctx.error_trace.append(msg)
+                    return msg, False
+
         if tc.name == "shell_exec":
             command = tc.arguments.get("command")
             if isinstance(command, str):
@@ -563,6 +711,12 @@ def build_tool_pipeline_context(
     )
 
 
+def _can_parallelize_tool_round(tool_calls: list[ToolCall]) -> bool:
+    return len(tool_calls) > 1 and all(
+        tc.name in PARALLEL_READ_ONLY_TOOLS for tc in tool_calls
+    )
+
+
 def _norm_rel_path(path: str) -> str:
     return path.replace("\\", "/").lstrip("./")
 
@@ -570,9 +724,9 @@ def _norm_rel_path(path: str) -> str:
 def _tool_denial_for_context(tool_name: str, ctx: ToolPipelineContext) -> str:
     if ctx.subtask.kind == SubTaskKind.DIAGNOSE and not ctx.runtime_tools:
         return (
-            f"Tool '{tool_name}' is disabled: diagnose exploration budget is used "
-            "or prior coordinates were already preloaded. Summarize from the "
-            "session/preloaded context now; do not call more tools."
+            f"Tool '{tool_name}' is disabled: diagnose context is Harness-owned. "
+            "Use the context_search handoff or preloaded evidence; do not call "
+            "raw exploration tools."
         )
     if not ctx.runtime_tools:
         return (
@@ -589,18 +743,10 @@ def _duplicate_explore_denial(
 ) -> str | None:
     if ctx.subtask.kind != SubTaskKind.DIAGNOSE:
         return None
-    if tool_name == "grep_search":
-        pattern = args.get("pattern") or args.get("query") or ""
-        scope = args.get("path") or args.get("include") or args.get("glob") or "*"
-        return (
-            f"Blocked duplicate grep_search in diagnose: {pattern!r} in {scope}. "
-            "Do not repeat equivalent searches. Summarize findings from the "
-            "session summary and tool outputs now."
-        )
-    if tool_name == "map_search":
+    if tool_name == "context_search":
         query = args.get("query") or ""
         return (
-            f"Blocked duplicate map_search in diagnose: {query!r}. "
+            f"Blocked duplicate context_search in diagnose: {query!r}. "
             "Do not repeat equivalent searches. Summarize findings now."
         )
     return None

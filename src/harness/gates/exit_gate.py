@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
+from src.executor.final_output import parse_executor_final
 from src.harness.gates.types import GateResult
 from src.planner.task_tree import SubTaskKind, SubTaskNode
 
@@ -68,6 +70,7 @@ class ExitCheckInput:
     changed_files: list[str]
     turns_used: int = 0
     tool_failure_count: int = 0
+    final_data: dict[str, Any] | None = None
 
 
 def validate_exit(data: ExitCheckInput) -> GateResult:
@@ -76,6 +79,11 @@ def validate_exit(data: ExitCheckInput) -> GateResult:
     warns: list[str] = []
     kind = data.subtask.kind
     message = (data.final_message or "").strip()
+    structured = parse_executor_final(message)
+    if structured is None and data.final_data:
+        import json
+
+        structured = parse_executor_final(json.dumps(data.final_data, ensure_ascii=False))
 
     if not message:
         blocks.append("Executor finished with an empty final answer.")
@@ -111,7 +119,16 @@ def validate_exit(data: ExitCheckInput) -> GateResult:
     if data.error_trace and kind == SubTaskKind.EDIT and not data.changed_files:
         blocks.append("Unresolved tool errors and no successful file edits.")
 
-    if kind == SubTaskKind.DIAGNOSE and message and diagnose_acceptance_unmet(message):
+    if (
+        kind == SubTaskKind.DIAGNOSE
+        and structured is not None
+        and structured.acceptance_met is False
+    ):
+        blocks.append(
+            "Diagnose summary indicates acceptance_criteria was not met — "
+            "revise the plan or search strategy before edit."
+        )
+    elif kind == SubTaskKind.DIAGNOSE and message and diagnose_acceptance_unmet(message):
         blocks.append(
             "Diagnose summary indicates acceptance_criteria was not met — "
             "revise the plan or search strategy before edit."
@@ -120,6 +137,7 @@ def validate_exit(data: ExitCheckInput) -> GateResult:
         missing = diagnose_missing_required_outputs(
             data.subtask.acceptance_criteria,
             message,
+            final_data=structured.raw if structured is not None else data.final_data,
         )
         if missing:
             blocks.append(
@@ -142,15 +160,48 @@ def diagnose_acceptance_unmet(message: str) -> bool:
     return any(phrase in lower for phrase in _ACCEPTANCE_FAILURE_PHRASES)
 
 
-def diagnose_missing_required_outputs(criteria: str, message: str) -> list[str]:
+def diagnose_missing_required_outputs(
+    criteria: str,
+    message: str,
+    *,
+    final_data: dict[str, Any] | None = None,
+) -> list[str]:
     missing: list[str] = []
-    if _REQ_FILE_LINE.search(criteria) and not _HAS_FILE_LINE.search(message):
+    has_file_line, has_symbol, has_snippet = _structured_evidence_flags(final_data)
+    if _REQ_FILE_LINE.search(criteria) and not (has_file_line or _HAS_FILE_LINE.search(message)):
         missing.append("file:line")
-    if _REQ_SYMBOL.search(criteria) and not _HAS_SYMBOL.search(message):
+    if _REQ_SYMBOL.search(criteria) and not (has_symbol or _HAS_SYMBOL.search(message)):
         missing.append("symbol")
-    if _REQ_SNIPPET.search(criteria) and not _HAS_SNIPPET.search(message):
+    if _REQ_SNIPPET.search(criteria) and not (has_snippet or _HAS_SNIPPET.search(message)):
         missing.append("snippet/decision")
     return missing
+
+
+def _structured_evidence_flags(final_data: dict[str, Any] | None) -> tuple[bool, bool, bool]:
+    if not isinstance(final_data, dict):
+        return False, False, False
+    evidence = final_data.get("evidence")
+    if not isinstance(evidence, list):
+        return False, False, False
+    has_file_line = False
+    has_symbol = False
+    has_snippet = False
+    for item in evidence:
+        if isinstance(item, str):
+            has_snippet = has_snippet or bool(item.strip())
+            continue
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path") or item.get("file")
+        line = item.get("line") or item.get("line_range") or item.get("lines")
+        location = item.get("location")
+        if (path and line) or (isinstance(location, str) and _HAS_FILE_LINE.search(location)):
+            has_file_line = True
+        if item.get("symbol"):
+            has_symbol = True
+        if item.get("snippet") or item.get("decision") or item.get("reason"):
+            has_snippet = True
+    return has_file_line, has_symbol, has_snippet
 
 
 def _message_acknowledges_failure(message: str) -> bool:

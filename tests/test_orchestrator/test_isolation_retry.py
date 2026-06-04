@@ -33,6 +33,6 @@ def test_rebuild_retry_uses_paths_only_not_full_files(tmp_path: Path) -> None:
         context_files=["main.py"],
     )
     system = "\n".join(m.content or "" for m in messages if m.role == "system")
-    assert "Paths only" in system or "paths only" in system.lower()
+    assert '"preload_mode": "paths_only"' in system
     assert '\n<file path="main.py">' not in system
     assert "write_file blocked" in (messages[-1].content or "")

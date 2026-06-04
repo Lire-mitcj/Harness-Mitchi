@@ -122,3 +122,53 @@ def test_context_pack_planner_block_contains_structured_evidence(tmp_path: Path)
     assert "relevant_files:" in block
     assert "main.py" in block
     assert "query_orders" in block
+
+
+def test_context_pack_agent_json_contains_builder_sections(tmp_path: Path) -> None:
+    main = tmp_path / "main.py"
+    main.write_text(
+        "\n".join([
+            "def helper():",
+            "    return 'x'",
+            "",
+            "def query_orders():",
+            "    return helper()",
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+    repo_map = FakeRepoMap([
+        FakeSymbol(
+            file_path="main.py",
+            name="query_orders",
+            kind="function",
+            start_line=4,
+            end_line=5,
+            signature="def query_orders()",
+            score=0.9,
+        ),
+        FakeSymbol(
+            file_path="main.py",
+            name="helper",
+            kind="function",
+            start_line=1,
+            end_line=2,
+            signature="def helper()",
+            score=0.7,
+        ),
+    ])
+
+    pack = ContextRetriever(project_root=tmp_path, repo_map=repo_map).build(
+        user_request="修改 main.py 里的 query_orders",
+        current_files=("main.py",),
+    )
+    data = pack.to_agent_json()
+
+    assert data["schema"] == "mitkii.context_pack.v1"
+    assert data["task"]["mode"] == "edit"
+    assert data["candidate_files"][0]["file"] == "main.py"
+    assert "explicit_file" in data["candidate_files"][0]["reasons"]
+    assert data["focused_snippets"]
+    assert data["evidence"]
+    assert "delete_file" in data["tool_policy"]["denied_tools"]
+    assert data["budget"]["max_input_tokens"] == 24000

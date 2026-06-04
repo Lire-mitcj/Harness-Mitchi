@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from src.agent.types import Message, harness_nudge, system_message, user_message
 from src.config.settings import MitKIISettings
@@ -33,11 +35,9 @@ from src.planner.kinds import SubTaskKind
 from src.planner.prior_context import extract_line_refs_from_summaries
 from src.planner.task_tree import SubTaskNode, TaskTree
 
-DEFAULT_DIAGNOSE_TOOL_ROUNDS = 12
 EDIT_TURN_RESERVE = 2
 EDIT_TOOLS = frozenset({"edit_file", "write_file", "delete_file", "replace_symbol"})
-DIAGNOSE_LOCATE_TOOLS = frozenset({"grep_search", "map_search"})
-DIAGNOSE_LOCATE_ROUND_CAP = 2
+DIAGNOSE_LOCATE_TOOLS = frozenset({"context_search"})
 
 
 @dataclass
@@ -62,9 +62,8 @@ class SubtaskHandoffBundle:
     edit_splice_max_attempts: int = 2
     max_turns: int = 3
     turn_cap: int = 3
-    diagnose_tool_rounds: int = DEFAULT_DIAGNOSE_TOOL_ROUNDS
     qg_limit: int = 1
-    map_search_available: bool = False
+    context_search_available: bool = False
 
 
 def prepare_executor_handoff(
@@ -80,7 +79,8 @@ def prepare_executor_handoff(
     prior_exploration: str | None = None,
     subtask_attempt: int = 1,
     quality_gate_retry_limit: int | None = None,
-    map_search_in_registry: bool = False,
+    context_search_in_registry: bool = True,
+    context_pack: Any | None = None,
 ) -> SubtaskHandoffBundle:
     """Build subtask prompt + runtime policy (Harness — not LLM reasoning)."""
     policy = truncation_policy or TruncationPolicy.green(
@@ -110,7 +110,6 @@ def prepare_executor_handoff(
         project_root=project_root,
     )
     max_turns = effective_max_turns(subtask.kind, settings)
-    diagnose_tool_rounds = settings.executor_tool_rounds_diagnose
     whitelist_files = effective_context_files(task_tree, subtask)
     if diag_slices:
         seen_whitelist = {norm_rel_path(p) for p in whitelist_files}
@@ -138,7 +137,7 @@ def prepare_executor_handoff(
         "edit_ambiguous",
     }
     incremental_edit = _prefers_incremental_edit(root_task, subtask)
-    edit_read_fallback = (prior_edit_fail and diag_handoff) or incremental_edit
+    edit_read_fallback = prior_edit_fail and diag_handoff
     if coordinate_handoff and not prior_edit_fail:
         explore_restricted = True
     truncated_paths = detect_truncated_preloads(
@@ -190,13 +189,14 @@ def prepare_executor_handoff(
         splice_edit=splice_edit,
         edit_read_fallback=edit_read_fallback,
     )
-    map_search_available = (
-        map_search_in_registry
+    context_search_available = (
+        context_search_in_registry
         and subtask.kind in {SubTaskKind.DIAGNOSE, SubTaskKind.EDIT}
         and not explore_restricted
     )
-    if map_search_available:
-        runtime_tools = runtime_tools | frozenset({"map_search"})
+    if context_search_available:
+        runtime_tools = runtime_tools | frozenset({"context_search"})
+    runtime_tools = _apply_context_pack_tool_policy(runtime_tools, context_pack)
 
     compact_token_threshold = int(
         settings.max_context_tokens * settings.executor_compact_context_ratio
@@ -212,6 +212,7 @@ def prepare_executor_handoff(
         whitelist_norm=whitelist_norm,
         diag_handoff=diag_handoff,
         compact_token_threshold=compact_token_threshold,
+        context_pack=context_pack,
     )
     ctx_runtime = ExecutorRuntimeState(
         paths_only_mode=paths_only_mode,
@@ -236,7 +237,7 @@ def prepare_executor_handoff(
     elif incremental_edit and subtask.kind == SubTaskKind.EDIT:
         startup_status.append(
             f"Executor [{subtask.id}] · incremental edit "
-            "(first turn read_files only; splice disabled for query-style change)"
+            "(context_search first; splice disabled for query-style change)"
         )
     elif diag_handoff and diag_preloaded:
         startup_status.append(
@@ -246,7 +247,7 @@ def prepare_executor_handoff(
     elif coordinate_handoff and files_in_prompt:
         startup_status.append(
             f"Executor [{subtask.id}] · coordinate handoff "
-            "(slice preload — read/grep/map disabled)"
+            "(slice preload — raw IO disabled)"
         )
     elif whitelist_files and not use_paths_only:
         startup_status.append(f"Preloading {len(whitelist_files)} context file(s)...")
@@ -262,16 +263,17 @@ def prepare_executor_handoff(
             context_files=whitelist_files,
             runtime_tools=runtime_tools,
             exploration_digest=prior_exploration,
+            context_pack=context_pack,
         )
         if explore_restricted:
             startup_status.append(
                 f"Executor [{subtask.id}] · retry mode "
-                "(digest — read_files once, then edit_file; grep/map disabled)"
+                "(digest — context_search/read fallback only if exposed, then edit_file)"
             )
         else:
             startup_status.append(
                 f"Executor [{subtask.id}] · retry mode (paths only — "
-                "read_files or grep_search, then edit_file)"
+                "context_search, then edit_file)"
             )
     elif auto_scoped_edit:
         messages = build_executor_messages(
@@ -283,10 +285,11 @@ def prepare_executor_handoff(
             prior_summaries=prior_summaries,
             preload_mode="paths_only",
             runtime_tools=runtime_tools,
+            context_pack=context_pack,
         )
         startup_status.append(
             f"Executor [{subtask.id}] · scoped mode "
-            f"({len(whitelist_files)} files — read_files once or grep, then edit)"
+            f"({len(whitelist_files)} files — context_search, then edit)"
         )
     else:
         messages = build_executor_messages(
@@ -297,6 +300,7 @@ def prepare_executor_handoff(
             policy=policy,
             prior_summaries=prior_summaries,
             runtime_tools=runtime_tools,
+            context_pack=context_pack,
         )
 
     if files_in_prompt and not use_paths_only:
@@ -310,8 +314,8 @@ def prepare_executor_handoff(
     if edit_handoff and edit_handoff.active:
         messages.append(system_message(format_edit_targets_block(edit_handoff.targets)))
 
-    messages.extend(
-        _bootstrap_user_messages(
+    messages.append(
+        _bootstrap_runtime_message(
             subtask=subtask,
             root_task=root_task,
             project_root=project_root,
@@ -328,14 +332,12 @@ def prepare_executor_handoff(
             files_in_prompt=files_in_prompt,
             truncated_paths=truncated_paths,
             runtime_tools=runtime_tools,
-            max_turns=max_turns,
-            diagnose_tool_rounds=diagnose_tool_rounds,
             prior_exploration=prior_exploration,
             retry_feedback=retry_feedback,
         )
     )
 
-    turn_cap = max_turns + (1 if subtask.kind == SubTaskKind.DIAGNOSE else 0)
+    turn_cap = max_turns
     return SubtaskHandoffBundle(
         subtask=subtask,
         task_tree=task_tree,
@@ -355,10 +357,24 @@ def prepare_executor_handoff(
         edit_splice_max_attempts=settings.edit_splice_max_attempts,
         max_turns=max_turns,
         turn_cap=turn_cap,
-        diagnose_tool_rounds=diagnose_tool_rounds,
         qg_limit=quality_gate_retry_limit or settings.subtask_quality_gate_retries,
-        map_search_available=map_search_available,
+        context_search_available=context_search_available,
     )
+
+
+def _apply_context_pack_tool_policy(
+    runtime_tools: frozenset[str],
+    context_pack: Any | None,
+) -> frozenset[str]:
+    if context_pack is None:
+        return runtime_tools
+    policy = getattr(context_pack, "tool_policy", {}) or {}
+    denied = {str(tool) for tool in policy.get("denied_tools", [])}
+    allowed = {str(tool) for tool in policy.get("allowed_tools", [])}
+    tools = runtime_tools - denied
+    if allowed:
+        tools = tools & allowed
+    return frozenset(tools)
 
 
 def resolve_turn_tools(
@@ -372,17 +388,12 @@ def resolve_turn_tools(
     """Per-turn tool surface (Harness turn policy)."""
     subtask = bundle.subtask
     is_diagnose = subtask.kind == SubTaskKind.DIAGNOSE
-    summary_only = is_diagnose and turns_used > bundle.max_turns
 
-    if summary_only:
-        return frozenset()
-    if is_diagnose and tool_rounds >= bundle.diagnose_tool_rounds:
-        return frozenset()
     turn_tools = active_runtime_tools
     if is_diagnose:
         locate_tools = active_runtime_tools & DIAGNOSE_LOCATE_TOOLS
         if locate_tools:
-            if tool_rounds >= min(bundle.diagnose_tool_rounds, DIAGNOSE_LOCATE_ROUND_CAP):
+            if tool_rounds >= 1:
                 return frozenset()
             return locate_tools
     if (
@@ -414,29 +425,11 @@ def turn_control_nudges(
     turns_used: int,
     tool_rounds: int,
     file_changes: list[str],
-    diagnose_summary_hint_sent: bool,
     error_trace: list[str] | None = None,
 ) -> list[Message]:
     """Harness turn-control messages injected before each LLM call."""
     out: list[Message] = []
     subtask = bundle.subtask
-    is_diagnose = subtask.kind == SubTaskKind.DIAGNOSE
-    summary_only = is_diagnose and turns_used > bundle.max_turns
-
-    if summary_only:
-        out.append(harness_nudge(
-            "Turn budget exhausted. Summarize findings NOW in plain text. "
-            "No tool calls. Cite paths from preloaded context."
-        ))
-    elif (
-        is_diagnose
-        and tool_rounds >= bundle.diagnose_tool_rounds
-        and not diagnose_summary_hint_sent
-    ):
-        out.append(harness_nudge(
-            f"Exploration budget used ({bundle.diagnose_tool_rounds} tool rounds). "
-            "Write your diagnosis summary now — no tool calls."
-        ))
 
     if (
         subtask.kind == SubTaskKind.EDIT
@@ -515,7 +508,7 @@ def _prefers_incremental_edit(root_task: str, subtask: SubTaskNode) -> bool:
     )
 
 
-def _bootstrap_user_messages(
+def _bootstrap_runtime_message(
     *,
     subtask: SubTaskNode,
     root_task: str,
@@ -533,131 +526,65 @@ def _bootstrap_user_messages(
     files_in_prompt: frozenset[str],
     truncated_paths: frozenset[str],
     runtime_tools: frozenset[str],
-    max_turns: int,
-    diagnose_tool_rounds: int,
     prior_exploration: str | None,
     retry_feedback: list[str] | None,
-) -> list[Message]:
-    hint = [f"Execute subtask [{subtask.id}] now."]
+) -> Message:
+    rules: list[str] = ["Execute only this subtask."]
     if retry_strategy.user_hint:
-        hint.append(retry_strategy.user_hint)
-    elif paths_only_mode:
-        hint.append(
-            f"Retry: files NOT fully loaded. map_search(query) or "
-            f"read_files(paths={whitelist_files!r}) once, then edit_file. "
-            "Use write_file only with complete file content."
-        )
+        rules.append(retry_strategy.user_hint)
+    if paths_only_mode:
+        rules.append("Files are paths-only; use context_search with scoped paths before editing.")
     elif auto_scoped_edit:
-        hint.append(
-            f"Scoped edit: map_search(query) or read_files(paths={whitelist_files!r}) once, "
-            "then edit_file — do not read one file per turn. "
-            "Use write_file only with complete file content."
-        )
-    elif splice_edit and edit_handoff and edit_handoff.targets:
-        t = edit_handoff.targets[0]
-        hint.append(
-            f"Splice edit: replace_symbol(path={t.path!r}, symbol={t.symbol!r}, new_body=...) "
-            "with the FULL revised function/block (must differ from <original>)."
-        )
-    elif edit_read_fallback and diag_handoff:
-        loaded = ", ".join(
-            f"{p}:{s}-{e}" for p, (s, e) in sorted(diag_slices.items())[:3]
-        )
-        hint.append(
-            f"Query-style edit: diagnose slices are preloaded ({loaded}), and "
-            "the only read step should be one read_files call if you need exact lines. "
-            "Then use edit_file with a unique multi-line old_string."
-        )
+        rules.append("Scoped edit: context_search on context_files, then edit_file.")
+    if splice_edit and edit_handoff and edit_handoff.targets:
+        rules.append("Use replace_symbol with the full revised block.")
+    if edit_read_fallback and diag_handoff:
+        rules.append("Read fallback is exposed only for exact old_string recovery.")
     elif explore_restricted and diag_handoff:
-        loaded = ", ".join(
-            f"{p}:{s}-{e}" for p, (s, e) in sorted(diag_slices.items())[:3]
-        )
-        hint.append(
-            f"Diagnose line slices preloaded ({loaded}) in <file> blocks. "
-            "Call edit_file: copy ≥3 lines from the <file> body as old_string "
-            "(skip [repo_map slice] header), apply your fix in new_string."
-        )
+        rules.append("Diagnose line slices are preloaded; edit from those slices.")
     elif explore_restricted and diag_slices:
-        loaded = ", ".join(
-            f"{p}:{s}-{e}" for p, (s, e) in sorted(diag_slices.items())[:3]
-        )
-        hint.append(
-            f"Prior milestone coordinates are preloaded ({loaded}) in <file> blocks. "
-            "Harness disabled read/grep/map for this step; use the preloaded slice "
-            "and this step's non-exploration tools."
-        )
+        rules.append("Prior milestone coordinates are preloaded; raw search is disabled.")
     elif explore_restricted:
-        hint.append(
-            "Retry with prior digest: grep/map disabled. read_files once if needed, "
-            "then edit_file with a unique multi-line old_string."
-        )
-    elif diag_slices and subtask.kind == SubTaskKind.EDIT:
-        loaded = ", ".join(
-            f"{p}:{s}-{e}" for p, (s, e) in sorted(diag_slices.items())[:3]
-        )
-        hint.append(
-            f"Diagnose located line slices preloaded ({loaded}). "
-            "edit_file: copy multi-line old_string from <file> body, not the symbol name alone."
-        )
-    elif whitelist_files and truncated_paths and subtask.kind == SubTaskKind.EDIT:
-        hint.append(
-            f"Truncated preload: {', '.join(sorted(truncated_paths))}. "
-            "Use map_search or grep_search on those paths, then edit_file."
-        )
-    elif whitelist_files and files_in_prompt:
-        if subtask.kind == SubTaskKind.EDIT:
-            hint_parts = [
-                f"Preloaded: {', '.join(sorted(files_in_prompt))}. "
-                f"Edit ONLY these paths — no /tmp or scratch files."
-            ]
-            if truncated_paths:
-                hint_parts.append(
-                    f"Truncated: {', '.join(sorted(truncated_paths))} — "
-                    "map_search or grep_search those paths first, then edit_file."
-                )
-            else:
-                hint_parts.append(
-                    f"Tools: {', '.join(sorted(runtime_tools))}. "
-                    "Prefer edit_file for partial changes; use write_file only with complete "
-                    "file content. map_search if you need symbol locations."
-                )
-            hint.append(" ".join(hint_parts))
-        else:
-            hint.append(
-                f"Preloaded: {', '.join(whitelist_files)} — "
-                "do not read_file these paths again."
-            )
-    elif whitelist_files:
-        hint.append(f"Context files: {', '.join(whitelist_files)}.")
+        rules.append("Retry with prior digest; raw search is disabled.")
+    if diag_slices and subtask.kind == SubTaskKind.EDIT:
+        rules.append("Use diagnose line slices as the starting evidence.")
+    if whitelist_files and truncated_paths and subtask.kind == SubTaskKind.EDIT:
+        rules.append("Some context_files are truncated; use context_search on those paths first.")
+    if whitelist_files and files_in_prompt and subtask.kind == SubTaskKind.EDIT:
+        rules.append("Edit only preloaded context_files; never create scratch files.")
     if subtask.kind == SubTaskKind.DIAGNOSE:
-        hint.append(
-            f"Diagnose: at most {diagnose_tool_rounds} tool rounds, then summarize "
-            f"(total turns ≤ {max_turns + 1}). Use repo_map Search modules when "
-            "present: one module for this step, one combined OR grep pattern "
-            "(term1|term2|term3) over that module's files/glob. Batch tool calls "
-            "only for distinct modules/scopes; do not probe one keyword per turn. "
-            "First turn should use grep_search/map_search only; do not list_dir, "
-            "git_status, glob_files, read_file, or read_files before map/grep evidence."
-        )
+        rules.append("Diagnose uses Harness context_search handoff; use at most one precise context_search if exposed.")
     if subtask.kind == SubTaskKind.VERIFY and runtime_tools == frozenset({"shell_exec"}):
-        hint.append(
-            f"Run shell_exec from project root ({project_root}); "
-            "do not set working_dir to /workspace."
-        )
+        rules.append(f"Run shell_exec from project root ({project_root}); do not set working_dir to /workspace.")
     if prior_exploration and prior_exploration.strip():
-        hint.append(
-            "Prior exploration from failed attempt(s) is in context — "
-            "do NOT re-read or re-grep the same files unless editing requires a line ref."
-        )
-
-    out: list[Message] = [user_message(" ".join(hint))]
-    if retry_feedback and not paths_only_mode:
-        block = "\n".join(f"- {e}" for e in retry_feedback[-8:])
-        out.append(harness_nudge(
-            f"Previous attempt(s) on this subtask failed. Do NOT repeat the same "
-            f"exploration. Fix or complete the task.\n{block}"
-        ))
-    return out
+        rules.append("Prior exploration is in session_digest; do not repeat the same context_search.")
+    payload = {
+        "schema": "mitkii.executor_runtime.v1",
+        "event": "start",
+        "subtask_id": subtask.id,
+        "mode": {
+            "paths_only": paths_only_mode,
+            "auto_scoped_edit": auto_scoped_edit,
+            "explore_restricted": explore_restricted,
+            "diag_handoff": diag_handoff,
+            "splice_edit": splice_edit,
+            "edit_read_fallback": edit_read_fallback,
+        },
+        "allowed_tools": sorted(runtime_tools),
+        "context_files": list(whitelist_files),
+        "preloaded_files": sorted(files_in_prompt),
+        "truncated_paths": sorted(truncated_paths),
+        "diag_slices": {
+            path: {"start": span[0], "end": span[1]}
+            for path, span in sorted(diag_slices.items())
+        },
+        "rules": rules,
+        "retry": {
+            "attempt": retry_strategy.attempt,
+            "feedback": [str(e) for e in (retry_feedback or [])[-8:]],
+        },
+    }
+    return user_message("EXECUTOR_RUNTIME_JSON\n" + json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 # ---------------------------------------------------------------------------

@@ -15,8 +15,9 @@ from src.planner.tool_policy import (
 
 def test_default_tools_by_kind() -> None:
     diag = default_allowed_tools(SubTaskKind.DIAGNOSE)
-    assert "read_file" in diag
-    assert "map_search" in diag
+    assert "context_search" in diag
+    assert "read_file" not in diag
+    assert "map_search" not in diag
     assert "shell_exec" not in diag
     shell = default_allowed_tools(SubTaskKind.SHELL)
     assert "shell_exec" in shell
@@ -26,9 +27,9 @@ def test_default_tools_by_kind() -> None:
 def test_normalize_rejects_out_of_kind_tools() -> None:
     tools = normalize_allowed_tools(
         SubTaskKind.DIAGNOSE,
-        ["read_file", "write_file", "shell_exec"],
+        ["context_search", "write_file", "shell_exec"],
     )
-    assert "read_file" in tools
+    assert "context_search" in tools
     assert "write_file" not in tools
     assert "shell_exec" not in tools
 
@@ -38,7 +39,7 @@ def test_validate_blocks_diagnose_with_shell() -> None:
         id="st-1",
         description="check schema",
         kind=SubTaskKind.DIAGNOSE,
-        allowed_tools=["read_file", "shell_exec"],
+        allowed_tools=["context_search", "shell_exec"],
         acceptance_criteria="schema listed",
     )
     blocks, _ = validate_node_tools(node)
@@ -50,7 +51,7 @@ def test_validate_blocks_edit_without_write_tools() -> None:
         id="st-1",
         description="fix api",
         kind=SubTaskKind.EDIT,
-        allowed_tools=["read_file", "grep_search"],
+        allowed_tools=["context_search"],
         acceptance_criteria="api fixed",
     )
     blocks, _ = validate_node_tools(node)
@@ -79,24 +80,24 @@ def test_effective_allowed_tools_on_node() -> None:
         id="st-1",
         description="x",
         kind=SubTaskKind.VERIFY,
-        allowed_tools=["shell_exec", "read_file"],
+        allowed_tools=["shell_exec", "context_search"],
     )
-    assert effective_allowed_tools(node) == frozenset({"read_file", "shell_exec"})
+    assert effective_allowed_tools(node) == frozenset({"context_search", "shell_exec"})
 
 
-def test_verify_and_shell_can_declare_read_grep_map_tools() -> None:
+def test_verify_and_shell_can_declare_context_search_tools() -> None:
     verify = SubTaskNode(
         id="st-1",
         description="verify",
         kind=SubTaskKind.VERIFY,
-        allowed_tools=["shell_exec", "read_files", "grep_search", "map_search"],
+        allowed_tools=["shell_exec", "context_search"],
         acceptance_criteria="verification output",
     )
     shell = SubTaskNode(
         id="st-2",
         description="shell",
         kind=SubTaskKind.SHELL,
-        allowed_tools=["shell_exec", "read_files", "grep_search", "map_search"],
+        allowed_tools=["shell_exec", "context_search"],
         acceptance_criteria="command output",
     )
 

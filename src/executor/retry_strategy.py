@@ -34,8 +34,8 @@ def classify_failure_pattern(errors: list[str]) -> str:
         return "scratch_path"
     if "already preloaded" in text or "read_file blocked" in text:
         return "read_preload_loop"
-    if "duplicate grep_search" in text or "blocked duplicate grep" in text:
-        return "grep_loop"
+    if "duplicate context_search" in text or "blocked duplicate context_search" in text:
+        return "context_search_loop"
     if "turn limit" in text or "hit executor turn limit" in text:
         return "turn_limit"
     if "quality gate" in text:
@@ -72,7 +72,7 @@ def build_executor_retry_strategy(
             "turn_limit",
             "edit_ambiguous",
             "read_preload_loop",
-            "grep_loop",
+            "context_search_loop",
         }
         if pattern in {"edit_not_found", "edit_identical"}:
             restrict = False
@@ -87,9 +87,9 @@ def build_executor_retry_strategy(
             hint_parts.append(EDIT_NOT_FOUND_HINT)
         if restrict:
             hint_parts.append(
-                "Prior session summary is in context — grep_search/map_search are disabled. "
-                "Use read_files once if needed, then edit_file with a unique old_string. "
-                "Do NOT repeat the same grep queries."
+                "Prior handoff evidence is in context — do not repeat the same "
+                "context_search. Use read_files once only if fallback is exposed, "
+                "then edit_file with a unique old_string."
             )
         elif has_digest:
             hint_parts.append(
@@ -143,13 +143,13 @@ def replan_revision_directive(
     ]
     if pattern == "read_preload_loop":
         lines.append(
-            "Add a dedicated diagnose subtask (grep_search) BEFORE edit, or list explicit "
-            "SQL/search patterns in acceptance_criteria."
+            "Add a dedicated diagnose handoff BEFORE edit, or list explicit "
+            "SQL/search evidence requirements in acceptance_criteria."
         )
     elif pattern == "scratch_path":
         lines.append(
-            "Edit subtasks must use grep_search on context_files — remind Planner that /tmp "
-            "is forbidden; split exploration into diagnose."
+            "Edit subtasks must stay within context_files — remind Planner that /tmp "
+            "is forbidden; split exploration into a diagnose handoff."
         )
     elif pattern == "turn_limit":
         lines.append(

@@ -8,7 +8,7 @@ import pytest
 
 from src.agent.events import AgentEvent, EventType
 from src.agent.loop import AgentLoop
-from src.agent.types import LLMResponse, TokenUsage, ToolCall
+from src.agent.types import LLMResponse, RiskLevel, TokenUsage, ToolCall
 from src.config.permissions import PermissionConfig, PermissionManager
 from src.config.settings import MitKIISettings
 from src.tools.registry import ToolRegistry
@@ -107,13 +107,10 @@ async def test_loop_handles_tool_calls(tmp_path: Any) -> None:
     llm.chat_stream = MagicMock(side_effect=fake_stream)
 
     registry = ToolRegistry()
-    from tests.conftest import FakeTool
-
     # Register a mock read_file tool
     mock_tool = MagicMock()
     mock_tool.name = "read_file"
-    mock_tool.risk_level = MagicMock()
-    mock_tool.risk_level.__str__ = lambda self: "safe"
+    mock_tool.risk_level = RiskLevel.SAFE
     mock_tool.to_schema.return_value = {"type": "function", "function": {"name": "read_file"}}
     registry._tools["read_file"] = mock_tool
 
@@ -165,7 +162,7 @@ async def test_loop_respects_max_turns(tmp_path: Any) -> None:
     registry.call = AsyncMock(return_value=ToolResult(success=True, output="ok"))
     mock_tool = MagicMock()
     mock_tool.name = "read_file"
-    mock_tool.risk_level = MagicMock()
+    mock_tool.risk_level = RiskLevel.SAFE
     mock_tool.to_schema.return_value = {"type": "function", "function": {"name": "read_file"}}
     registry._tools["read_file"] = mock_tool
 

@@ -288,6 +288,7 @@ class OrchestratorLoop:
             return
 
         task_tree, scout_skipped = apply_scout_discovery_to_plan(task_tree, manifest)
+        _apply_context_pack_to_task_tree(task_tree, context_pack)
         self.state.subtask_summaries.update(scout_skipped)
         for sid, summary in scout_skipped.items():
             node = task_tree.get(sid)
@@ -373,6 +374,8 @@ class OrchestratorLoop:
 
             pm.start("executor", subtask_id=node.id)
             exec_result: dict[str, Any] | None = None
+            executor_fallback_errors: list[str] = []
+            executor_fallback_digest: str | None = None
             if self.settings.executor_skill_enabled and node.kind == SubTaskKind.EDIT:
                 async for event in self._run_edit_skill_executor(
                     user_msg=user_msg,
@@ -386,38 +389,22 @@ class OrchestratorLoop:
                         if "success" in data or data.get("failure_code"):
                             exec_result = data
                     yield event
-                if exec_result is None and not self.settings.legacy_react_fallback_enabled:
-                    yield error_event(
-                        "SkillExecutor edit path produced no result.",
-                        {"subtask_id": node.id, "terminal": True},
-                    )
-                    return
-                if exec_result is not None or not self.settings.legacy_react_fallback_enabled:
-                    pass
-                else:
-                    yield AgentEvent(
-                        type=EventType.STATUS,
-                        content="SkillExecutor fallback to legacy ReAct.",
-                        data={"phase": "executor", "subtask_id": node.id},
-                    )
+                if exec_result and exec_result.get("requires_executor_fallback"):
+                    executor_fallback_errors = list(exec_result.get("error_trace") or [])
+                    executor_fallback_digest = exec_result.get("exploration_digest") or None
+                    exec_result = None
 
             if exec_result is None:
-                if (
-                    self.settings.executor_skill_enabled
-                    and node.kind == SubTaskKind.EDIT
-                    and not self.settings.legacy_react_fallback_enabled
-                ):
-                    yield error_event(
-                        "SkillExecutor edit path failed and legacy ReAct fallback is disabled.",
-                        {"subtask_id": node.id, "terminal": True},
-                    )
-                    return
                 prior_errors = list(node.error_trace)
+                prior_errors.extend(executor_fallback_errors)
                 prior_ctx = collect_prior_summaries(
                     task_tree, node, self.state.subtask_summaries
                 )
                 attempt_num = self.state.subtask_attempts.get(node.id, 0) + 1
-                prior_exploration = self.state.subtask_exploration_digests.get(node.id)
+                prior_exploration = (
+                    executor_fallback_digest
+                    or self.state.subtask_exploration_digests.get(node.id)
+                )
                 async for event in self._executor.run(
                     root_task=task_tree.root_task,
                     task_tree=task_tree,
@@ -428,6 +415,7 @@ class OrchestratorLoop:
                     prior_summaries=prior_ctx or None,
                     subtask_attempt=attempt_num,
                     prior_exploration=prior_exploration,
+                    context_pack=context_pack,
                 ):
                     if event.type == EventType.STREAM_END and event.data:
                         data = event.data
@@ -895,7 +883,11 @@ class OrchestratorLoop:
                 content=f"SkillExecutor [{node.id}] · code_edit failed: {edit.summary}",
                 data=_executor_status_data(subtask_id=node.id, skill_error=True),
             )
-            yield self._skill_failure_stream_end(node, edit.summary)
+            yield self._skill_failure_stream_end(
+                node,
+                edit.summary,
+                exploration_digest=str(search_output),
+            )
             return
 
         validation_started = time.perf_counter()
@@ -931,7 +923,11 @@ class OrchestratorLoop:
                 content=f"SkillExecutor [{node.id}] · validator failed: {validation.summary}",
                 data=_executor_status_data(subtask_id=node.id, skill_error=True),
             )
-            yield self._skill_failure_stream_end(node, validation.summary)
+            yield self._skill_failure_stream_end(
+                node,
+                validation.summary,
+                requires_executor_fallback=False,
+            )
             return
 
         final_message = (
@@ -959,7 +955,14 @@ class OrchestratorLoop:
             },
         )
 
-    def _skill_failure_stream_end(self, node: SubTaskNode, reason: str) -> AgentEvent:
+    def _skill_failure_stream_end(
+        self,
+        node: SubTaskNode,
+        reason: str,
+        *,
+        requires_executor_fallback: bool = True,
+        exploration_digest: str | None = None,
+    ) -> AgentEvent:
         return AgentEvent(
             type=EventType.STREAM_END,
             data={
@@ -972,6 +975,8 @@ class OrchestratorLoop:
                 "final_message": reason,
                 "failure_code": "skill_executor",
                 "quality_gate_failures": 0,
+                "requires_executor_fallback": requires_executor_fallback,
+                "exploration_digest": exploration_digest,
             },
         )
 
@@ -983,16 +988,6 @@ class OrchestratorLoop:
     ) -> AgentEvent:
         preview = _compact_preview(raw_preview)
         suffix = f" Raw preview: {preview}" if preview else ""
-        if self.settings.legacy_react_fallback_enabled:
-            return AgentEvent(
-                type=EventType.STATUS,
-                content=f"PatchPlan fallback to legacy ReAct: {reason}{suffix}",
-                data={
-                    "phase": "patch_plan",
-                    "fallback": "task_tree",
-                    "raw_preview": preview,
-                },
-            )
         return error_event(
             f"PatchPlan failed: {reason}{suffix}",
             {
@@ -1246,3 +1241,22 @@ class OrchestratorLoop:
             user_msg=root,
             changed_files=changed,
         )
+
+
+def _apply_context_pack_to_task_tree(task_tree: TaskTree, context_pack: Any | None) -> None:
+    if context_pack is None:
+        return
+    files = [
+        str(item.get("file") or "").strip()
+        for item in getattr(context_pack, "candidate_files", ())[:5]
+        if isinstance(item, dict) and str(item.get("file") or "").strip()
+    ]
+    if not files:
+        files = list(getattr(context_pack, "relevant_files", ())[:5])
+    if not files:
+        return
+    for node in task_tree.nodes:
+        if node.context_files:
+            continue
+        if node.kind in {SubTaskKind.DIAGNOSE, SubTaskKind.EDIT}:
+            node.context_files = list(files)

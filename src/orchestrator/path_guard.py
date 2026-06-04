@@ -106,13 +106,13 @@ def format_whitelist_denial(
                 return (
                     f"{tool_name} blocked: path '{raw}' is outside the project. "
                     "Scratch/note files (/tmp/*, etc.) are forbidden. "
-                    f"Use grep_search on whitelisted files ({allowed}) to locate code, "
-                    "then edit_file on one of those paths."
+                    f"Use context_search on whitelisted files ({allowed}) to locate code, "
+                    "then act on one of those paths."
                 )
     blocked_str = ", ".join(blocked)
     return (
         f"{tool_name} blocked: path(s) [{blocked_str}] not in context_files. "
         f"Allowed edit paths: {allowed}. "
-        "Use grep_search to find the target code, then edit_file — "
+        "Use context_search to find the target code, then edit_file — "
         "do not create files outside this list."
     )

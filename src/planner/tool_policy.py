@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 # Full executor tool catalog (Harness may expose a subset per subtask).
 EXECUTOR_TOOLS: frozenset[str] = frozenset({
+    "context_search",
     "read_file",
     "read_files",
     "grep_search",
@@ -26,37 +27,22 @@ WRITE_TOOLS: frozenset[str] = frozenset({"write_file", "edit_file", "delete_file
 
 KIND_DEFAULT_TOOLS: dict[SubTaskKind, frozenset[str]] = {
     SubTaskKind.DIAGNOSE: frozenset({
-        "read_file",
-        "read_files",
-        "grep_search",
-        "map_search",
-        "glob_files",
-        "list_dir",
+        "context_search",
         "git_status",
     }),
     SubTaskKind.EDIT: frozenset({
-        "read_file",
-        "read_files",
-        "grep_search",
-        "map_search",
+        "context_search",
         "write_file",
         "edit_file",
         "delete_file",
     }),
     SubTaskKind.VERIFY: frozenset({
-        "read_file",
-        "read_files",
-        "grep_search",
-        "map_search",
+        "context_search",
         "shell_exec",
     }),
     SubTaskKind.SHELL: frozenset({
         "shell_exec",
-        "read_file",
-        "read_files",
-        "grep_search",
-        "map_search",
-        "list_dir",
+        "context_search",
     }),
 }
 

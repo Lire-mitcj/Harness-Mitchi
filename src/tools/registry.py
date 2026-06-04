@@ -71,9 +71,13 @@ class ToolRegistry:
 
 def create_default_registry(
     *,
+    project_root: object | None = None,
     repo_map_service: object | None = None,
 ) -> ToolRegistry:
     """Build a registry pre-loaded with all built-in tools."""
+    from pathlib import Path
+
+    from src.tools.search.context_search import ContextSearchTool
     from src.tools.file.delete import DeleteFileTool
     from src.tools.file.replace_symbol import ReplaceSymbolTool
     from src.tools.file.edit import EditFileTool
@@ -108,6 +112,13 @@ def create_default_registry(
 
     if repo_map_service is not None:
         registry.register(MapSearchTool(repo_map_service))
+
+    registry.register(
+        ContextSearchTool(
+            project_root=Path(project_root).resolve() if project_root is not None else Path.cwd(),
+            tools=registry,
+        )
+    )
 
     log.debug("Default registry created with %d tools", len(registry))
     return registry

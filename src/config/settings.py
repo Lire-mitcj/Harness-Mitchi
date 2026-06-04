@@ -121,18 +121,21 @@ class MitKIISettings(BaseSettings):
         le=15,
         description="Executor turns for diagnose subtasks (explore + summarize).",
     )
-    executor_tool_rounds_diagnose: int = Field(
-        default=12,
-        ge=1,
-        le=30,
-        description=(
-            "Max tool-call rounds allowed inside a diagnose subtask before "
-            "summary-only mode."
-        ),
-    )
     executor_max_turns_edit: int = Field(default=5, ge=1, le=15)
     executor_max_turns_verify: int = Field(default=5, ge=1, le=15)
     executor_max_turns_shell: int = Field(default=5, ge=1, le=15)
+    executor_summary_max_tokens: int = Field(
+        default=768,
+        ge=128,
+        le=2048,
+        description="Max completion tokens for no-tool Executor summary calls.",
+    )
+    executor_summary_timeout: int = Field(
+        default=30,
+        ge=5,
+        le=180,
+        description="Timeout seconds for no-tool Executor summary calls.",
+    )
     orchestrator_max_replans: int = Field(default=3, ge=0, le=10)
     subtask_max_retries: int = Field(
         default=3,
@@ -259,16 +262,9 @@ class MitKIISettings(BaseSettings):
             "Default false because executable patches belong in the Executor skill layer."
         ),
     )
-    legacy_react_fallback_enabled: bool = Field(
-        default=False,
-        description=(
-            "Allow fallback from PatchPlan/SkillExecutor to legacy TaskTree/ReAct. "
-            "Default false keeps the new architecture as the primary execution path."
-        ),
-    )
     executor_skill_enabled: bool = Field(
         default=True,
-        description="Use deterministic skills for edit subtasks before legacy ReAct.",
+        description="Use deterministic skills for edit subtasks before LLM execution.",
     )
 
     # --- Prompt caching (prefix snapshot) -------------------------------------

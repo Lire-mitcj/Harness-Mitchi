@@ -288,7 +288,11 @@ class AgentLoop:
     ) -> AsyncIterator[dict[str, Any]]:
         """Wrap the LLM streaming call and yield normalized chunks."""
         try:
-            async for content_chunk, final_response in self.llm.chat_stream(messages, tools=tools):
+            async for chunk in self.llm.chat_stream(messages, tools=tools):
+                if isinstance(chunk, dict):
+                    yield chunk
+                    continue
+                content_chunk, final_response = chunk
                 clean_chunk = strip_dsml_text(content_chunk)
                 if clean_chunk:
                     yield {"type": "content", "content": clean_chunk}

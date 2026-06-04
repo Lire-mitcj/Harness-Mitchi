@@ -72,6 +72,7 @@ def test_effective_planner_model_prefers_planner_model() -> None:
 def test_effective_planner_model_falls_back_to_scout() -> None:
     settings = MitKIISettings(
         model="openai/deepseek-ai/DeepSeek-V4-Flash",
+        planner_model=None,
         scout_model="openai/Qwen/Qwen2.5-7B-Instruct",
     )
     assert settings.effective_planner_model == "openai/Qwen/Qwen2.5-7B-Instruct"
@@ -84,6 +85,8 @@ def test_planner_defaults() -> None:
     assert settings.planner_trace is False
     assert settings.scout_trace is False
     assert settings.scout_max_tokens == 1024
+    assert settings.executor_summary_max_tokens == 768
+    assert settings.executor_summary_timeout == 30
 
 
 def test_extract_planning_trace() -> None:

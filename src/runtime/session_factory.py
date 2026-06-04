@@ -78,7 +78,7 @@ def create_mitkii_session(
             context_builder.invalidate_project_context()
 
         file_tracker.set_change_callback(_on_file_change)
-    tools = create_default_registry(repo_map_service=repo_map_service)
+    tools = create_default_registry(project_root=root, repo_map_service=repo_map_service)
     harness = HarnessEngine.create(settings, project_root=root)
     permissions = PermissionManager()
     cache_ttl = "1h" if settings.prompt_cache_ttl.strip().lower() in {"1h", "hour", "60m"} else "5m"

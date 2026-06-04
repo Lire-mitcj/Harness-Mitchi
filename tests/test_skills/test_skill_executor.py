@@ -14,6 +14,8 @@ from src.skills import (
     SkillResult,
     ValidatorSkill,
 )
+from src.tools.search.context_search import ContextSearchTool
+from src.tools.registry import create_default_registry
 
 
 class FakeSkill:
@@ -34,6 +36,17 @@ class FakeToolRegistry:
     async def call(self, name: str, params: dict[str, object]) -> ToolResult:
         self.calls.append((name, params))
         return ToolResult(success=True, output=f"{name}: ok")
+
+
+class SnippetToolRegistry:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def call(self, name: str, params: dict[str, object]) -> ToolResult:
+        self.calls.append((name, params))
+        if name == "grep_search":
+            return ToolResult(success=True, output="main.py:2: def target():")
+        return ToolResult(success=True, output="No matches found.")
 
 
 async def fake_edit_complete(_messages: list[dict[str, object]]) -> str:
@@ -188,6 +201,104 @@ async def test_code_search_skill_batches_map_and_grep(tmp_path) -> None:
     ]
     grep_calls = [args for name, args in registry.calls if name == "grep_search"]
     assert [args["include"] for args in grep_calls] == ["*.py", "*.sql"]
-    assert "登机牌" in str(grep_calls[0]["pattern"])
-    assert "boarding_pass" in str(grep_calls[0]["pattern"])
+    pattern = str(grep_calls[0]["pattern"])
+    assert "boarding_pass" in pattern
+    assert "CREATE" in pattern
+    assert "VIEW" in pattern
+    assert "api" not in pattern.lower()
     assert result.metadata["search_output"]
+
+
+@pytest.mark.asyncio
+async def test_code_search_skill_does_not_grep_need_words(tmp_path) -> None:
+    registry = FakeToolRegistry()
+    skill = CodeSearchSkill(project_root=tmp_path, tools=registry)  # type: ignore[arg-type]
+
+    result = await skill.run(
+        SkillContext(user_request="视图 view\nNeed: file:line symbol snippet"),
+        extra_query="视图 view\nNeed: file:line symbol snippet",
+        search_query="视图 view",
+    )
+
+    assert result.success
+    grep_patterns = [
+        str(args["pattern"])
+        for name, args in registry.calls
+        if name == "grep_search"
+    ]
+    assert grep_patterns
+    assert all("snippet" not in pattern for pattern in grep_patterns)
+    assert all("file" not in pattern for pattern in grep_patterns)
+    assert all("CREATE" in pattern and "VIEW" in pattern for pattern in grep_patterns)
+
+
+@pytest.mark.asyncio
+async def test_code_search_skill_view_definition_uses_definition_pattern(tmp_path) -> None:
+    registry = FakeToolRegistry()
+    skill = CodeSearchSkill(project_root=tmp_path, tools=registry)  # type: ignore[arg-type]
+
+    result = await skill.run(
+        SkillContext(user_request="搜索项目中的视图定义"),
+        extra_query="搜索项目中的视图定义",
+        search_query="搜索项目中的视图定义",
+    )
+
+    assert result.success
+    grep_patterns = [
+        str(args["pattern"])
+        for name, args in registry.calls
+        if name == "grep_search"
+    ]
+    assert grep_patterns
+    assert all(r"\bview\b" not in pattern for pattern in grep_patterns)
+    assert all("CREATE" in pattern and "VIEW" in pattern for pattern in grep_patterns)
+
+
+@pytest.mark.asyncio
+async def test_code_search_skill_hydrates_bounded_snippets(tmp_path) -> None:
+    target = tmp_path / "main.py"
+    target.write_text(
+        "x = 1\n"
+        "def target():\n"
+        "    return x\n",
+        encoding="utf-8",
+    )
+    executor = SkillExecutor([
+        CodeSearchSkill(project_root=tmp_path, tools=SnippetToolRegistry()),  # type: ignore[arg-type]
+    ])
+
+    result = await executor.run(
+        "code_search",
+        SkillContext(user_request="find target"),
+    )
+
+    assert result.success
+    output = result.metadata["search_output"]
+    assert '<snippet path="main.py"' in output
+    assert "2: def target():" in output
+
+
+@pytest.mark.asyncio
+async def test_context_search_tool_uses_skill_snippets(tmp_path) -> None:
+    target = tmp_path / "main.py"
+    target.write_text(
+        "x = 1\n"
+        "def target():\n"
+        "    return x\n",
+        encoding="utf-8",
+    )
+    tool = ContextSearchTool(
+        project_root=tmp_path,
+        tools=SnippetToolRegistry(),  # type: ignore[arg-type]
+    )
+
+    result = await tool.execute(query="target", need="file:line and snippet", paths=["."])
+
+    assert result.success
+    assert '<snippet path="main.py"' in result.output
+
+
+def test_default_registry_registers_context_search(tmp_path) -> None:
+    registry = create_default_registry(project_root=tmp_path)
+
+    assert registry.get("context_search") is not None

@@ -70,7 +70,7 @@ def test_retry_attempt2_with_digest_restricts_explore(tmp_path: Path) -> None:
     )
     assert s.restrict_explore is True
     assert s.paths_only is False
-    assert "grep_search/map_search are disabled" in s.user_hint
+    assert "do not repeat the same context_search" in s.user_hint
 
 
 def test_escalation_replan_on_first_ambiguous_turn_limit() -> None:

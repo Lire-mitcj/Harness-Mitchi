@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -72,9 +74,75 @@ async def test_duplicate_grep_serves_cache_not_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_edit_file_yields_approval_before_waiting(tmp_path: Path) -> None:
-    import asyncio
+async def test_read_only_tool_round_runs_calls_concurrently(tmp_path: Path) -> None:
+    subtask = SubTaskNode(id="st-1", kind=SubTaskKind.DIAGNOSE, description="find")
+    ctx = ToolPipelineContext(
+        subtask=subtask,
+        root_task="task",
+        project_root=tmp_path,
+        runtime_tools=frozenset({"grep_search"}),
+        preloaded_paths=frozenset(),
+        paths_only_mode=False,
+        truncated_paths=frozenset(),
+        whitelist_files=[],
+        policy=TruncationPolicy.green(),
+        memory=ExploreSessionMemory(tracker=ExploreCommandTracker(grep_dedup_limit=10)),
+        messages=[],
+        error_trace=[],
+        tool_failures=[0],
+        shell_tracker=MagicMock(),
+        pre_edit_snapshots={},
+        file_changes=[],
+    )
 
+    active = 0
+    max_active = 0
+
+    async def call(name: str, params: dict[str, object]) -> ToolResult:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.05)
+        active -= 1
+        return ToolResult(success=True, output=f"{name}:{params['pattern']}")
+
+    tools = MagicMock()
+    tools.get.return_value = None
+    tools.call = call
+
+    pipeline = ExecutorToolPipeline(
+        tools,
+        MagicMock(),
+        approval_waiter=AsyncMock(return_value=True),
+        normalize_path=lambda _r, p: str(p),
+        snapshot_before_edit=lambda *_a: None,
+        collect_diff=lambda *_a: {},
+    )
+
+    response = MagicMock()
+    response.tool_calls = [
+        ToolCall(id="t1", name="grep_search", arguments={"pattern": "first", "path": "."}),
+        ToolCall(id="t2", name="grep_search", arguments={"pattern": "second", "path": "."}),
+    ]
+
+    started = time.perf_counter()
+    events = []
+    async for ev in pipeline.process_tool_calls(response, ctx):
+        events.append(ev)
+    elapsed = time.perf_counter() - started
+
+    assert max_active == 2
+    assert elapsed < 0.09
+    assert [m.content for m in ctx.messages] == [
+        "grep_search:first",
+        "grep_search:second",
+    ]
+    assert [e.type for e in events[:2]] == [EventType.TOOL_CALL, EventType.TOOL_CALL]
+    assert pipeline.last_round_stats(ctx).explore_ok is True
+
+
+@pytest.mark.asyncio
+async def test_edit_file_yields_approval_before_waiting(tmp_path: Path) -> None:
     subtask = SubTaskNode(id="st-2", kind=SubTaskKind.EDIT, description="fix")
     ctx = ToolPipelineContext(
         subtask=subtask,
@@ -343,3 +411,58 @@ def test_session_memory_duplicate_read_preload(tmp_path: Path) -> None:
     served = memory.serve_read_from_preload("app.py", start_line=10, end_line=20)
     assert served is not None
     assert "line 10" in served
+
+
+@pytest.mark.asyncio
+async def test_context_search_paths_are_whitelisted_for_edit(tmp_path: Path) -> None:
+    subtask = SubTaskNode(
+        id="st-2",
+        kind=SubTaskKind.EDIT,
+        description="fix",
+        context_files=["app.py"],
+    )
+    ctx = ToolPipelineContext(
+        subtask=subtask,
+        root_task="task",
+        project_root=tmp_path,
+        runtime_tools=frozenset({"context_search"}),
+        preloaded_paths=frozenset(),
+        paths_only_mode=True,
+        truncated_paths=frozenset(),
+        whitelist_files=["app.py"],
+        policy=TruncationPolicy.green(),
+        memory=ExploreSessionMemory(tracker=ExploreCommandTracker()),
+        messages=[],
+        error_trace=[],
+        tool_failures=[0],
+        shell_tracker=MagicMock(),
+        pre_edit_snapshots={},
+        file_changes=[],
+    )
+    tools = MagicMock()
+    tools.get.return_value = None
+    tools.call = AsyncMock(return_value=ToolResult(success=True, output="should not run"))
+    pipeline = ExecutorToolPipeline(
+        tools,
+        MagicMock(),
+        approval_waiter=AsyncMock(return_value=True),
+        normalize_path=lambda _r, p: str(p),
+        snapshot_before_edit=lambda *_a: None,
+        collect_diff=lambda *_a: {},
+    )
+    response = MagicMock()
+    response.tool_calls = [
+        ToolCall(
+            id="t1",
+            name="context_search",
+            arguments={"query": "target", "paths": ["other.py"]},
+        ),
+    ]
+
+    events = []
+    async for ev in pipeline.process_tool_calls(response, ctx):
+        events.append(ev)
+
+    tools.call.assert_not_called()
+    assert ctx.tool_failures[0] == 1
+    assert "not in context_files" in (ctx.messages[0].content or "")

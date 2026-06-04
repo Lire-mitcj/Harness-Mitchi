@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from src.llm.prompt_cache import apply_prompt_cache, mark_cache_breakpoint
 
 
@@ -59,8 +61,123 @@ def test_executor_messages_layered_cache_breakpoints() -> None:
     assert all(m.role == "system" for m in messages)
     assert all(m.cache_breakpoint for m in messages)
     assert "MitKII Executor" in (messages[0].content or "")
-    assert "TaskTree outline" in (messages[1].content or "")
+    assert "EXECUTOR_HANDOFF_JSON" in (messages[1].content or "")
+    assert "mitkii.executor_handoff.v1" in (messages[1].content or "")
+    assert '"allowed_tools"' in (messages[1].content or "")
     assert "st-1" in (messages[2].content or "")
+
+
+def test_executor_handoff_json_contains_runtime_tools_only(tmp_path) -> None:
+    from src.harness.subtask.prompt_builder import build_executor_messages
+    from src.planner.kinds import SubTaskKind
+    from src.planner.task_tree import SubTaskNode, TaskTree
+
+    tree = TaskTree(
+        root_task="task",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.EDIT,
+                description="edit",
+                allowed_tools=["context_search", "edit_file", "shell_exec"],
+            ),
+        ],
+    )
+    messages = build_executor_messages(
+        root_task="task",
+        task_tree=tree,
+        subtask=tree.nodes[0],
+        project_root=tmp_path,
+        runtime_tools=frozenset({"edit_file"}),
+    )
+    raw_json = (messages[1].content or "").split("\n", 1)[1]
+    handoff = json.loads(raw_json)
+
+    assert handoff["allowed_tools"] == ["edit_file"]
+    assert "shell_exec" in handoff["denied_tools"]
+    assert "shell_exec" not in json.dumps(handoff["plan_state"], ensure_ascii=False)
+
+
+def test_executor_handoff_json_carries_prior_evidence_and_negatives(tmp_path) -> None:
+    from src.harness.subtask.prompt_builder import build_executor_messages
+    from src.planner.kinds import SubTaskKind
+    from src.planner.task_tree import SubTaskNode, TaskTree
+
+    (tmp_path / "app.py").write_text("def query_orders():\n    pass\n", encoding="utf-8")
+    tree = TaskTree(
+        root_task="task",
+        nodes=[
+            SubTaskNode(id="st-1", kind=SubTaskKind.DIAGNOSE, description="find"),
+            SubTaskNode(
+                id="st-2",
+                kind=SubTaskKind.EDIT,
+                description="edit",
+                depends_on=["st-1"],
+            ),
+        ],
+    )
+    messages = build_executor_messages(
+        root_task="task",
+        task_tree=tree,
+        subtask=tree.nodes[1],
+        project_root=tmp_path,
+        runtime_tools=frozenset({"edit_file"}),
+        prior_summaries={
+            "st-1": (
+                '{"result":"found","acceptance_met":true,'
+                '"evidence":[{"path":"app.py","line":1,'
+                '"symbol":"query_orders","snippet":"def query_orders"}],'
+                '"blocker":"no matches in tests"}'
+            )
+        },
+    )
+    handoff = json.loads((messages[1].content or "").split("\n", 1)[1])
+
+    assert handoff["prior"]["evidence"]
+    assert handoff["prior"]["evidence"][0]["path"] == "app.py"
+    assert handoff["prior"]["known_negatives"]
+
+
+def test_executor_prompt_carries_context_pack_json(tmp_path) -> None:
+    from src.context.pack import ContextPack, ContextSnippet
+    from src.harness.subtask.prompt_builder import build_executor_messages
+    from src.planner.kinds import SubTaskKind
+    from src.planner.task_tree import SubTaskNode, TaskTree
+
+    pack = ContextPack(
+        user_request="edit",
+        candidate_files=({"file": "app.py", "score": 0.95, "reasons": ["symbol_match"]},),
+        focused_snippets=(
+            ContextSnippet(
+                file_path="app.py",
+                start_line=10,
+                end_line=12,
+                text="10: def target():\n11:     return 1",
+                source="symbol",
+            ),
+        ),
+        evidence=({"type": "symbol_match", "file": "app.py", "symbol": "target"},),
+        tool_policy={"allowed_tools": ["context_search", "edit_file"], "denied_tools": ["delete_file"]},
+    )
+    tree = TaskTree(
+        root_task="task",
+        nodes=[SubTaskNode(id="st-1", kind=SubTaskKind.EDIT, description="edit")],
+    )
+
+    messages = build_executor_messages(
+        root_task="task",
+        task_tree=tree,
+        subtask=tree.nodes[0],
+        project_root=tmp_path,
+        runtime_tools=frozenset({"context_search", "edit_file"}),
+        context_pack=pack,
+    )
+    handoff = json.loads((messages[1].content or "").split("\n", 1)[1])
+    payload = json.loads((messages[2].content or "").split("\n", 1)[1])
+
+    assert handoff["context_pack_summary"]["candidate_files"][0]["file"] == "app.py"
+    assert payload["context_pack"]["focused_snippets"][0]["file"] == "app.py"
+    assert payload["context_pack"]["tool_policy"]["denied_tools"] == ["delete_file"]
 
 
 def test_llm_client_enables_parallel_tool_calls() -> None:
@@ -74,3 +191,21 @@ def test_llm_client_enables_parallel_tool_calls() -> None:
 
     assert kwargs["tool_choice"] == "auto"
     assert kwargs["parallel_tool_calls"] is True
+
+
+def test_llm_client_allows_per_request_budget_override() -> None:
+    from src.llm.client import LLMClient
+
+    client = LLMClient(model="test-model", request_timeout=180)
+    kwargs = client._build_kwargs(  # noqa: SLF001 - intentional unit coverage
+        [{"role": "user", "content": "summarize"}],
+        [],
+        max_tokens=512,
+        timeout=30,
+        response_format={"type": "json_object"},
+    )
+
+    assert kwargs["max_tokens"] == 512
+    assert kwargs["timeout"] == 30
+    assert kwargs["response_format"] == {"type": "json_object"}
+    assert "tools" not in kwargs

@@ -6,7 +6,6 @@ from src.harness.subtask.context_pipeline import (
     ExecutorRuntimeState,
 )
 from src.harness.subtask.handoff import (
-    DEFAULT_DIAGNOSE_TOOL_ROUNDS,
     EDIT_TURN_RESERVE,
     SubtaskCommitResult,
     SubtaskHandoffBundle,
@@ -34,7 +33,6 @@ from src.harness.subtask.session_memory import ExploreSessionMemory
 from src.harness.subtask.tool_pipeline import ExecutorToolPipeline, ToolPipelineContext
 
 __all__ = [
-    "DEFAULT_DIAGNOSE_TOOL_ROUNDS",
     "EDIT_TURN_RESERVE",
     "ExecutorContextConfig",
     "ExecutorContextSession",

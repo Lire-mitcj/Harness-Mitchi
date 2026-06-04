@@ -23,7 +23,7 @@ def test_attempt2_edit_paths_only_with_digest_hint() -> None:
         prior_errors=["read_file blocked: already preloaded"],
     )
     assert s.paths_only is True
-    assert "digest" in s.user_hint.lower() or "grep_search/map_search are disabled" in s.user_hint
+    assert "digest" in s.user_hint.lower() or "context_search" in s.user_hint
 
 
 def test_attempt3_includes_replan_hint() -> None:
@@ -47,4 +47,4 @@ def test_replan_directive_forbids_same_plan() -> None:
         error_trace=["read_file blocked: already preloaded"],
     )
     assert "MUST change" in text
-    assert "grep" in text.lower()
+    assert "diagnose handoff" in text.lower()

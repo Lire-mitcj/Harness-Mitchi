@@ -113,4 +113,4 @@ def test_compact_preserves_pinned_s1_s2(tmp_path: Path) -> None:
     assert "PINNED-S3-SCOPE-WITH-FILES" not in (result.messages[2].content or "")
     assert len(result.messages) < len(messages)
     combined = "\n".join(m.content or "" for m in result.messages)
-    assert "Context folded" in combined
+    assert '"event": "context_folded"' in combined

@@ -36,8 +36,9 @@ from src.cli.stream_preview import (
 )
 from src.context.retriever import build_context_queries
 from src.executor.context_compress import merge_exploration_digests
+from src.executor.final_output import normalize_executor_final_text
 from src.harness.gates.exit_gate import ExitCheckInput, validate_exit
-from src.harness.gates.types import GateVerdict, TruncationPolicy
+from src.harness.gates.types import GateResult, GateVerdict, TruncationPolicy
 from src.harness.quality_gate import evaluate_quality_gate
 from src.harness.subtask.handoff import (
     prepare_executor_handoff,
@@ -63,7 +64,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 EDIT_TOOLS = frozenset({"edit_file", "write_file", "delete_file", "replace_symbol"})
-DIAGNOSE_SEED_TOOLS = frozenset({"grep_search", "map_search"})
+DIAGNOSE_SEED_TOOLS = frozenset({"context_search"})
 _HANDOFF_FILE_LINE = re.compile(r"\bfile\s*:\s*line\b|\bline\b|行号|路径")
 _HANDOFF_SYMBOL = re.compile(r"\bsymbol\b|\bfunction\b|\bmethod\b|符号|函数|类|方法|接口|端点")
 _HANDOFF_SNIPPET = re.compile(r"\bsnippet\b|\bdecision\b|片段|代码|证据|结论|决策")
@@ -156,6 +157,7 @@ class SubTaskExecutor:
         prior_summaries: dict[str, str] | None = None,
         subtask_attempt: int = 1,
         prior_exploration: str | None = None,
+        context_pack: Any | None = None,
     ) -> AsyncIterator[AgentEvent]:
         async for event in self._run_inner(
             root_task,
@@ -167,6 +169,7 @@ class SubTaskExecutor:
             prior_summaries=prior_summaries,
             subtask_attempt=subtask_attempt,
             prior_exploration=prior_exploration,
+            context_pack=context_pack,
         ):
             yield event
 
@@ -204,6 +207,7 @@ class SubTaskExecutor:
         prior_summaries: dict[str, str] | None = None,
         subtask_attempt: int = 1,
         prior_exploration: str | None = None,
+        context_pack: Any | None = None,
     ) -> AsyncIterator[AgentEvent]:
         project_root = self.harness.project_root
         bundle = prepare_executor_handoff(
@@ -218,7 +222,8 @@ class SubTaskExecutor:
             prior_exploration=prior_exploration,
             subtask_attempt=subtask_attempt,
             quality_gate_retry_limit=quality_gate_retry_limit,
-            map_search_in_registry="map_search" in self.tools,
+            context_search_in_registry="context_search" in self.tools,
+            context_pack=context_pack,
         )
         session_memory = bundle.session_memory
         ctx_config = bundle.ctx_config
@@ -265,8 +270,6 @@ class SubTaskExecutor:
             dedup_limit=self.settings.shell_dedup_limit,
             stagnant_limit=self.settings.shell_stagnant_limit,
         )
-        diagnose_summary_hint_sent = False
-
         if _should_seed_diagnose_search(
             subtask=subtask,
             active_runtime_tools=active_runtime_tools,
@@ -278,10 +281,55 @@ class SubTaskExecutor:
                 subtask=subtask,
                 state=state,
                 session_memory=session_memory,
+                search_paths=tuple(bundle.whitelist_files),
             ):
                 yield seed_event
             session_memory.merge_digest_from_messages(state.messages)
-            tool_rounds = bundle.diagnose_tool_rounds
+            tool_rounds = 1
+            seed_handoff = _diagnose_handoff_from_seed_if_ready(
+                subtask=subtask,
+                session_memory=session_memory,
+                state=state,
+                error_trace=error_trace,
+            )
+            if seed_handoff is not None:
+                final_message, exit_result = seed_handoff
+                state.add_message(assistant_message(final_message))
+                yield AgentEvent(
+                    type=EventType.STATUS,
+                    content=(
+                        f"Executor [{subtask.id}] · harness context_search "
+                        "evidence satisfies diagnose handoff; skipping summary LLM"
+                    ),
+                    data={
+                        "phase": "executor",
+                        "subtask_id": subtask.id,
+                        "executor_activity": True,
+                    },
+                )
+                yield final_answer_event(
+                    final_message,
+                    intermediate=True,
+                    subtask_id=subtask.id,
+                )
+                yield AgentEvent(
+                    type=EventType.STREAM_END,
+                    data={
+                        "subtask_id": subtask.id,
+                        "turns_used": 0,
+                        "success": True,
+                        "changed_files": [],
+                        "file_diffs": {},
+                        "error_trace": error_trace,
+                        "final_message": final_message,
+                        "exit_gate": exit_result.verdict.value,
+                        "failure_code": "",
+                        "quality_gate_failures": 0,
+                        "exploration_digest": session_memory.running_digest,
+                        "harness_summarized": True,
+                    },
+                )
+                return
 
         for turns_used in range(1, turn_cap + 1):
             turn_changes_start = len(state.file_changes)
@@ -292,12 +340,9 @@ class SubTaskExecutor:
                 turns_used=turns_used,
                 tool_rounds=tool_rounds,
                 file_changes=state.file_changes,
-                diagnose_summary_hint_sent=diagnose_summary_hint_sent,
                 error_trace=error_trace,
             ):
                 state.add_message(nudge)
-                if "Exploration budget used" in (nudge.content or ""):
-                    diagnose_summary_hint_sent = True
 
             turn_tools = resolve_turn_tools(
                 bundle,
@@ -367,6 +412,14 @@ class SubTaskExecutor:
             )
             await asyncio.sleep(0)
             tool_schemas = self.tools.get_schemas(include=turn_tools)
+            summary_call = is_diagnose and not turn_tools
+            request_max_tokens = (
+                self.settings.executor_summary_max_tokens if summary_call else None
+            )
+            request_timeout = (
+                float(self.settings.executor_summary_timeout) if summary_call else None
+            )
+            response_format = {"type": "json_object"} if not turn_tools else None
             prompt_tokens_est = pre_cp.token_est
             tool_names = ", ".join(sorted(turn_tools)) or "none"
             context_mode = (
@@ -384,6 +437,11 @@ class SubTaskExecutor:
                 f"mode={context_mode}, "
                 f"preloaded={len(preloaded_paths)}, truncated={len(truncated_paths)}"
             )
+            if summary_call:
+                call_detail += (
+                    f", summary_max_tokens={request_max_tokens}, "
+                    f"summary_timeout={request_timeout:.0f}s"
+                )
             log.info(call_detail)
             yield AgentEvent(
                 type=EventType.STATUS,
@@ -401,7 +459,13 @@ class SubTaskExecutor:
             stream_parts: list[str] = []
             first_chunk_elapsed: float | None = None
             model_start = time.perf_counter()
-            async for chunk in self._stream_llm(trimmed, tool_schemas):
+            async for chunk in self._stream_llm(
+                trimmed,
+                tool_schemas,
+                max_tokens=request_max_tokens,
+                timeout=request_timeout,
+                response_format=response_format,
+            ):
                 if chunk.get("type") == "content":
                     delta = chunk.get("content", "")
                     if delta:
@@ -545,20 +609,18 @@ class SubTaskExecutor:
                     session_memory.running_digest,
                     state.messages,
                 )
-                final_message = _diagnose_summary_from_digest(
+                response.content = response.content or _diagnose_summary_from_digest(
                     subtask,
                     digest,
                     error_trace,
-                    blocked_extra_tools=True,
                 )
-                response.content = final_message
                 response.tool_calls = None
-                response_text = final_message
+                response_text = response.content or ""
                 yield AgentEvent(
                     type=EventType.STATUS,
                     content=(
-                        f"Executor [{subtask.id}] · tools disabled; "
-                        "converted extra tool request into diagnose summary"
+                        f"Executor [{subtask.id}] · ignored unexpected tool request "
+                        "in no-tool diagnose summary"
                     ),
                     data={
                         "phase": "executor",
@@ -693,6 +755,32 @@ class SubTaskExecutor:
                 continue
 
             final_message = response.content or response_text
+            final_data: dict[str, Any] | None = None
+            if is_diagnose and _looks_like_llm_timeout(final_message):
+                digest = merge_exploration_digests(
+                    session_memory.running_digest,
+                    state.messages,
+                )
+                if digest.strip():
+                    final_message = _diagnose_summary_from_digest(
+                        subtask,
+                        digest,
+                        error_trace,
+                    )
+                    yield AgentEvent(
+                        type=EventType.STATUS,
+                        content=(
+                            f"Executor [{subtask.id}] · model summary timed out; "
+                            "using harness context_search digest as diagnose handoff"
+                        ),
+                        data={
+                            "phase": "executor",
+                            "subtask_id": subtask.id,
+                            "executor_activity": True,
+                        },
+                    )
+            else:
+                final_message, final_data = normalize_executor_final_text(final_message)
 
             if (
                 subtask.kind == SubTaskKind.EDIT
@@ -717,6 +805,7 @@ class SubTaskExecutor:
                 ExitCheckInput(
                     subtask=subtask,
                     final_message=final_message,
+                    final_data=final_data,
                     error_trace=error_trace,
                     changed_files=list(state.file_changes),
                     turns_used=turns_used,
@@ -773,6 +862,7 @@ class SubTaskExecutor:
                 ),
                 "error_trace": error_trace,
                 "final_message": final_message,
+                "final_data": final_data,
                 "exit_gate": exit_result.verdict.value,
                 "failure_code": "",
                 "quality_gate_failures": quality_gate_failures,
@@ -808,9 +898,19 @@ class SubTaskExecutor:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
-            async for content_chunk, final_response in self.llm.chat_stream(messages, tools=tools):
+            async for content_chunk, final_response in self.llm.chat_stream(
+                messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                response_format=response_format,
+            ):
                 clean_chunk = strip_dsml_text(content_chunk)
                 if clean_chunk:
                     yield {"type": "content", "content": clean_chunk}
@@ -837,6 +937,7 @@ class SubTaskExecutor:
         subtask: SubTaskNode,
         state: AgentState,
         session_memory: ExploreSessionMemory,
+        search_paths: tuple[str, ...] = (),
     ) -> AsyncIterator[AgentEvent]:
         available = frozenset(
             name for name in DIAGNOSE_SEED_TOOLS if self.tools.get(name) is not None
@@ -845,13 +946,14 @@ class SubTaskExecutor:
             root_task=root_task,
             subtask=subtask,
             available_tools=available,
+            search_paths=search_paths,
         )
         if not calls:
             return
 
         detail = (
             f"Executor [{subtask.id}] · harness pre-search: "
-            f"{len(calls)} batched map/grep call(s); next model turn summarizes"
+            f"{len(calls)} context_search call(s); harness will build evidence handoff"
         )
         log.info(detail)
         yield AgentEvent(
@@ -949,6 +1051,33 @@ def _failure_payload(
     }
 
 
+def _diagnose_handoff_from_seed_if_ready(
+    *,
+    subtask: SubTaskNode,
+    session_memory: ExploreSessionMemory,
+    state: AgentState,
+    error_trace: list[str],
+) -> tuple[str, GateResult] | None:
+    digest = merge_exploration_digests(session_memory.running_digest, state.messages)
+    if not digest.strip():
+        return None
+    final_message = _diagnose_summary_from_digest(subtask, digest, error_trace)
+    exit_result = validate_exit(
+        ExitCheckInput(
+            subtask=subtask,
+            final_message=final_message,
+            error_trace=error_trace,
+            changed_files=[],
+            turns_used=0,
+            tool_failure_count=0,
+        )
+    )
+    if not exit_result.passed:
+        return None
+    session_memory.running_digest = digest
+    return final_message, exit_result
+
+
 def _should_seed_diagnose_search(
     *,
     subtask: SubTaskNode,
@@ -960,10 +1089,10 @@ def _should_seed_diagnose_search(
         return False
     if subtask_attempt != 1 or prior_summaries:
         return False
-    if subtask.context_files:
+    if "context_search" not in active_runtime_tools:
         return False
-    if not (active_runtime_tools & DIAGNOSE_SEED_TOOLS):
-        return False
+    if subtask.description or subtask.acceptance_criteria or subtask.allowed_tools:
+        return True
     criteria = subtask.acceptance_criteria or ""
     return bool(
         _HANDOFF_FILE_LINE.search(criteria)
@@ -977,99 +1106,169 @@ def _diagnose_seed_tool_calls(
     root_task: str,
     subtask: SubTaskNode,
     available_tools: frozenset[str],
+    search_paths: tuple[str, ...] = (),
 ) -> list[ToolCall]:
     text = " ".join(
         part
         for part in (root_task, subtask.description, subtask.acceptance_criteria)
         if part
     )
-    map_queries, grep_pattern = _diagnose_seed_queries(text)
-
-    calls: list[ToolCall] = []
-    call_index = 1
-    if "map_search" in available_tools:
-        for query in map_queries:
-            calls.append(
-                ToolCall(
-                    id=f"harness-diagnose-seed-{call_index}",
-                    name="map_search",
-                    arguments={"query": query, "limit": 20},
-                )
+    if "context_search" in available_tools:
+        query_terms = build_context_queries(text, limit=8)
+        query = " ".join(query_terms) if query_terms else text
+        need_parts = [
+            "relevant file:line, symbol, and bounded code/SQL snippet evidence",
+        ]
+        if "视图" in text or "view" in text.lower():
+            need_parts.append("views, CREATE VIEW SQL, or code that uses database views")
+        if "接口" in text or "端点" in text or "api" in text.lower():
+            need_parts.append("API endpoint/handler locations and callers")
+        arguments: dict[str, object] = {
+            "query": query,
+            "need": "; ".join(need_parts),
+            "max_results": 80,
+        }
+        if search_paths:
+            arguments["paths"] = list(search_paths)
+        return [
+            ToolCall(
+                id="harness-diagnose-seed-1",
+                name="context_search",
+                arguments=arguments,
             )
-            call_index += 1
-    if "grep_search" in available_tools and grep_pattern:
-        for include in ("*.py", "*.sql"):
-            calls.append(
-                ToolCall(
-                    id=f"harness-diagnose-seed-{call_index}",
-                    name="grep_search",
-                    arguments={
-                        "pattern": grep_pattern,
-                        "path": ".",
-                        "include": include,
-                        "max_results": 80,
-                    },
-                )
-            )
-            call_index += 1
-    return calls
+        ]
 
-
-def _diagnose_seed_queries(text: str) -> tuple[list[str], str]:
-    map_terms: list[str] = build_context_queries(text, limit=3)
-    grep_terms: list[str] = [re.escape(term) for term in build_context_queries(text, limit=12)]
-
-    def add_map(term: str) -> None:
-        if term and term not in map_terms:
-            map_terms.append(term)
-
-    def add_grep(term: str, *, regex: bool = False) -> None:
-        value = term if regex else re.escape(term)
-        if value and value not in grep_terms:
-            grep_terms.append(value)
-
-    if "视图" in text or "view" in text.lower():
-        add_grep(r"CREATE\s+VIEW", regex=True)
-        add_grep(r"create\s+view", regex=True)
-    if "接口" in text or "端点" in text or "api" in text.lower():
-        add_grep(r"@app\.(get|post|put|delete|patch)", regex=True)
-
-    for endpoint in re.findall(r"/[A-Za-z0-9_./{}-]+", text):
-        add_map(endpoint.strip("/"))
-        add_grep(endpoint)
-
-    if not grep_terms:
-        return map_terms[:3], ""
-
-    return map_terms[:3], "|".join(grep_terms[:18])
+    return []
 
 
 def _diagnose_summary_from_digest(
     subtask: SubTaskNode,
     digest: str,
     error_trace: list[str],
-    *,
-    blocked_extra_tools: bool = False,
 ) -> str:
     body = digest.strip()
     if not body:
         recent = "\n".join(f"- {e}" for e in error_trace[-5:])
         body = recent or "The diagnose step reached summary mode before more tool output."
-    if blocked_extra_tools:
-        return (
-            "Result: 诊断证据不足，acceptance criteria not yet met.\n"
-            "Evidence:\n"
-            f"{body[:6000]}\n"
-            "Conclusion: 工具预算已用完，模型仍请求更多工具；当前证据不足以安全交付"
-            f" {subtask.id}，需要重规划或扩大/调整搜索模块。"
+    findings = _diagnose_findings_from_digest(subtask, body)
+    if findings:
+        lines = [
+            f"Result: 已定位 {len(findings)} 个相关代码位置。",
+            "Evidence:",
+        ]
+        lines.extend(f"- {item}" for item in findings)
+        lines.append(
+            f"Conclusion: acceptance met。以上路径和行号可作为 {subtask.id} 的交接证据。"
         )
+        return "\n".join(lines)
     return (
-        "Result: 已根据已有工具证据生成诊断摘要。\n"
+        "Result: 已根据已有工具证据生成诊断摘要，但未抽取到清晰的路径行号列表。\n"
         "Evidence:\n"
         f"{body[:6000]}\n"
-        "Conclusion: 使用上面的路径、行号和 grep/map 命中作为 "
+        "Conclusion: 使用上面的路径、行号和 context_search 命中作为 "
         f"{subtask.id} 的交接证据。"
     )
+
+
+def _diagnose_findings_from_digest(subtask: SubTaskNode, digest: str) -> list[str]:
+    intent = f"{subtask.description} {subtask.acceptance_criteria}".lower()
+    wants_view_definition = (
+        ("视图" in intent or "view" in intent)
+        and ("定义" in intent or "definition" in intent or "create" in intent)
+    )
+    snippets = _code_snippets_from_digest(digest)
+    candidates: list[tuple[int, str]] = []
+    for raw in digest.splitlines():
+        line = raw.strip()
+        if line.startswith("- "):
+            line = line[2:].strip()
+        if not _looks_like_location_hit(line):
+            continue
+        score = _finding_score(line, wants_view_definition=wants_view_definition)
+        if score <= 0:
+            continue
+        candidates.append((
+            score,
+            _format_finding_line(
+                line,
+                wants_view_definition,
+                fallback_snippet=snippets[0] if snippets else "",
+            ),
+        ))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    out: list[str] = []
+    seen_locations: set[str] = set()
+    for _score, text in candidates:
+        location = text.split(" | ", 1)[0]
+        if location in seen_locations:
+            continue
+        seen_locations.add(location)
+        out.append(text)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _looks_like_location_hit(line: str) -> bool:
+    return bool(re.match(r"[\w./-]+\.(?:py|sql|md|tsx?|jsx?):\d+", line))
+
+
+def _finding_score(line: str, *, wants_view_definition: bool) -> int:
+    lower = line.lower()
+    score = 1
+    if ".sql:" in lower:
+        score += 3
+    if "create view" in lower or "create or replace view" in lower:
+        score += 8
+    if "视图" in line:
+        score += 3
+    if "-- 视图" in line or "视图：" in line or "视图:" in line:
+        score += 5
+    if wants_view_definition and not (
+        ".sql:" in lower
+        or "create view" in lower
+        or "-- 视图" in line
+        or "视图：" in line
+        or "视图:" in line
+    ):
+        return 0
+    return score
+
+
+def _format_finding_line(
+    line: str,
+    wants_view_definition: bool,
+    *,
+    fallback_snippet: str = "",
+) -> str:
+    location, _, snippet = line.partition(":")
+    line_no, _, rest = snippet.partition(":")
+    loc = f"{location}:{line_no}" if line_no else location
+    symbol = "视图定义" if wants_view_definition else "目标代码"
+    evidence = rest.strip() or fallback_snippet or line
+    return f"{loc} | {symbol} | {evidence[:220]}"
+
+
+def _code_snippets_from_digest(digest: str) -> list[str]:
+    snippets: list[str] = []
+    in_section = False
+    for raw in digest.splitlines():
+        line = raw.strip()
+        if line == "Code / SQL seen (snippets):":
+            in_section = True
+            continue
+        if in_section and line and not line.startswith("- "):
+            break
+        if in_section and line.startswith("- "):
+            snippet = line[2:].strip()
+            if snippet:
+                snippets.append(snippet)
+    return snippets
+
+
+def _looks_like_llm_timeout(message: str | None) -> bool:
+    text = (message or "").lower()
+    return "llm request timed out" in text or "llm stream timed out" in text
 
 
 def _snapshot_before_edit(

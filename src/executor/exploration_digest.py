@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 from src.agent.explore_guard import _normalize_grep_scope
@@ -11,7 +12,14 @@ _READ_RANGE_RE = re.compile(
     r"^(?:--- )?(.+?)(?:\s+lines?\s+(\d+)(?:-(\d+))?)?\s*---?\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
-_DEF_RE = re.compile(r"^(def |class |CREATE VIEW|CREATE OR REPLACE VIEW)", re.MULTILINE | re.IGNORECASE)
+_CONTEXT_SNIPPET_RE = re.compile(
+    r"<snippet\s+path=\"(?P<path>[^\"]+)\"\s+lines=\"(?P<lines>[^\"]+)\"",
+    re.IGNORECASE,
+)
+_DEF_RE = re.compile(
+    r"^(?:\d+:\s*)?(def |class |CREATE VIEW|CREATE OR REPLACE VIEW)",
+    re.MULTILINE | re.IGNORECASE,
+)
 _SQL_HINT_RE = re.compile(
     r"\b(SELECT|CREATE VIEW|DROP VIEW|text\s*\(|boarding_pass|build_\w+_sql|v_\w+)\b",
     re.IGNORECASE,
@@ -51,6 +59,12 @@ def build_exploration_digest(
                     query = tc.arguments.get("query")
                     if isinstance(query, str) and query not in map_queries:
                         map_queries.append(query)
+                elif tc.name == "context_search":
+                    query = tc.arguments.get("query")
+                    need = tc.arguments.get("need")
+                    label = str(query or need or "").strip()
+                    if label and label not in map_queries:
+                        map_queries.append(label[:200])
                 elif tc.name in {"read_file", "read_files"}:
                     _record_read_call(
                         tc.name,
@@ -85,9 +99,21 @@ def build_exploration_digest(
                 seen_paths.add(norm)
                 read_paths.append(norm)
 
+        for match in _CONTEXT_SNIPPET_RE.finditer(content):
+            norm = _norm(match.group("path"))
+            line_range = match.group("lines")
+            label = f"{norm}:{line_range}"
+            if norm and label not in seen_ranges:
+                seen_ranges.add(label)
+                read_ranges.append(label)
+            if norm and norm not in seen_paths:
+                seen_paths.add(norm)
+                read_paths.append(norm)
+
         for hit in _GREP_HIT_RE.findall(content):
-            if hit not in grep_hits:
-                grep_hits.append(hit)
+            normalized_hit = _normalize_grep_hit(hit)
+            if normalized_hit not in grep_hits:
+                grep_hits.append(normalized_hit)
             if len(grep_hits) >= 50:
                 break
 
@@ -116,7 +142,7 @@ def build_exploration_digest(
     elif read_paths:
         lines.append("Files already read: " + ", ".join(read_paths[:20]))
     if map_queries:
-        lines.append("Repo map searches already run:")
+        lines.append("Context/map searches already run:")
         lines.extend(f"  - {q}" for q in map_queries[:12])
     if map_hits:
         lines.append("Repo map hits (sample):")
@@ -194,9 +220,23 @@ def _norm(path: str) -> str:
     return p.lstrip("./")
 
 
+def _normalize_grep_hit(hit: str) -> str:
+    path, sep, rest = hit.partition(":")
+    if not sep:
+        return hit
+    return f"{_norm(path)}:{rest}"
+
+
 def format_digest_system_block(digest: str) -> Message:
     return system_message(
-        "Session exploration summary (preserved across context compression — "
-        "use this instead of re-reading the same files):\n\n"
-        + digest.strip()
+        "SESSION_DIGEST_JSON\n"
+        + json.dumps(
+            {
+                "schema": "mitkii.session_digest.v1",
+                "digest": digest.strip(),
+                "instruction": "Use this evidence instead of repeating prior searches.",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     )

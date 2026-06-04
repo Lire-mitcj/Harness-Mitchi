@@ -53,7 +53,7 @@ def apply_post_tool_recovery(
             "Duplicate exploration was blocked. Stop searching and summarize from "
             "the session summary/tool outputs now."
         ))
-        out.status_lines.append("duplicate exploration blocked — summary only")
+        out.status_lines.append("duplicate context_search blocked")
         return out
 
     if not recent_edit_recoverable_failure(error_trace):
@@ -106,7 +106,7 @@ def _recent_duplicate_explore(error_trace: list[str], *, lookback: int = 4) -> b
     for entry in reversed(error_trace[-lookback:]):
         lower = entry.lower()
         if "blocked duplicate" in lower and (
-            "grep_search" in lower or "map_search" in lower or "read" in lower
+            "context_search" in lower
         ):
             return True
     return False

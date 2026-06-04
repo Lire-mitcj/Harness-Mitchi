@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from src.agent.types import Message, system_message, user_message
 from src.executor.exploration_digest import build_exploration_digest, format_digest_system_block
 
@@ -55,14 +57,23 @@ def rebuild_compacted_executor_messages(
     out = list(base_messages)
     if digest.strip():
         out.append(format_digest_system_block(digest))
-    lines = [
-        f"Context folded ({compact_reason}). "
-        "Continue from the session summary — avoid re-reading the same line ranges."
-    ]
-    if error_trace:
-        lines.append("Recent errors:")
-        lines.extend(f"- {e}" for e in error_trace[-6:])
-    out.append(user_message("\n".join(lines)))
+    out.append(user_message(
+        "EXECUTOR_RUNTIME_JSON\n"
+        + json.dumps(
+            {
+                "schema": "mitkii.executor_runtime.v1",
+                "event": "context_folded",
+                "reason": compact_reason,
+                "rules": [
+                    "Continue from SESSION_DIGEST_JSON.",
+                    "Avoid repeating the same line ranges or context_search queries.",
+                ],
+                "recent_errors": [str(e) for e in (error_trace or [])[-6:]],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    ))
     return out
 
 

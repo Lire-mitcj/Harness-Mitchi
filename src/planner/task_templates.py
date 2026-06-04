@@ -150,7 +150,7 @@ def task_tree_from_template(user_request: str, template: TaskTemplate) -> TaskTr
                     acceptance_criteria=(
                         "Output file:line, symbol, and snippet/decision for the edit target"
                     ),
-                    allowed_tools=["grep_search", "map_search"],
+                    allowed_tools=["context_search"],
                     context_files=[],
                     needs_l1=False,
                 ),
@@ -159,7 +159,7 @@ def task_tree_from_template(user_request: str, template: TaskTemplate) -> TaskTr
                     description=user_request[:120],
                     kind=SubTaskKind.EDIT,
                     acceptance_criteria="Target behavior is changed as requested",
-                    allowed_tools=["read_file", "read_files", "edit_file"],
+                    allowed_tools=["context_search", "edit_file"],
                     context_files=[],
                     depends_on=["st-1"],
                     needs_l1=True,
@@ -187,7 +187,7 @@ def task_tree_from_template(user_request: str, template: TaskTemplate) -> TaskTr
                 description=user_request[:120],
                 kind=SubTaskKind.DIAGNOSE,
                 acceptance_criteria="Search project and list relevant file paths with evidence",
-                allowed_tools=["grep_search", "map_search", "glob_files", "list_dir"],
+                allowed_tools=["context_search"],
                 context_files=[],
                 needs_l1=False,
             )

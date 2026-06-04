@@ -53,4 +53,4 @@ def test_format_whitelist_denial_outside_project(tmp_path: Path) -> None:
     )
     assert "outside the project" in msg
     assert "/tmp" in msg
-    assert "grep_search" in msg
+    assert "context_search" in msg

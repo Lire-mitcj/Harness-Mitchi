@@ -82,6 +82,8 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         *,
         max_tokens: int | None = None,
+        timeout: float | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> AsyncIterator[tuple[str, LLMResponse | None]]:
         """Convenience streaming helper.
 
@@ -90,7 +92,14 @@ class LLMClient:
         """
         import asyncio
 
-        kwargs = self._build_kwargs(messages, tools, max_tokens=max_tokens)
+        request_timeout = timeout if timeout is not None else self.request_timeout
+        kwargs = self._build_kwargs(
+            messages,
+            tools,
+            max_tokens=max_tokens,
+            timeout=request_timeout,
+            response_format=response_format,
+        )
 
         content_parts: list[str] = []
         tool_calls_raw: dict[int, dict[str, Any]] = {}
@@ -98,7 +107,7 @@ class LLMClient:
         last_chunk: Any = None
 
         try:
-            async with asyncio.timeout(self.request_timeout):
+            async with asyncio.timeout(request_timeout):
                 response = await litellm.acompletion(**kwargs, stream=True)
 
                 async for chunk in response:
@@ -132,12 +141,12 @@ class LLMClient:
                                 if tc_delta.function.arguments:
                                     entry["arguments"] += tc_delta.function.arguments
         except TimeoutError:
-            log.error("LLM stream timed out after %.0fs", self.request_timeout)
+            log.error("LLM stream timed out after %.0fs", request_timeout)
             yield (
                 "",
                 LLMResponse(
                     content=(
-                        f"LLM request timed out after {int(self.request_timeout)}s. "
+                        f"LLM request timed out after {int(request_timeout)}s. "
                         "Try a smaller context or retry."
                     ),
                     tool_calls=None,
@@ -205,7 +214,10 @@ class LLMClient:
         tools: list[dict[str, Any]] | None,
         *,
         max_tokens: int | None = None,
+        timeout: float | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        request_timeout = timeout if timeout is not None else self.request_timeout
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": apply_prompt_cache(
@@ -217,13 +229,15 @@ class LLMClient:
             ),
             "temperature": self.temperature,
             "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
-            "timeout": self.request_timeout,
+            "timeout": request_timeout,
             "stream_options": {"include_usage": True},
         }
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = True
+        elif response_format is not None:
+            kwargs["response_format"] = response_format
         return kwargs
 
     async def _chat_sync(self, kwargs: dict[str, Any]) -> LLMResponse:

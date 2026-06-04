@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
+from typing import Any
 
 from src.agent.types import Message, system_message, user_message
+from src.executor.final_output import parse_executor_final
 from src.harness.gates.types import TruncationPolicy
 from src.harness.probe.token_budget import TokenBudget
 from src.harness.subtask.preload import load_context_file_contents
 from src.planner.context_policy import effective_context_files
 from src.planner.kinds import SubTaskKind
-from src.planner.prior_context import format_diagnose_handoff_block, format_prior_summaries_block
+from src.planner.prior_context import (
+    extract_line_refs_from_text,
+    extract_paths_from_text,
+    extract_symbol_hits_from_text,
+    format_diagnose_handoff_block,
+)
 from src.planner.task_tree import SubTaskNode, TaskTree
 
 log = logging.getLogger(__name__)
@@ -36,18 +44,7 @@ def load_executor_system_prompt() -> str:
     return _EXECUTOR_SYSTEM_PROMPT
 
 
-_EDIT_FILE_WORKFLOW = (
-    "edit_file workflow (exact string replace):\n"
-    "1. Pick the lines to change inside the <file> block above "
-    "(skip any [repo_map slice…] header line).\n"
-    "2. old_string = copy those lines verbatim (≥3 lines; exact spaces/quotes).\n"
-    "3. new_string = same block with your fix (must differ from old_string).\n"
-    "4. path = relative path (e.g. app.py).\n"
-    "Never use only a function name or one-line signature — include the code/SQL you change."
-)
-
-
-def _build_subtask_scope_block(
+def _build_context_payload_block(
     *,
     subtask: SubTaskNode,
     task_tree: TaskTree,
@@ -55,65 +52,67 @@ def _build_subtask_scope_block(
     policy: TruncationPolicy,
     preload_mode: str,
     runtime_tools: frozenset[str] | None,
+    context_pack: Any | None = None,
 ) -> str:
-    parts = [
-        f"Your assigned subtask [{subtask.id}] (kind={subtask.kind.value}):",
-        subtask.description,
-        "",
-    ]
-    if subtask.acceptance_criteria:
-        parts.append(f"Done when: {subtask.acceptance_criteria}")
-        parts.append("")
-    tools = ", ".join(
-        sorted(runtime_tools if runtime_tools is not None else subtask.effective_allowed_tools())
-    )
-    l1_label = "enabled" if subtask.effective_needs_l1() else "skipped for this kind"
     context_files = effective_context_files(task_tree, subtask)
-    parts.extend([
-        f"Allowed tools (ONLY these): {tools}",
-        f"Quality gate L1: {l1_label}.",
-        "",
-        "Whitelisted context files:",
-    ])
+    runtime = sorted(runtime_tools if runtime_tools is not None else subtask.effective_allowed_tools())
+    payload: dict[str, Any] = {
+        "schema": "mitkii.executor_context_payload.v1",
+        "subtask_id": subtask.id,
+        "kind": subtask.kind.value,
+        "allowed_tools": runtime,
+        "quality_gate_l1": subtask.effective_needs_l1(),
+        "context_files": list(context_files),
+        "preload_mode": preload_mode,
+        "policy_tier": policy.tier,
+        "instructions": _context_payload_instructions(
+            subtask=subtask,
+            context_files=context_files,
+            preload_mode=preload_mode,
+            policy=policy,
+        ),
+    }
+    if context_pack is not None:
+        payload["context_pack"] = context_pack.to_agent_json()
+    parts = [
+        "CONTEXT_PAYLOAD_JSON",
+        json.dumps(payload, ensure_ascii=False, indent=2),
+    ]
 
-    if context_files and preload_mode == "paths_only":
-        parts.append(
-            "Paths only (NOT fully preloaded). Prefer map_search(query) or "
-            "read_files(paths=[...]) once for all "
-            "paths below, or grep_search to locate code — then edit_file. "
-            "Use write_file only for new files or complete-file rewrites. "
-            "Never create /tmp or files outside this list:"
-        )
-        for rel in context_files:
-            parts.append(f"  - {rel}")
-    elif context_files and policy.tier != "red":
-        parts.append(
-            "Preloaded below (FULL file content — do NOT call read_file on these paths again):"
-        )
-        if subtask.kind == SubTaskKind.DIAGNOSE:
-            parts.append(
-                "Diagnose mode: use preloaded content + map_search or grep_search, "
-                "then reply with findings (no more reads)."
-            )
-        elif subtask.kind == SubTaskKind.EDIT:
-            parts.append(
-                "Edit mode: whitelisted files are preloaded. "
-                "Use edit_file on those paths for partial changes (no /tmp or scratch files). "
-                "Use write_file only for new files or complete-file rewrites. "
-                "If a file shows [truncated], use map_search, read_files, "
-                "or grep_search on those paths first."
-            )
-            parts.append(_EDIT_FILE_WORKFLOW)
+    if context_files and preload_mode != "paths_only" and policy.tier != "red":
         for rel, content in load_context_file_contents(
             project_root, context_files, policy=policy
         ):
             parts.append(f'\n<file path="{rel}">\n{content}\n</file>')
-    else:
-        parts.append(
-            "  (none preloaded — map_search/grep_search/read_file/list_dir work "
-            "on any path under project root)"
-        )
     return "\n".join(parts)
+
+
+def _context_payload_instructions(
+    *,
+    subtask: SubTaskNode,
+    context_files: list[str],
+    preload_mode: str,
+    policy: TruncationPolicy,
+) -> list[str]:
+    instructions: list[str] = []
+    if context_files and preload_mode == "paths_only":
+        instructions.append(
+            "Paths are scoped but not fully preloaded. Use context_search with paths before editing."
+        )
+    elif context_files and policy.tier != "red":
+        instructions.append("Full or sliced file content follows in <file> blocks.")
+        if subtask.kind == SubTaskKind.EDIT:
+            instructions.append(
+                "For edit_file, copy a unique multi-line old_string from <file> content."
+            )
+            instructions.append("Never create /tmp or scratch files.")
+        elif subtask.kind == SubTaskKind.DIAGNOSE:
+            instructions.append("Use preloaded evidence and context_search only if exposed.")
+    else:
+        instructions.append(
+            "No file content is preloaded. Use context_search for file:line/symbol/snippet evidence."
+        )
+    return instructions
 
 
 def build_executor_messages(
@@ -126,19 +125,26 @@ def build_executor_messages(
     prior_summaries: dict[str, str] | None = None,
     preload_mode: str = "full",
     runtime_tools: frozenset[str] | None = None,
+    context_pack: Any | None = None,
 ) -> list[Message]:
     """Layered Executor system messages (L0 prompt | L2 task tree | L3 subtask + preload)."""
     policy = policy or TruncationPolicy.green()
 
+    context_files = effective_context_files(task_tree, subtask)
+    handoff = build_executor_handoff_json(
+        root_task=root_task,
+        task_tree=task_tree,
+        subtask=subtask,
+        project_root=project_root,
+        runtime_tools=runtime_tools,
+        context_files=context_files,
+        prior_summaries=prior_summaries or {},
+        context_pack=context_pack,
+    )
     task_parts = [
-        f"Global task: {root_task}",
-        "",
-        "TaskTree outline:",
-        task_tree.to_outline(),
+        "EXECUTOR_HANDOFF_JSON",
+        json.dumps(handoff, ensure_ascii=False, indent=2),
     ]
-    prior_block = format_prior_summaries_block(prior_summaries or {})
-    if prior_block:
-        task_parts.extend(["", prior_block])
     if subtask.kind == SubTaskKind.EDIT and prior_summaries:
         intent = " ".join(
             part
@@ -151,15 +157,16 @@ def build_executor_messages(
             intent_text=intent,
         )
         if handoff:
-            task_parts.extend(["", handoff])
+            task_parts.extend(["", "DIAGNOSE_SLICE_HINT", handoff])
 
-    scope = _build_subtask_scope_block(
+    scope = _build_context_payload_block(
         subtask=subtask,
         task_tree=task_tree,
         project_root=project_root,
         policy=policy,
         preload_mode=preload_mode,
         runtime_tools=runtime_tools,
+        context_pack=context_pack,
     )
 
     return [
@@ -167,6 +174,150 @@ def build_executor_messages(
         system_message("\n".join(task_parts), cache_breakpoint=True),
         system_message(scope, cache_breakpoint=True),
     ]
+
+
+def build_executor_handoff_json(
+    *,
+    root_task: str,
+    task_tree: TaskTree,
+    subtask: SubTaskNode,
+    project_root: Path,
+    runtime_tools: frozenset[str] | None,
+    context_files: list[str],
+    prior_summaries: dict[str, str],
+    context_pack: Any | None = None,
+) -> dict[str, Any]:
+    allowed_tools = sorted(runtime_tools if runtime_tools is not None else subtask.effective_allowed_tools())
+    siblings = [
+        {
+            "id": node.id,
+            "kind": node.kind.value,
+            "status": node.status.value,
+            "depends_on": list(node.depends_on),
+        }
+        for node in task_tree.nodes
+    ]
+    evidence, known_negatives = _prior_evidence_and_negatives(
+        prior_summaries,
+        project_root,
+    )
+    payload: dict[str, Any] = {
+        "schema": "mitkii.executor_handoff.v1",
+        "root_task": root_task,
+        "subtask": {
+            "id": subtask.id,
+            "kind": subtask.kind.value,
+            "description": subtask.description,
+            "acceptance_criteria": subtask.acceptance_criteria,
+            "depends_on": list(subtask.depends_on),
+        },
+        "allowed_tools": allowed_tools,
+        "denied_tools": _denied_tools_for_allowed(allowed_tools),
+        "context_scope": {
+            "context_files": list(context_files),
+            "preload_mode": "paths_only" if context_files and runtime_tools and "context_search" in runtime_tools else "full_or_none",
+        },
+        "prior": {
+            "evidence": evidence,
+            "known_negatives": known_negatives,
+        },
+        "plan_state": {
+            "nodes": siblings,
+        },
+        "requirements": {
+            "final_output": {
+                "format": "json_object",
+                "required_keys": ["result", "acceptance_met", "evidence", "blocker"],
+            },
+            "tool_policy": (
+                "Only tools in allowed_tools are available. Denied tools are not "
+                "present in runtime schemas and must not be requested."
+            ),
+        },
+    }
+    if context_pack is not None:
+        pack_json = context_pack.to_agent_json(max_snippet_chars=8_000)
+        payload["context_pack_summary"] = {
+            "confidence": pack_json.get("confidence"),
+            "candidate_files": pack_json.get("candidate_files", []),
+            "candidate_symbols": pack_json.get("candidate_symbols", []),
+            "evidence": pack_json.get("evidence", []),
+            "known_negatives": pack_json.get("known_negatives", []),
+            "call_chain": pack_json.get("call_chain", []),
+            "tool_policy": pack_json.get("tool_policy", {}),
+            "budget": pack_json.get("budget", {}),
+        }
+    return payload
+
+
+def _denied_tools_for_allowed(allowed_tools: list[str]) -> list[str]:
+    catalog = {
+        "context_search",
+        "read_file",
+        "read_files",
+        "grep_search",
+        "map_search",
+        "glob_files",
+        "list_dir",
+        "git_status",
+        "edit_file",
+        "write_file",
+        "delete_file",
+        "replace_symbol",
+        "shell_exec",
+    }
+    return sorted(catalog - set(allowed_tools))
+
+
+def _prior_evidence_and_negatives(
+    prior_summaries: dict[str, str],
+    project_root: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    evidence: list[dict[str, Any]] = []
+    negatives: list[dict[str, str]] = []
+    for sid, text in prior_summaries.items():
+        parsed = parse_executor_final(text)
+        if parsed is not None:
+            for item in parsed.evidence:
+                evidence.append({"source_subtask": sid, **item})
+            if parsed.blocker or parsed.acceptance_met is False:
+                negatives.append({
+                    "source_subtask": sid,
+                    "reason": parsed.blocker or parsed.result,
+                })
+        for rel, span in extract_line_refs_from_text(text, project_root).items():
+            evidence.append({
+                "source_subtask": sid,
+                "path": rel,
+                "line_range": f"{span[0]}-{span[1]}",
+            })
+        for rel in extract_paths_from_text(text, project_root):
+            evidence.append({"source_subtask": sid, "path": rel})
+        for rel, line, symbol in extract_symbol_hits_from_text(text, project_root):
+            evidence.append({
+                "source_subtask": sid,
+                "path": rel,
+                "line": str(line),
+                "symbol": symbol,
+            })
+        lower = text.lower()
+        if any(marker in lower for marker in ("no matches", "not found", "没有命中", "未找到")):
+            negatives.append({"source_subtask": sid, "reason": text[:500]})
+    return _dedupe_dicts(evidence, limit=20), _dedupe_dicts(negatives, limit=10)
+
+
+def _dedupe_dicts(items: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def build_executor_scope_message(
@@ -177,16 +328,18 @@ def build_executor_scope_message(
     policy: TruncationPolicy | None = None,
     preload_mode: str = "full",
     runtime_tools: frozenset[str] | None = None,
+    context_pack: Any | None = None,
 ) -> Message:
     """L3 only — subtask scope plus optional file preload."""
     policy = policy or TruncationPolicy.green()
-    scope = _build_subtask_scope_block(
+    scope = _build_context_payload_block(
         subtask=subtask,
         task_tree=task_tree,
         project_root=project_root,
         policy=policy,
         preload_mode=preload_mode,
         runtime_tools=runtime_tools,
+        context_pack=context_pack,
     )
     return system_message(scope, cache_breakpoint=True)
 
@@ -202,9 +355,11 @@ def rebuild_executor_retry_messages(
     context_files: list[str],
     runtime_tools: frozenset[str] | None = None,
     exploration_digest: str | None = None,
+    context_pack: Any | None = None,
 ) -> list[Message]:
     from src.executor.retry_strategy import classify_failure_pattern
 
+    pattern = classify_failure_pattern(error_trace)
     messages = build_executor_messages(
         root_task=root_task,
         task_tree=task_tree,
@@ -214,28 +369,44 @@ def rebuild_executor_retry_messages(
         prior_summaries=prior_summaries,
         preload_mode="paths_only",
         runtime_tools=runtime_tools,
+        context_pack=context_pack,
     )
-    lines = [
-        f"Subtask [{subtask.id}] — retry after tool error(s).",
-        f"Retry failure pattern: {classify_failure_pattern(error_trace)}.",
-        "Change the approach from the failed attempt. Do NOT repeat the same "
-        "tool arguments or produce the same edit/write result.",
-        "Continue from the session summary if present; avoid re-reading the same line ranges.",
-        "Use edit_file for partial changes. Use write_file only for new files "
-        "or complete-file rewrites.",
-        "Do NOT write /tmp or scratch files.",
-    ]
-    if context_files:
-        lines.append("Allowed paths: " + ", ".join(context_files))
+    runtime_payload: dict[str, Any] = {
+        "schema": "mitkii.executor_runtime.v1",
+        "event": "retry",
+        "subtask_id": subtask.id,
+        "failure_pattern": pattern,
+        "rules": [
+            "Change the approach from the failed attempt.",
+            "Do not repeat the same tool arguments or same edit/write result.",
+            "Continue from session_digest if present.",
+            "Use edit_file for partial changes; write_file only for new files or complete-file rewrites.",
+            "Do not create /tmp or scratch files.",
+        ],
+        "allowed_paths": list(context_files),
+        "recent_errors": [str(e) for e in error_trace[-6:]],
+    }
     if exploration_digest and exploration_digest.strip():
-        from src.executor.exploration_digest import format_digest_system_block
-
-        messages.append(format_digest_system_block(exploration_digest))
-    if error_trace:
-        lines.append("Recent errors:")
-        lines.extend(f"- {e}" for e in error_trace[-6:])
-    messages.append(user_message("\n".join(lines)))
+        messages.append(_json_system_message(
+            "SESSION_DIGEST_JSON",
+            {
+                "schema": "mitkii.session_digest.v1",
+                "digest": exploration_digest.strip(),
+            },
+        ))
+    messages.append(_json_user_message("EXECUTOR_RUNTIME_JSON", runtime_payload))
     return messages
+
+
+def _json_system_message(label: str, payload: dict[str, Any]) -> Message:
+    return system_message(
+        label + "\n" + json.dumps(payload, ensure_ascii=False, indent=2),
+        cache_breakpoint=True,
+    )
+
+
+def _json_user_message(label: str, payload: dict[str, Any]) -> Message:
+    return user_message(label + "\n" + json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def count_messages_tokens(messages: list[Message]) -> int:

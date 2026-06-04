@@ -8,6 +8,7 @@ if False:  # TYPE_CHECKING without import cycle
     from src.planner.task_tree import SubTaskNode
 
 EXPLORE_TOOLS = frozenset({
+    "context_search",
     "read_file",
     "read_files",
     "grep_search",
@@ -18,14 +19,11 @@ EXPLORE_TOOLS = frozenset({
 })
 
 EDIT_SCOPED_EXPLORE = frozenset({
-    "grep_search",
-    "map_search",
-    "read_file",
-    "read_files",
+    "context_search",
 })
 
-# Harness always grants repo-map lookup on diagnose/edit (even if Planner omitted it).
-HARNESS_MAP_SEARCH = frozenset({"map_search"})
+# Harness always grants high-level context lookup on diagnose/edit.
+HARNESS_CONTEXT_SEARCH = frozenset({"context_search"})
 
 
 def effective_max_turns(kind: SubTaskKind, settings: MitKIISettings) -> int:
@@ -60,8 +58,8 @@ def resolve_executor_tools(
     """Runtime tool surface for the Executor LLM.
 
     Planner ``allowed_tools`` defines write intent; Harness may grant scoped
-    exploration (grep/read on context_files) when full preload is absent or
-    truncated — regardless of whether Planner listed grep_search.
+    exploration (context_search) when full preload is absent or truncated.
+    Raw read tools are only granted for explicit edit-read fallback.
     """
     from src.planner.task_tree import SubTaskNode  # noqa: F401
 
@@ -78,11 +76,11 @@ def resolve_executor_tools(
         scoped = not preloaded_paths or bool(truncated)
         if scoped:
             if explore_restricted:
-                return tools | frozenset({"read_file", "read_files"})
+                return tools
             return tools | EDIT_SCOPED_EXPLORE
         if explore_restricted:
             return tools
-        return tools | HARNESS_MAP_SEARCH
+        return tools | HARNESS_CONTEXT_SEARCH
 
     if explore_restricted and subtask.kind == SubTaskKind.DIAGNOSE:
         return frozenset()
@@ -92,14 +90,20 @@ def resolve_executor_tools(
 
     if not preloaded_paths:
         if subtask.kind == SubTaskKind.DIAGNOSE:
-            return allowed | HARNESS_MAP_SEARCH
+            return allowed | HARNESS_CONTEXT_SEARCH
         return allowed
 
     if subtask.kind == SubTaskKind.DIAGNOSE:
-        return (allowed - frozenset({"read_file", "read_files"})) | HARNESS_MAP_SEARCH
+        return (allowed - frozenset({"read_file", "read_files"})) | HARNESS_CONTEXT_SEARCH
 
     if subtask.kind == SubTaskKind.VERIFY:
-        return allowed - frozenset({"read_file", "read_files", "grep_search", "map_search"})
+        return allowed - frozenset({
+            "context_search",
+            "read_file",
+            "read_files",
+            "grep_search",
+            "map_search",
+        })
 
     return allowed
 
@@ -113,12 +117,12 @@ def redundant_read_denial(
     if kind == SubTaskKind.EDIT:
         if paths_only:
             return (
-                f"read_file blocked: '{rel_path}' — use map_search(query) or "
-                f'grep_search(pattern, path="{rel_path}") to locate code, then edit_file.'
+                f"read_file blocked: '{rel_path}' — use context_search(query, need) "
+                "to locate code, then edit_file."
             )
         return (
             f"read_file blocked: '{rel_path}' is already preloaded in your system prompt. "
-            "Use map_search or grep_search if truncated, then edit_file to fix the code. "
+            "Use context_search if truncated, then edit_file to fix the code. "
             "Use write_file only with complete file content."
         )
     return (
@@ -132,7 +136,7 @@ def explore_tool_denial(tool_name: str) -> str:
     return (
         f"Tool '{tool_name}' is disabled for this subtask turn — "
         "check Allowed tools in your system prompt. "
-        "In scoped edit mode use map_search, grep_search, or read_files(paths=[...]) once, then edit_file."
+        "In scoped edit mode use context_search(query, need), then edit_file."
     )
 
 
@@ -157,7 +161,10 @@ def enable_edit_read_fallback(
 
 
 def explore_first_turn_tools(runtime_tools: frozenset[str]) -> frozenset[str]:
-    """Turn-1 exploration surface: batch read or grep/map, not many read_file calls."""
+    """Turn-1 exploration surface: prefer skill-owned context lookup."""
+    batch = runtime_tools & frozenset({"context_search"})
+    if batch:
+        return batch
     batch = runtime_tools & frozenset({"grep_search", "map_search", "read_files"})
     if batch:
         return batch

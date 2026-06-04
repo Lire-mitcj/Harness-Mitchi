@@ -65,7 +65,7 @@ def test_query_style_edit_uses_incremental_read_not_splice(tmp_path: Path) -> No
                 id="st-2",
                 kind=SubTaskKind.EDIT,
                 description="将登机牌查询接口改为使用视图",
-                allowed_tools=["read_file", "edit_file"],
+                allowed_tools=["context_search", "edit_file"],
                 context_files=["main.py"],
                 depends_on=["st-1"],
             ),
@@ -89,17 +89,15 @@ def test_query_style_edit_uses_incremental_read_not_splice(tmp_path: Path) -> No
 
     assert bundle.edit_handoff is None
     assert bundle.ctx_runtime is not None
-    assert bundle.ctx_runtime.edit_read_fallback is True
-    assert bundle.ctx_runtime.active_runtime_tools == frozenset(
-        {"edit_file", "read_file", "read_files"}
-    )
+    assert bundle.ctx_runtime.edit_read_fallback is False
+    assert bundle.ctx_runtime.active_runtime_tools == frozenset({"edit_file"})
     assert resolve_turn_tools(
         bundle,
         turns_used=1,
         tool_rounds=0,
         file_changes=[],
         active_runtime_tools=bundle.ctx_runtime.active_runtime_tools,
-    ) == frozenset({"edit_file", "read_files"})
+    ) == frozenset({"edit_file"})
     assert resolve_turn_tools(
         bundle,
         turns_used=2,
@@ -117,15 +115,7 @@ def test_diagnose_turn_tools_prefer_batched_map_and_grep(tmp_path: Path) -> None
                 id="st-1",
                 kind=SubTaskKind.DIAGNOSE,
                 description="locate target",
-                allowed_tools=[
-                    "read_file",
-                    "read_files",
-                    "grep_search",
-                    "map_search",
-                    "glob_files",
-                    "list_dir",
-                    "git_status",
-                ],
+                allowed_tools=["context_search", "git_status"],
             ),
         ],
     )
@@ -136,17 +126,8 @@ def test_diagnose_turn_tools_prefer_batched_map_and_grep(tmp_path: Path) -> None
         project_root=tmp_path,
         settings=MitKIISettings(),
         truncation_policy=TruncationPolicy.green(),
-        map_search_in_registry=True,
     )
-    active = frozenset({
-        "read_file",
-        "read_files",
-        "grep_search",
-        "map_search",
-        "glob_files",
-        "list_dir",
-        "git_status",
-    })
+    active = frozenset({"context_search", "git_status"})
 
     assert resolve_turn_tools(
         bundle,
@@ -154,7 +135,7 @@ def test_diagnose_turn_tools_prefer_batched_map_and_grep(tmp_path: Path) -> None
         tool_rounds=0,
         file_changes=[],
         active_runtime_tools=active,
-    ) == frozenset({"grep_search", "map_search"})
+    ) == frozenset({"context_search"})
     assert resolve_turn_tools(
         bundle,
         turns_used=3,
@@ -262,10 +243,7 @@ def test_prepare_handoff_coordinate_handoff_restricts_verify_explore(tmp_path: P
                 depends_on=["st-1"],
                 allowed_tools=[
                     "shell_exec",
-                    "read_file",
-                    "read_files",
-                    "grep_search",
-                    "map_search",
+                    "context_search",
                 ],
             ),
         ],
@@ -286,6 +264,7 @@ def test_prepare_handoff_coordinate_handoff_restricts_verify_explore(tmp_path: P
     assert bundle.ctx_runtime is not None
     assert bundle.ctx_runtime.explore_restricted is True
     assert "shell_exec" in bundle.ctx_runtime.active_runtime_tools
+    assert "context_search" not in bundle.ctx_runtime.active_runtime_tools
     assert "read_file" not in bundle.ctx_runtime.active_runtime_tools
     assert "grep_search" not in bundle.ctx_runtime.active_runtime_tools
     assert "map_search" not in bundle.ctx_runtime.active_runtime_tools
@@ -311,7 +290,7 @@ def test_prepare_handoff_coordinate_handoff_restricts_diagnose_explore(tmp_path:
                 kind=SubTaskKind.DIAGNOSE,
                 description="check target usage",
                 depends_on=["st-1"],
-                allowed_tools=["read_file", "read_files", "grep_search", "map_search"],
+                allowed_tools=["context_search"],
             ),
         ],
     )
@@ -338,8 +317,8 @@ def test_prepare_handoff_coordinate_handoff_restricts_diagnose_explore(tmp_path:
     assert '<file path="app.py">' in system_text
 
 
-def test_diagnose_locate_rounds_are_capped(tmp_path: Path) -> None:
-    settings = MitKIISettings(executor_tool_rounds_diagnose=4)
+def test_diagnose_context_search_is_single_round(tmp_path: Path) -> None:
+    settings = MitKIISettings()
     tree = TaskTree(
         root_task="find",
         nodes=[
@@ -347,7 +326,7 @@ def test_diagnose_locate_rounds_are_capped(tmp_path: Path) -> None:
                 id="st-1",
                 kind=SubTaskKind.DIAGNOSE,
                 description="find target",
-                allowed_tools=["grep_search", "map_search"],
+                allowed_tools=["context_search"],
             ),
         ],
     )
@@ -360,15 +339,22 @@ def test_diagnose_locate_rounds_are_capped(tmp_path: Path) -> None:
         truncation_policy=TruncationPolicy.green(),
     )
 
-    active = frozenset({"grep_search", "map_search"})
+    active = frozenset({"context_search"})
 
+    assert resolve_turn_tools(
+        bundle,
+        turns_used=1,
+        tool_rounds=0,
+        file_changes=[],
+        active_runtime_tools=active,
+    ) == active
     assert resolve_turn_tools(
         bundle,
         turns_used=2,
         tool_rounds=1,
         file_changes=[],
         active_runtime_tools=active,
-    ) == active
+    ) == frozenset()
     assert resolve_turn_tools(
         bundle,
         turns_used=3,
@@ -420,6 +406,6 @@ def test_retry_messages_force_different_attempt(tmp_path: Path) -> None:
     )
     text = "\n".join(m.content or "" for m in messages)
 
-    assert "Retry failure pattern: edit_not_found" in text
-    assert "Do NOT repeat the same tool arguments" in text
+    assert '"failure_pattern": "edit_not_found"' in text
+    assert "Do not repeat the same tool arguments" in text
     assert "Files already read: app.py" in text

@@ -178,6 +178,50 @@ def test_exit_gate_passes_chinese_diagnose_handoff_evidence() -> None:
     assert result.verdict == GateVerdict.PASS
 
 
+def test_exit_gate_passes_structured_diagnose_handoff_evidence() -> None:
+    node = SubTaskNode(
+        id="st-1",
+        description="定位查询接口",
+        kind=SubTaskKind.DIAGNOSE,
+        acceptance_criteria="输出文件:行号、符号和代码片段/决策",
+    )
+    result = validate_exit(
+        ExitCheckInput(
+            subtask=node,
+            final_message=(
+                '{"result":"已定位目标","acceptance_met":true,'
+                '"evidence":[{"path":"main.py","line":1626,'
+                '"symbol":"query_orders","snippet":"SELECT * FROM orders"}],'
+                '"blocker":""}'
+            ),
+            error_trace=[],
+            changed_files=[],
+        )
+    )
+    assert result.verdict == GateVerdict.PASS
+
+
+def test_exit_gate_blocks_structured_diagnose_acceptance_false() -> None:
+    node = SubTaskNode(
+        id="st-1",
+        description="定位查询接口",
+        kind=SubTaskKind.DIAGNOSE,
+        acceptance_criteria="输出文件:行号、符号和代码片段/决策",
+    )
+    result = validate_exit(
+        ExitCheckInput(
+            subtask=node,
+            final_message=(
+                '{"result":"未定位目标","acceptance_met":false,'
+                '"evidence":[],"blocker":"没有命中"}'
+            ),
+            error_trace=[],
+            changed_files=[],
+        )
+    )
+    assert result.verdict == GateVerdict.BLOCK
+
+
 def test_exit_gate_blocks_llm_transport_error_summary() -> None:
     node = SubTaskNode(
         id="st-1",

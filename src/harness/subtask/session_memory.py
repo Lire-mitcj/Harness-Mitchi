@@ -53,6 +53,13 @@ class ExploreSessionMemory:
         )
 
     def explore_key(self, tool_name: str, args: dict) -> str | None:
+        if tool_name == "context_search":
+            query = args.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return None
+            need = args.get("need")
+            suffix = f":{need.strip()}" if isinstance(need, str) and need.strip() else ""
+            return normalize_map_query(query + suffix)
         if tool_name == "grep_search":
             pattern = args.get("pattern") or args.get("query") or ""
             if not isinstance(pattern, str) or not pattern.strip():
@@ -127,6 +134,13 @@ class ExploreSessionMemory:
         )
 
     def is_duplicate_explore(self, tool_name: str, args: dict) -> bool:
+        if tool_name == "context_search":
+            query = args.get("query")
+            if not isinstance(query, str):
+                return False
+            need = args.get("need")
+            suffix = f":{need.strip()}" if isinstance(need, str) and need.strip() else ""
+            return self.tracker.check_map(query + suffix) is not None
         if tool_name == "grep_search":
             pattern = args.get("pattern") or args.get("query") or ""
             if not isinstance(pattern, str):
@@ -168,7 +182,13 @@ class ExploreSessionMemory:
         return False
 
     def record_explore(self, tool_name: str, args: dict) -> None:
-        if tool_name == "grep_search":
+        if tool_name == "context_search":
+            query = args.get("query")
+            if isinstance(query, str) and query.strip():
+                need = args.get("need")
+                suffix = f":{need.strip()}" if isinstance(need, str) and need.strip() else ""
+                self.tracker.record_map(query + suffix)
+        elif tool_name == "grep_search":
             pattern = args.get("pattern") or args.get("query") or ""
             if isinstance(pattern, str):
                 self.tracker.record_grep(

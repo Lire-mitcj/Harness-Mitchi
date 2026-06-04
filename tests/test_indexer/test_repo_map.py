@@ -34,8 +34,13 @@ def test_repo_map_skeleton_includes_search_modules() -> None:
 
 
 @pytest.mark.asyncio
-async def test_map_search_tool() -> None:
-    service = RepoMapService(FIXTURE_ROOT, enabled=True, top_k=10)
+async def test_map_search_tool(tmp_path: Path) -> None:
+    service = RepoMapService(
+        FIXTURE_ROOT,
+        enabled=True,
+        top_k=10,
+        cache_path=tmp_path / "symbols.db",
+    )
     service.initial_build()
     tool = MapSearchTool(service)
     result = await tool.execute(query="boarding")
@@ -44,8 +49,13 @@ async def test_map_search_tool() -> None:
 
 
 @pytest.mark.asyncio
-async def test_repo_map_service_refresh_on_dirty() -> None:
-    service = RepoMapService(FIXTURE_ROOT, enabled=True, top_k=50)
+async def test_repo_map_service_refresh_on_dirty(tmp_path: Path) -> None:
+    service = RepoMapService(
+        FIXTURE_ROOT,
+        enabled=True,
+        top_k=50,
+        cache_path=tmp_path / "symbols.db",
+    )
     first = service.initial_build()
     assert first is not None
     service.mark_dirty("schema.sql")

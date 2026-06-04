@@ -74,7 +74,7 @@ def test_plan_gate_enriches_before_sql_warn() -> None:
                 kind=SubTaskKind.EDIT,
                 context_files=["main.py"],
                 depends_on=["st-1"],
-                allowed_tools=["read_file", "edit_file", "grep_search"],
+                allowed_tools=["context_search", "edit_file"],
                 acceptance_criteria="Transaction handling is fixed",
             ),
         ],
