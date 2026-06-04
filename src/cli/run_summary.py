@@ -35,7 +35,7 @@ def _format_step_line(node: SubTaskNode, summaries: dict[str, str]) -> list[str]
     icon = _STATUS_ICON.get(node.status, "?")
     out = [f"  {icon} [{node.id}] {node.description}"]
     summary = summaries.get(node.id, "").strip()
-    if summary and node.status == SubTaskStatus.SUCCESS and node.kind.value != "diagnose":
+    if summary and node.status == SubTaskStatus.SUCCESS:
         hint = milestone_from_report(summary, max_len=100)
         if hint:
             out.append(f"      → {hint}")

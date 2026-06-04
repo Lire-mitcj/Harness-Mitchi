@@ -466,3 +466,152 @@ async def test_context_search_paths_are_whitelisted_for_edit(tmp_path: Path) -> 
     tools.call.assert_not_called()
     assert ctx.tool_failures[0] == 1
     assert "not in context_files" in (ctx.messages[0].content or "")
+
+
+@pytest.mark.asyncio
+async def test_context_search_defaults_to_context_files_and_caps_results(tmp_path: Path) -> None:
+    subtask = SubTaskNode(
+        id="st-2",
+        kind=SubTaskKind.EDIT,
+        description="fix",
+        context_files=["app.py"],
+    )
+    ctx = ToolPipelineContext(
+        subtask=subtask,
+        root_task="task",
+        project_root=tmp_path,
+        runtime_tools=frozenset({"context_search"}),
+        preloaded_paths=frozenset(),
+        paths_only_mode=True,
+        truncated_paths=frozenset(),
+        whitelist_files=["app.py"],
+        policy=TruncationPolicy.green(),
+        memory=ExploreSessionMemory(tracker=ExploreCommandTracker()),
+        messages=[],
+        error_trace=[],
+        tool_failures=[0],
+        shell_tracker=MagicMock(),
+        pre_edit_snapshots={},
+        file_changes=[],
+        max_context_search_results=25,
+    )
+    tools = MagicMock()
+    tools.get.return_value = None
+    tools.call = AsyncMock(return_value=ToolResult(success=True, output="ok"))
+    pipeline = ExecutorToolPipeline(
+        tools,
+        MagicMock(),
+        approval_waiter=AsyncMock(return_value=True),
+        normalize_path=lambda _r, p: str(p),
+        snapshot_before_edit=lambda *_a: None,
+        collect_diff=lambda *_a: {},
+    )
+    response = MagicMock()
+    response.tool_calls = [
+        ToolCall(
+            id="t1",
+            name="context_search",
+            arguments={"query": "target", "max_results": 999},
+        ),
+    ]
+
+    async for _ev in pipeline.process_tool_calls(response, ctx):
+        pass
+
+    tools.call.assert_awaited_once()
+    args = tools.call.await_args.args[1]
+    assert args["paths"] == ["app.py"]
+    assert args["max_results"] == 25
+
+
+@pytest.mark.asyncio
+async def test_tool_budget_blocks_extra_calls(tmp_path: Path) -> None:
+    subtask = SubTaskNode(id="st-1", kind=SubTaskKind.DIAGNOSE, description="find")
+    memory = ExploreSessionMemory(tracker=ExploreCommandTracker())
+    memory.tool_calls = 1
+    ctx = ToolPipelineContext(
+        subtask=subtask,
+        root_task="task",
+        project_root=tmp_path,
+        runtime_tools=frozenset({"context_search"}),
+        preloaded_paths=frozenset(),
+        paths_only_mode=False,
+        truncated_paths=frozenset(),
+        whitelist_files=[],
+        policy=TruncationPolicy.green(),
+        memory=memory,
+        messages=[],
+        error_trace=[],
+        tool_failures=[0],
+        shell_tracker=MagicMock(),
+        pre_edit_snapshots={},
+        file_changes=[],
+        max_tool_calls=1,
+    )
+    tools = MagicMock()
+    tools.get.return_value = None
+    tools.call = AsyncMock(return_value=ToolResult(success=True, output="ok"))
+    pipeline = ExecutorToolPipeline(
+        tools,
+        MagicMock(),
+        approval_waiter=AsyncMock(return_value=True),
+        normalize_path=lambda _r, p: str(p),
+        snapshot_before_edit=lambda *_a: None,
+        collect_diff=lambda *_a: {},
+    )
+    response = MagicMock()
+    response.tool_calls = [
+        ToolCall(id="t1", name="context_search", arguments={"query": "target"}),
+    ]
+
+    async for _ev in pipeline.process_tool_calls(response, ctx):
+        pass
+
+    tools.call.assert_not_called()
+    assert "Tool budget exhausted" in (ctx.messages[0].content or "")
+    assert ctx.tool_failures[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_context_search_blocks_known_negative_query(tmp_path: Path) -> None:
+    subtask = SubTaskNode(id="st-1", kind=SubTaskKind.DIAGNOSE, description="find")
+    ctx = ToolPipelineContext(
+        subtask=subtask,
+        root_task="task",
+        project_root=tmp_path,
+        runtime_tools=frozenset({"context_search"}),
+        preloaded_paths=frozenset(),
+        paths_only_mode=False,
+        truncated_paths=frozenset(),
+        whitelist_files=[],
+        policy=TruncationPolicy.green(),
+        memory=ExploreSessionMemory(tracker=ExploreCommandTracker()),
+        messages=[],
+        error_trace=[],
+        tool_failures=[0],
+        shell_tracker=MagicMock(),
+        pre_edit_snapshots={},
+        file_changes=[],
+        known_negative_queries=("boarding_pass",),
+    )
+    tools = MagicMock()
+    tools.get.return_value = None
+    tools.call = AsyncMock(return_value=ToolResult(success=True, output="ok"))
+    pipeline = ExecutorToolPipeline(
+        tools,
+        MagicMock(),
+        approval_waiter=AsyncMock(return_value=True),
+        normalize_path=lambda _r, p: str(p),
+        snapshot_before_edit=lambda *_a: None,
+        collect_diff=lambda *_a: {},
+    )
+    response = MagicMock()
+    response.tool_calls = [
+        ToolCall(id="t1", name="context_search", arguments={"query": "boarding_pass"}),
+    ]
+
+    async for _ev in pipeline.process_tool_calls(response, ctx):
+        pass
+
+    tools.call.assert_not_called()
+    assert "known_negatives" in (ctx.messages[0].content or "")

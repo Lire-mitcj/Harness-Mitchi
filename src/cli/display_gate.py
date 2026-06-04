@@ -69,6 +69,8 @@ class OrchestratorDisplayGate:
 
         if et == EventType.STATUS:
             if data.get("spinner_only"):
+                if data.get("llm_loading"):
+                    renderer.render_event(event)
                 return
             milestone = data.get("milestone")
             if milestone == "subtask_start":

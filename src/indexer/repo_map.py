@@ -36,7 +36,9 @@ class RepoMap:
     symbols: list[RankedSymbol] = field(default_factory=list)
     all_symbols: list[RankedSymbol] = field(default_factory=list)
     symbols_by_file: dict[str, list[RankedSymbol]] = field(default_factory=dict)
+    symbols_by_id: dict[str, RankedSymbol] = field(default_factory=dict)
     file_scores: dict[str, float] = field(default_factory=dict)
+    reference_edges: list[tuple[str, str]] = field(default_factory=list)
     source: str = "parser"
     build_ms: int = 0
     symbol_count: int = 0
@@ -56,6 +58,45 @@ class RepoMap:
         ]
         hits.sort(key=lambda s: s.score, reverse=True)
         return hits[:limit]
+
+    def expand_symbol_edges(
+        self,
+        symbol_ids: list[str],
+        *,
+        depth: int = 2,
+        limit: int = 20,
+    ) -> list[tuple[RankedSymbol, RankedSymbol]]:
+        """Expand high-signal symbol references around focused symbols."""
+        if not symbol_ids or not self.reference_edges:
+            return []
+        adjacency: dict[str, list[str]] = {}
+        for src, dst in self.reference_edges:
+            adjacency.setdefault(src, []).append(dst)
+
+        out: list[tuple[RankedSymbol, RankedSymbol]] = []
+        seen_edges: set[tuple[str, str]] = set()
+        seen_nodes = set(symbol_ids)
+        frontier = list(symbol_ids)
+        for _level in range(max(1, depth)):
+            next_frontier: list[str] = []
+            for src in frontier:
+                src_sym = self.symbols_by_id.get(src)
+                for dst in adjacency.get(src, []):
+                    dst_sym = self.symbols_by_id.get(dst)
+                    if src_sym is not None and dst_sym is not None:
+                        key = (src, dst)
+                        if key not in seen_edges:
+                            seen_edges.add(key)
+                            out.append((src_sym, dst_sym))
+                            if len(out) >= limit:
+                                return out
+                    if dst not in seen_nodes:
+                        seen_nodes.add(dst)
+                        next_frontier.append(dst)
+            frontier = next_frontier
+            if not frontier:
+                break
+        return out
 
     def to_skeleton_block(
         self,
@@ -373,7 +414,9 @@ def build_repo_map(
         symbols=top_symbols,
         all_symbols=ranked,
         symbols_by_file=symbols_by_file,
+        symbols_by_id={sym.symbol_id: sym for sym in ranked},
         file_scores=file_scores,
+        reference_edges=edges,
         source=indexed.source,
         build_ms=elapsed,
         symbol_count=len(indexed.symbols),

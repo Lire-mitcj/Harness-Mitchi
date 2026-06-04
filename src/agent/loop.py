@@ -142,6 +142,15 @@ class AgentLoop:
 
             response_text = ""
             response: LLMResponse | None = None
+            yield AgentEvent(
+                type=EventType.STATUS,
+                content=f"Agent · turn {self.state.turn_count} · calling model…",
+                data={
+                    "spinner_only": True,
+                    "llm_loading": True,
+                    "phase": "agent",
+                },
+            )
 
             async for chunk in self._stream_llm(trimmed, tool_schemas):
                 if chunk.get("type") == "content":

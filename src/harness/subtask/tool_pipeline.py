@@ -109,6 +109,9 @@ class ToolPipelineContext:
     edit_splice_max_attempts: int = 2
     runtime: ExecutorRuntimeState | None = None
     splice_edit: bool = False
+    max_tool_calls: int | None = None
+    max_context_search_results: int = 80
+    known_negative_queries: tuple[str, ...] = ()
     round_stats: ToolRoundStats = field(default_factory=ToolRoundStats)
 
 
@@ -198,6 +201,14 @@ class ExecutorToolPipeline:
                 ctx.error_trace.append(deny)
                 ctx.messages.append(tool_message(tc.id, deny))
                 yield tool_result_event(tc.name, deny, success=False, phase="executor")
+                continue
+
+            budget_deny = _tool_budget_denial(ctx)
+            if budget_deny is not None:
+                ctx.error_trace.append(budget_deny)
+                ctx.messages.append(tool_message(tc.id, budget_deny))
+                ctx.tool_failures[0] += 1
+                yield tool_result_event(tc.name, budget_deny, success=False, phase="executor")
                 continue
 
             if tc.name in EXPLORE_TOOLS:
@@ -322,6 +333,14 @@ class ExecutorToolPipeline:
                 ctx.messages.append(tool_message(tc.id, deny))
                 ctx.tool_failures[0] += 1
                 yield tool_result_event(tc.name, deny, success=False, phase="executor")
+                continue
+
+            budget_deny = _tool_budget_denial(ctx, pending=len(prepared))
+            if budget_deny is not None:
+                ctx.error_trace.append(budget_deny)
+                ctx.messages.append(tool_message(tc.id, budget_deny))
+                ctx.tool_failures[0] += 1
+                yield tool_result_event(tc.name, budget_deny, success=False, phase="executor")
                 continue
 
             if tc.name in EXPLORE_TOOLS:
@@ -485,6 +504,14 @@ class ExecutorToolPipeline:
             )
         if tc.name == "shell_exec":
             return normalize_shell_exec_args(tc.arguments, project_root=ctx.project_root)
+        if tc.name == "context_search":
+            args = dict(tc.arguments)
+            max_results = args.get("max_results")
+            if not isinstance(max_results, int) or max_results > ctx.max_context_search_results:
+                args["max_results"] = ctx.max_context_search_results
+            if ctx.whitelist_files and not args.get("paths"):
+                args["paths"] = list(ctx.whitelist_files)
+            return args
         return dict(tc.arguments)
 
     def _pre_execute_guards(
@@ -598,6 +625,14 @@ class ExecutorToolPipeline:
                 return msg, False
 
         if tc.name == "context_search":
+            query = str(tc.arguments.get("query") or "").strip().lower()
+            if query and any(_query_equivalent(query, known) for known in ctx.known_negative_queries):
+                msg = (
+                    f"context_search blocked: query {query!r} repeats known_negatives. "
+                    "Use existing handoff evidence or ask for a different focused query."
+                )
+                ctx.error_trace.append(msg)
+                return msg, False
             raw_paths = [
                 p for p in (tc.arguments.get("paths") or []) if isinstance(p, str)
             ]
@@ -683,6 +718,18 @@ def build_tool_pipeline_context(
 ) -> ToolPipelineContext:
     """Harness builds tool middleware context — Executor only passes session state."""
     splice_edit = bool(bundle.edit_handoff and bundle.edit_handoff.active)
+    context_pack = bundle.ctx_config.context_pack if bundle.ctx_config else None
+    tool_policy = getattr(context_pack, "tool_policy", {}) if context_pack is not None else {}
+    budget = getattr(context_pack, "budget", {}) if context_pack is not None else {}
+    known_negative_queries = tuple(
+        str(item.get("query") or "").strip().lower()
+        for item in getattr(context_pack, "known_negatives", ())
+        if isinstance(item, dict) and str(item.get("query") or "").strip()
+    )
+    max_tool_calls = tool_policy.get("max_tool_calls") if isinstance(tool_policy, dict) else None
+    max_context_search_results = (
+        budget.get("context_search_max_results") if isinstance(budget, dict) else None
+    )
     return ToolPipelineContext(
         subtask=subtask,
         root_task=root_task,
@@ -708,6 +755,13 @@ def build_tool_pipeline_context(
         edit_splice_max_attempts=bundle.edit_splice_max_attempts,
         runtime=runtime,
         splice_edit=splice_edit,
+        max_tool_calls=max_tool_calls if isinstance(max_tool_calls, int) else None,
+        max_context_search_results=(
+            max_context_search_results
+            if isinstance(max_context_search_results, int)
+            else 80
+        ),
+        known_negative_queries=known_negative_queries,
     )
 
 
@@ -719,6 +773,27 @@ def _can_parallelize_tool_round(tool_calls: list[ToolCall]) -> bool:
 
 def _norm_rel_path(path: str) -> str:
     return path.replace("\\", "/").lstrip("./")
+
+
+def _tool_budget_denial(ctx: ToolPipelineContext, *, pending: int = 0) -> str | None:
+    if ctx.max_tool_calls is None:
+        return None
+    if ctx.memory.tool_calls + pending >= ctx.max_tool_calls:
+        return (
+            f"Tool budget exhausted: max_tool_calls={ctx.max_tool_calls}. "
+            "Summarize current evidence or finish with blocker."
+        )
+    return None
+
+
+def _query_equivalent(query: str, known: str) -> bool:
+    if not query or not known:
+        return False
+    if query == known or query in known or known in query:
+        return True
+    q_terms = {term for term in query.split() if len(term) >= 2}
+    k_terms = {term for term in known.split() if len(term) >= 2}
+    return bool(q_terms and k_terms and len(q_terms & k_terms) >= min(2, len(k_terms)))
 
 
 def _tool_denial_for_context(tool_name: str, ctx: ToolPipelineContext) -> str:

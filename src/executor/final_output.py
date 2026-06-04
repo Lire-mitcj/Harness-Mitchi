@@ -8,8 +8,13 @@ from typing import Any
 @dataclass(frozen=True)
 class ExecutorFinal:
     result: str
+    status: str = ""
     acceptance_met: bool | None = None
     evidence: list[dict[str, str]] = field(default_factory=list)
+    changed_files: list[str] = field(default_factory=list)
+    validation: dict[str, Any] = field(default_factory=dict)
+    risks: list[str] = field(default_factory=list)
+    handoff: dict[str, Any] = field(default_factory=dict)
     blocker: str = ""
     raw: dict[str, Any] | None = None
 
@@ -25,15 +30,35 @@ def parse_executor_final(text: str | None) -> ExecutorFinal | None:
     if parsed is None:
         return None
 
-    result = str(parsed.get("result") or parsed.get("summary") or "").strip()
+    status = str(parsed.get("status") or "").strip()
+    result = str(parsed.get("result") or parsed.get("summary") or status or "").strip()
     blocker = str(parsed.get("blocker") or "").strip()
     acceptance_raw = parsed.get("acceptance_met")
-    acceptance_met = acceptance_raw if isinstance(acceptance_raw, bool) else None
+    acceptance_met = acceptance_raw if isinstance(acceptance_raw, bool) else _acceptance_from_status(status)
+    handoff = parsed.get("handoff") if isinstance(parsed.get("handoff"), dict) else {}
     evidence = _normalize_evidence(parsed.get("evidence"))
+    if not evidence and handoff:
+        evidence = _normalize_evidence(handoff.get("evidence"))
+    changed_files = [
+        str(item).strip()
+        for item in (parsed.get("changed_files") or [])
+        if str(item).strip()
+    ] if isinstance(parsed.get("changed_files"), list) else []
+    validation = parsed.get("validation") if isinstance(parsed.get("validation"), dict) else {}
+    risks = [
+        str(item).strip()
+        for item in (parsed.get("risks") or [])
+        if str(item).strip()
+    ] if isinstance(parsed.get("risks"), list) else []
     return ExecutorFinal(
         result=result,
+        status=status,
         acceptance_met=acceptance_met,
         evidence=evidence,
+        changed_files=changed_files,
+        validation=validation,
+        risks=risks,
+        handoff=handoff,
         blocker=blocker,
         raw=parsed,
     )
@@ -47,7 +72,24 @@ def normalize_executor_final_text(text: str | None) -> tuple[str, dict[str, Any]
 
 
 def format_executor_final(final: ExecutorFinal) -> str:
-    lines = [f"Result: {final.result or '(no result provided)'}"]
+    lines = [f"Result: {final.result or final.status or '(no result provided)'}"]
+    if final.status:
+        lines.append(f"Status: {final.status}")
+    if final.changed_files:
+        lines.append("Changed files: " + ", ".join(final.changed_files))
+    if final.validation:
+        ran = final.validation.get("ran")
+        result = final.validation.get("result")
+        summary = final.validation.get("summary")
+        parts = []
+        if ran:
+            parts.append(f"ran={ran}")
+        if result:
+            parts.append(f"result={result}")
+        if summary:
+            parts.append(f"summary={summary}")
+        if parts:
+            lines.append("Validation: " + "; ".join(str(p) for p in parts))
     if final.evidence:
         lines.append("Evidence:")
         for item in final.evidence:
@@ -76,6 +118,8 @@ def format_executor_final(final: ExecutorFinal) -> str:
     )
     if final.blocker:
         conclusion += f"; blocker: {final.blocker}"
+    if final.risks:
+        conclusion += "; risks: " + ", ".join(final.risks)
     lines.append(f"Conclusion: {conclusion}.")
     return "\n".join(lines)
 
@@ -116,6 +160,15 @@ def _normalize_evidence(raw: object) -> list[dict[str, str]]:
         if normalized:
             out.append(normalized)
     return out
+
+
+def _acceptance_from_status(status: str) -> bool | None:
+    lower = status.strip().lower()
+    if lower == "success":
+        return True
+    if lower in {"failed", "need_more_context"}:
+        return False
+    return None
 
 
 def _location(item: dict[str, str]) -> str:

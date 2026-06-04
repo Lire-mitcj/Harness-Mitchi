@@ -42,6 +42,7 @@ class ContextRetriever:
         task_template: str = "",
         current_files: tuple[str, ...] = (),
         open_files: tuple[str, ...] = (),
+        recent_files: tuple[str, ...] = (),
         previous_handoff: dict[str, Any] | None = None,
         mode: str | None = None,
         max_input_tokens: int = 24_000,
@@ -64,13 +65,18 @@ class ContextRetriever:
             for query in queries:
                 raw_symbols.extend(self.repo_map.search(query, limit=20))
 
-        symbols = _dedupe_symbols(raw_symbols)[: self.max_symbols]
+        focused_symbols = _dedupe_symbols(raw_symbols)[: self.max_symbols]
+        graph_edges = _graph_call_edges(self.repo_map, focused_symbols)
+        symbols = _dedupe_symbols(
+            focused_symbols + [dst for _src, dst in graph_edges]
+        )[: self.max_symbols]
         explicit_files = _explicit_files(user_request, self.project_root)
         file_scores = _score_files(
             symbols=symbols,
             queries=queries,
             explicit_files=explicit_files,
             current_files=tuple(_norm_path(p) for p in current_files + open_files),
+            recent_files=tuple(_norm_path(p) for p in recent_files),
             repo_map=self.repo_map,
             project_root=self.project_root,
         )
@@ -94,13 +100,14 @@ class ContextRetriever:
             explicit_files=explicit_files,
             queries=queries,
         )
+        evidence = _merge_prior_evidence(evidence, previous_handoff)
         known_negatives = _known_negatives(
             queries=queries,
             symbols=symbols,
             snippets=snippets,
             previous_handoff=previous_handoff,
         )
-        call_chain = _call_chain(symbols, snippets)
+        call_chain = _call_chain(symbols, snippets, graph_edges=graph_edges)
         if not symbols:
             missing.append("no relevant symbols found")
         if symbols and not snippets:
@@ -124,6 +131,7 @@ class ContextRetriever:
                         symbols=symbols,
                         explicit_files=explicit_files,
                         current_files=tuple(_norm_path(p) for p in current_files + open_files),
+                        recent_files=tuple(_norm_path(p) for p in recent_files),
                         repo_map=self.repo_map,
                     ),
                 }
@@ -158,6 +166,7 @@ class ContextRetriever:
                 "max_input_tokens": max_input_tokens,
                 "reserved_output_tokens": reserved_output_tokens,
                 "snippet_chars": _token_chars(max_input_tokens - reserved_output_tokens),
+                "context_search_max_results": 80,
             },
             confidence=confidence,
             missing_info=tuple(missing),
@@ -166,6 +175,9 @@ class ContextRetriever:
                 "retriever": "context_builder_v1",
                 "task_template": task_template,
                 "queries": "|".join(queries),
+                "previous_next_focus": "|".join(
+                    _prior_text_items(previous_handoff, "next_focus")
+                ),
             },
         )
 
@@ -243,6 +255,7 @@ def _score_files(
     queries: list[str],
     explicit_files: tuple[str, ...],
     current_files: tuple[str, ...],
+    recent_files: tuple[str, ...],
     repo_map: RepoMapSearcher | None,
     project_root: Path,
 ) -> list[tuple[str, float]]:
@@ -264,6 +277,8 @@ def _score_files(
         add(path, 1.5, "explicit_file")
     for path in current_files:
         add(path, 0.4, "open_file")
+    for path in recent_files:
+        add(path, 0.55, "recent_edit")
 
     file_scores = getattr(repo_map, "file_scores", {}) if repo_map is not None else {}
     for path, score in getattr(file_scores, "items", lambda: [])():
@@ -502,15 +517,84 @@ def _known_negatives(
     return _dedupe_dicts(negatives, limit=12)
 
 
-def _call_chain(symbols: list[object], snippets: list[ContextSnippet]) -> list[str]:
-    if not symbols or not snippets:
+def _merge_prior_evidence(
+    evidence: list[dict[str, Any]],
+    previous_handoff: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    merged = list(evidence)
+    prior = previous_handoff or {}
+    for item in prior.get("facts", []) if isinstance(prior, dict) else []:
+        if isinstance(item, dict):
+            merged.append({"type": "prior_fact", **item})
+        elif str(item).strip():
+            merged.append({"type": "prior_fact", "fact": str(item)})
+    for item in prior.get("evidence", []) if isinstance(prior, dict) else []:
+        if isinstance(item, dict):
+            merged.append({"type": "prior_handoff", **item})
+    return _dedupe_dicts(merged, limit=40)
+
+
+def _prior_text_items(previous_handoff: dict[str, Any] | None, key: str) -> list[str]:
+    prior = previous_handoff or {}
+    if not isinstance(prior, dict):
         return []
+    out: list[str] = []
+    for item in prior.get(key, []) or []:
+        if isinstance(item, dict):
+            value = item.get("focus") or item.get("fact") or item.get("path") or item.get("file")
+            if value:
+                out.append(str(value))
+        elif str(item).strip():
+            out.append(str(item))
+    return out[:20]
+
+
+def _graph_call_edges(
+    repo_map: RepoMapSearcher | None,
+    symbols: list[object],
+) -> list[tuple[object, object]]:
+    if repo_map is None:
+        return []
+    expand = getattr(repo_map, "expand_symbol_edges", None)
+    if not callable(expand):
+        return []
+    symbol_ids = [
+        str(getattr(symbol, "symbol_id", ""))
+        for symbol in symbols
+        if str(getattr(symbol, "symbol_id", ""))
+    ]
+    if not symbol_ids:
+        return []
+    try:
+        return list(expand(symbol_ids, depth=2, limit=20))
+    except TypeError:
+        return []
+
+
+def _call_chain(
+    symbols: list[object],
+    snippets: list[ContextSnippet],
+    *,
+    graph_edges: list[tuple[object, object]] = (),
+) -> list[str]:
+    edges: list[str] = []
+    for src, dst in graph_edges:
+        src_name = str(getattr(src, "name", ""))
+        dst_name = str(getattr(dst, "name", ""))
+        if not src_name or not dst_name:
+            continue
+        edge = f"{src_name} -> {dst_name}"
+        if edge not in edges:
+            edges.append(edge)
+        if len(edges) >= 12:
+            return edges
+    if not symbols or not snippets:
+        return edges
     symbol_names = [
         str(getattr(symbol, "name", ""))
         for symbol in symbols
         if str(getattr(symbol, "name", ""))
     ]
-    edges: list[str] = []
     for symbol in symbols[:8]:
         src = str(getattr(symbol, "name", ""))
         if not src:
@@ -603,6 +687,7 @@ def _file_reasons(
     symbols: list[object],
     explicit_files: tuple[str, ...],
     current_files: tuple[str, ...],
+    recent_files: tuple[str, ...],
     repo_map: RepoMapSearcher | None,
 ) -> list[str]:
     reasons: list[str] = []
@@ -610,6 +695,8 @@ def _file_reasons(
         reasons.append("explicit_file")
     if path in current_files:
         reasons.append("open_file")
+    if path in recent_files:
+        reasons.append("recent_edit")
     if any(str(getattr(symbol, "file_path", "")) == path for symbol in symbols):
         reasons.append("symbol_match")
     file_scores = getattr(repo_map, "file_scores", {}) if repo_map is not None else {}

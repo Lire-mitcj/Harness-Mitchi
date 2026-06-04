@@ -96,6 +96,13 @@ def test_executor_handoff_json_contains_runtime_tools_only(tmp_path) -> None:
     assert handoff["allowed_tools"] == ["edit_file"]
     assert "shell_exec" in handoff["denied_tools"]
     assert "shell_exec" not in json.dumps(handoff["plan_state"], ensure_ascii=False)
+    assert handoff["requirements"]["final_output"]["required_keys"] == [
+        "status",
+        "changed_files",
+        "validation",
+        "risks",
+        "handoff",
+    ]
 
 
 def test_executor_handoff_json_carries_prior_evidence_and_negatives(tmp_path) -> None:
@@ -124,10 +131,13 @@ def test_executor_handoff_json_carries_prior_evidence_and_negatives(tmp_path) ->
         runtime_tools=frozenset({"edit_file"}),
         prior_summaries={
             "st-1": (
-                '{"result":"found","acceptance_met":true,'
+                '{"status":"success","changed_files":[],'
+                '"validation":{"ran":[],"result":"skipped","summary":""},'
+                '"risks":[],"handoff":{"facts":["located route"],'
                 '"evidence":[{"path":"app.py","line":1,'
                 '"symbol":"query_orders","snippet":"def query_orders"}],'
-                '"blocker":"no matches in tests"}'
+                '"known_negatives":[{"query":"tests","reason":"no matches"}],'
+                '"next_focus":["app.py"]}}'
             )
         },
     )
@@ -136,6 +146,8 @@ def test_executor_handoff_json_carries_prior_evidence_and_negatives(tmp_path) ->
     assert handoff["prior"]["evidence"]
     assert handoff["prior"]["evidence"][0]["path"] == "app.py"
     assert handoff["prior"]["known_negatives"]
+    assert handoff["prior"]["facts"][0]["fact"] == "located route"
+    assert handoff["prior"]["next_focus"][0]["focus"] == "app.py"
 
 
 def test_executor_prompt_carries_context_pack_json(tmp_path) -> None:

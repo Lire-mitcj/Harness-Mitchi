@@ -174,6 +174,32 @@ def test_diagnose_seed_handoff_requires_gate_passing_evidence() -> None:
     assert handoff is None
 
 
+def test_diagnose_seed_handoff_requires_actionable_findings_even_without_strict_criteria() -> None:
+    node = SubTaskNode(
+        id="st-1",
+        kind=SubTaskKind.DIAGNOSE,
+        description="搜索项目中使用的视图",
+    )
+    state = AgentState()
+    state.messages = [
+        tool_message(
+            "tc1",
+            "Session exploration summary (paths, line ranges, map/grep hits, code seen so far):\n"
+            "Context/map searches already run:\n"
+            "  - 视图 view\n",
+        )
+    ]
+
+    handoff = _diagnose_handoff_from_seed_if_ready(
+        subtask=node,
+        session_memory=ExploreSessionMemory.create(),
+        state=state,
+        error_trace=[],
+    )
+
+    assert handoff is None
+
+
 def test_diagnose_summary_filters_view_definition_noise() -> None:
     node = SubTaskNode(
         id="st-1",
@@ -198,4 +224,23 @@ def test_diagnose_summary_filters_view_definition_noise() -> None:
     assert "db/init/init.sql:353" in summary
     assert "app.py:1429" not in summary
     assert "app.py:2057" not in summary
+    assert "Session exploration summary" not in summary
+
+
+def test_diagnose_summary_without_findings_is_user_readable_failure() -> None:
+    node = SubTaskNode(
+        id="st-1",
+        kind=SubTaskKind.DIAGNOSE,
+        description="搜索项目中使用的视图",
+    )
+    digest = (
+        "Session exploration summary (paths, line ranges, map/grep hits, code seen so far):\n"
+        "Context/map searches already run:\n"
+        "  - 视图 view\n"
+    )
+
+    summary = _diagnose_summary_from_digest(node, digest, [])
+
+    assert "未定位到可交接的具体路径和行号" in summary
+    assert "视图 view" in summary
     assert "Session exploration summary" not in summary

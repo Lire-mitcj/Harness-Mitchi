@@ -67,6 +67,65 @@ def test_exit_gate_passes_edit_with_changes() -> None:
     assert result.verdict == GateVerdict.PASS
 
 
+def test_exit_gate_blocks_incomplete_final_json_schema() -> None:
+    node = SubTaskNode(
+        id="st-1",
+        description="fix api",
+        kind=SubTaskKind.EDIT,
+        context_files=["api.py"],
+    )
+    result = validate_exit(
+        ExitCheckInput(
+            subtask=node,
+            final_message='{"result":"updated"}',
+            error_trace=[],
+            changed_files=["api.py"],
+        )
+    )
+
+    assert result.verdict == GateVerdict.BLOCK
+    assert "missing required key" in "; ".join(result.messages)
+
+
+def test_exit_gate_passes_agent_output_schema() -> None:
+    node = SubTaskNode(
+        id="st-1",
+        description="fix api",
+        kind=SubTaskKind.EDIT,
+        context_files=["api.py"],
+    )
+    result = validate_exit(
+        ExitCheckInput(
+            subtask=node,
+            final_message=(
+                '{"status":"success","changed_files":["api.py"],'
+                '"validation":{"ran":["pytest"],"result":"passed","summary":"ok"},'
+                '"risks":[],"handoff":{"facts":["fixed"],"evidence":[],'
+                '"known_negatives":[],"next_focus":[]}}'
+            ),
+            error_trace=[],
+            changed_files=["api.py"],
+        )
+    )
+
+    assert result.verdict == GateVerdict.PASS
+
+
+def test_exit_gate_blocks_incomplete_agent_output_schema() -> None:
+    node = SubTaskNode(id="st-1", description="verify", kind=SubTaskKind.VERIFY)
+    result = validate_exit(
+        ExitCheckInput(
+            subtask=node,
+            final_message='{"status":"success","handoff":{}}',
+            error_trace=[],
+            changed_files=[],
+        )
+    )
+
+    assert result.verdict == GateVerdict.BLOCK
+    assert "changed_files" in "; ".join(result.messages)
+
+
 def test_exit_gate_blocks_diagnose_acceptance_unmet() -> None:
     node = SubTaskNode(
         id="st-1",

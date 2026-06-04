@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from src.indexer.repo_map import build_repo_map
+from src.indexer.ctags import CtagsIndexResult, CtagsSymbol
 from src.indexer.repo_map_service import RepoMapService
 from src.tools.search.map_search import MapSearchTool
 
@@ -31,6 +32,39 @@ def test_repo_map_skeleton_includes_search_modules() -> None:
     assert "one module" in block
     assert "patterns=" in block
     assert "boarding" in block or "v_boarding_pass" in block
+
+
+def test_repo_map_expands_symbol_reference_edges() -> None:
+    repo_map = build_repo_map(FIXTURE_ROOT, top_k=50)
+    app = repo_map.search("AppService", limit=1)[0]
+
+    edges = repo_map.expand_symbol_edges([app.symbol_id], depth=2)
+
+    assert any(src.name == "AppService" and dst.name == "BaseService" for src, dst in edges)
+
+
+def test_repo_map_expands_function_call_chain_from_indexed_references(tmp_path: Path) -> None:
+    indexed = CtagsIndexResult(
+        symbols=[
+            CtagsSymbol("main.py", "query_orders", "function", 1, 2, "def query_orders()"),
+            CtagsSymbol("main.py", "build_order_query", "function", 4, 5, "def build_order_query()"),
+            CtagsSymbol("main.py", "format_order_response", "function", 7, 8, "def format_order_response()"),
+        ],
+        references=[
+            ("main.py:query_orders:1", "build_order_query"),
+            ("main.py:build_order_query:4", "format_order_response"),
+        ],
+        source="test",
+    )
+    repo_map = build_repo_map(tmp_path, top_k=50, indexed=indexed)
+    focused = repo_map.search("query_orders", limit=1)[0]
+
+    edges = repo_map.expand_symbol_edges([focused.symbol_id], depth=2)
+
+    assert [(src.name, dst.name) for src, dst in edges] == [
+        ("query_orders", "build_order_query"),
+        ("build_order_query", "format_order_response"),
+    ]
 
 
 @pytest.mark.asyncio

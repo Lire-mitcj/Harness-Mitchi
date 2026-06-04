@@ -17,11 +17,13 @@ from src.agent.types import AgentState
 from src.cli.run_summary import build_terminal_run_summary
 from src.cli.stream_preview import planner_status_hint
 from src.context.retriever import ContextRetriever
-from src.executor.subtask_executor import SubTaskExecutor
+from src.executor.final_output import parse_executor_final
+from src.executor.subtask_executor import SubTaskExecutor, _diagnose_summary_from_digest
 from src.harness.discovery.input_parser import parse_turn_input
 from src.harness.discovery.manifest import DiagnosticsManifest, manifest_actionable
 from src.harness.discovery.manifest_gate import validate_manifest
 from src.harness.discovery.scout_agent import ScoutAgent
+from src.harness.gates.exit_gate import ExitCheckInput, validate_exit
 from src.harness.gates.plan_gate import ReplanGateContext, validate_plan
 from src.harness.gates.preflight_probe import assess_preflight
 from src.harness.gates.types import GateVerdict, PreflightResult, TruncationPolicy
@@ -33,6 +35,10 @@ from src.harness.subtask.handoff import (
 from src.llm.client import LLMClient
 from src.orchestrator.escalation import EscalationAction, decide_subtask_escalation
 from src.orchestrator.evidence import EvidencePack
+from src.orchestrator.final_summarizer import (
+    FinalSummarizer,
+    build_deterministic_user_summary,
+)
 from src.planner.context_policy import effective_context_files
 from src.planner.kinds import SubTaskKind
 from src.planner.patch_plan_parse import parse_patch_plan_output
@@ -86,8 +92,8 @@ def _estimate_prompt_tokens(messages: list[dict[str, Any]]) -> int:
     return max(1, len(text) // 4)
 
 
-def _executor_status_data(**data: Any) -> dict[str, Any]:
-    return {"phase": "executor", "executor_activity": True, **data}
+def _skill_status_data(**data: Any) -> dict[str, Any]:
+    return {"phase": "skill_executor", "executor_activity": True, **data}
 
 
 @dataclass
@@ -145,6 +151,18 @@ class OrchestratorLoop:
                 prompt_cache_ttl=_cache_ttl(settings.prompt_cache_ttl),
             ),
             require_trace=settings.planner_trace,
+        )
+        self._final_summarizer = FinalSummarizer(
+            LLMClient(
+                model=settings.effective_final_summary_model,
+                max_tokens=settings.final_summary_max_tokens,
+                request_timeout=settings.final_summary_timeout,
+                prompt_cache_enabled=settings.prompt_cache_enabled,
+                prompt_cache_min_tokens=settings.prompt_cache_min_tokens,
+                prompt_cache_ttl=_cache_ttl(settings.prompt_cache_ttl),
+            ),
+            max_tokens=settings.final_summary_max_tokens,
+            timeout=float(settings.final_summary_timeout),
         )
         self._skill_executor = SkillExecutor([
             CodeEditSkill(
@@ -288,7 +306,6 @@ class OrchestratorLoop:
             return
 
         task_tree, scout_skipped = apply_scout_discovery_to_plan(task_tree, manifest)
-        _apply_context_pack_to_task_tree(task_tree, context_pack)
         self.state.subtask_summaries.update(scout_skipped)
         for sid, summary in scout_skipped.items():
             node = task_tree.get(sid)
@@ -311,6 +328,28 @@ class OrchestratorLoop:
         while task_tree.has_pending():
             node = task_tree.first_pending()
             assert node is not None
+            subtask_context_pack = await self._context_pack_for_subtask(
+                task_tree=task_tree,
+                node=node,
+            )
+            _apply_context_pack_to_subtask(node, subtask_context_pack)
+            if subtask_context_pack is not None:
+                yield AgentEvent(
+                    type=EventType.STATUS,
+                    content=(
+                        f"ContextBuilder [{node.id}]: "
+                        f"confidence={subtask_context_pack.confidence:.2f}, "
+                        f"files={len(subtask_context_pack.relevant_files)}, "
+                        f"snippets={len(subtask_context_pack.focused_snippets or subtask_context_pack.snippets)}"
+                    ),
+                    data={
+                        "phase": "context_builder",
+                        "subtask_id": node.id,
+                        "confidence": subtask_context_pack.confidence,
+                        "files": list(subtask_context_pack.relevant_files),
+                        "missing_info": list(subtask_context_pack.missing_info),
+                    },
+                )
 
             preflight = assess_preflight(
                 subtask=node,
@@ -374,37 +413,28 @@ class OrchestratorLoop:
 
             pm.start("executor", subtask_id=node.id)
             exec_result: dict[str, Any] | None = None
-            executor_fallback_errors: list[str] = []
-            executor_fallback_digest: str | None = None
-            if self.settings.executor_skill_enabled and node.kind == SubTaskKind.EDIT:
-                async for event in self._run_edit_skill_executor(
-                    user_msg=user_msg,
+            prior_errors = list(node.error_trace)
+            prior_ctx = collect_prior_summaries(
+                task_tree, node, self.state.subtask_summaries
+            )
+            attempt_num = self.state.subtask_attempts.get(node.id, 0) + 1
+            prior_exploration = self.state.subtask_exploration_digests.get(node.id)
+            if _should_use_diagnose_skill_executor(
+                node,
+                prior_summaries=prior_ctx,
+                attempt_num=attempt_num,
+            ):
+                async for event in self._run_diagnose_skill_executor(
                     task_tree=task_tree,
                     node=node,
-                    project_structure=project_structure,
-                    context_pack=context_pack,
+                    context_pack=subtask_context_pack,
                 ):
                     if event.type == EventType.STREAM_END and event.data:
                         data = event.data
                         if "success" in data or data.get("failure_code"):
                             exec_result = data
                     yield event
-                if exec_result and exec_result.get("requires_executor_fallback"):
-                    executor_fallback_errors = list(exec_result.get("error_trace") or [])
-                    executor_fallback_digest = exec_result.get("exploration_digest") or None
-                    exec_result = None
-
-            if exec_result is None:
-                prior_errors = list(node.error_trace)
-                prior_errors.extend(executor_fallback_errors)
-                prior_ctx = collect_prior_summaries(
-                    task_tree, node, self.state.subtask_summaries
-                )
-                attempt_num = self.state.subtask_attempts.get(node.id, 0) + 1
-                prior_exploration = (
-                    executor_fallback_digest
-                    or self.state.subtask_exploration_digests.get(node.id)
-                )
+            else:
                 async for event in self._executor.run(
                     root_task=task_tree.root_task,
                     task_tree=task_tree,
@@ -415,7 +445,7 @@ class OrchestratorLoop:
                     prior_summaries=prior_ctx or None,
                     subtask_attempt=attempt_num,
                     prior_exploration=prior_exploration,
-                    context_pack=context_pack,
+                    context_pack=subtask_context_pack,
                 ):
                     if event.type == EventType.STREAM_END and event.data:
                         data = event.data
@@ -588,7 +618,37 @@ class OrchestratorLoop:
             self.state.agent_state.current_plan = task_tree.to_json()
             yield plan_update_event(task_tree)
 
-        summary = self._build_summary(task_tree)
+        yield AgentEvent(
+            type=EventType.STATUS,
+            content=(
+                "FinalSummarizer · calling model "
+                f"({self.settings.effective_final_summary_model})"
+            ),
+            data={
+                "phase": "final_summarizer",
+                "spinner_only": True,
+                "llm_loading": True,
+                "model": self.settings.effective_final_summary_model,
+            },
+        )
+        summary_start = time.perf_counter()
+        summary, summary_fallback = await self._build_summary(user_msg, task_tree)
+        summary_elapsed = time.perf_counter() - summary_start
+        yield AgentEvent(
+            type=EventType.STATUS,
+            content=(
+                f"FinalSummarizer · model call took {summary_elapsed:.1f}s "
+                f"(model={self.settings.effective_final_summary_model}, "
+                f"output={len(summary)} chars, fallback={summary_fallback})"
+            ),
+            data={
+                "phase": "final_summarizer",
+                "model": self.settings.effective_final_summary_model,
+                "elapsed": summary_elapsed,
+                "output_chars": len(summary),
+                "fallback": summary_fallback,
+            },
+        )
         yield final_answer_event(summary, terminal=True)
         yield AgentEvent(type=EventType.STREAM_END)
 
@@ -612,7 +672,7 @@ class OrchestratorLoop:
             yield AgentEvent(
                 type=EventType.STATUS,
                 content=spinner_label,
-                data={"spinner_only": True, "phase": "planner"},
+                data={"spinner_only": True, "llm_loading": True, "phase": "planner"},
             )
 
             if attempt == 0:
@@ -711,7 +771,7 @@ class OrchestratorLoop:
         yield AgentEvent(
             type=EventType.STATUS,
             content="PatchPlan: generating executable patch plan",
-            data={"spinner_only": True, "phase": "patch_plan"},
+            data={"spinner_only": True, "llm_loading": True, "phase": "patch_plan"},
         )
         messages = self._planner.patch_plan_messages(
             user_msg,
@@ -783,6 +843,101 @@ class OrchestratorLoop:
             terminal=True,
         )
 
+    async def _run_diagnose_skill_executor(
+        self,
+        *,
+        task_tree: TaskTree,
+        node: SubTaskNode,
+        context_pack: Any | None,
+    ) -> AsyncIterator[AgentEvent]:
+        yield AgentEvent(
+            type=EventType.STATUS,
+            content=f"SkillExecutor [{node.id}] · code_search",
+            data=_skill_status_data(
+                subtask_id=node.id,
+                spinner_only=True,
+                skill="code_search",
+            ),
+        )
+        skill_context = SkillContext(
+            user_request=f"{task_tree.root_task}\n\nSubtask: {node.description}",
+            context_pack=context_pack,
+        )
+        started = time.perf_counter()
+        search = await self._skill_executor.run(
+            "code_search",
+            skill_context,
+            extra_query=f"{task_tree.root_task} {node.description} {node.acceptance_criteria}",
+        )
+        elapsed = time.perf_counter() - started
+        search_output = str(search.metadata.get("search_output", ""))
+        yield AgentEvent(
+            type=EventType.STATUS,
+            content=(
+                f"SkillExecutor [{node.id}] · code_search took {elapsed:.1f}s "
+                f"(success={search.success}, output={len(search_output)} chars)"
+            ),
+            data={
+                "phase": "skill_executor",
+                "executor_activity": True,
+                "subtask_id": node.id,
+                "skill": "code_search",
+                "elapsed": elapsed,
+                "success": search.success,
+                "output_chars": len(search_output),
+                "summary": search.summary,
+            },
+        )
+        if not search.success:
+            yield self._skill_failure_stream_end(
+                node,
+                search.summary,
+                exploration_digest=search_output,
+            )
+            return
+
+        final_message = _diagnose_summary_from_digest(node, search_output, [])
+        exit_result = validate_exit(
+            ExitCheckInput(
+                subtask=node,
+                final_message=final_message,
+                error_trace=[],
+                changed_files=[],
+                turns_used=0,
+                tool_failure_count=0,
+            )
+        )
+        if not exit_result.passed:
+            yield self._skill_failure_stream_end(
+                node,
+                "; ".join(exit_result.messages),
+                exploration_digest=search_output,
+                final_message=final_message,
+            )
+            return
+
+        yield final_answer_event(
+            final_message,
+            intermediate=True,
+            subtask_id=node.id,
+        )
+        yield AgentEvent(
+            type=EventType.STREAM_END,
+            data={
+                "subtask_id": node.id,
+                "turns_used": 0,
+                "success": True,
+                "changed_files": [],
+                "file_diffs": {},
+                "error_trace": [],
+                "final_message": final_message,
+                "failure_code": "",
+                "quality_gate_failures": 0,
+                "exploration_digest": search_output,
+                "skill_executor": True,
+            },
+        )
+
     async def _run_edit_skill_executor(
         self,
         *,
@@ -795,7 +950,7 @@ class OrchestratorLoop:
         yield AgentEvent(
             type=EventType.STATUS,
             content=f"SkillExecutor [{node.id}] · code_search",
-            data=_executor_status_data(
+            data=_skill_status_data(
                 subtask_id=node.id,
                 spinner_only=True,
                 skill="code_search",
@@ -820,7 +975,7 @@ class OrchestratorLoop:
                 f"(success={search.success}, output={len(search_output)} chars)"
             ),
             data={
-                "phase": "executor",
+                "phase": "skill_executor",
                 "executor_activity": True,
                 "subtask_id": node.id,
                 "skill": "code_search",
@@ -834,7 +989,7 @@ class OrchestratorLoop:
             yield AgentEvent(
                 type=EventType.STATUS,
                 content=f"SkillExecutor [{node.id}] · code_search failed: {search.summary}",
-                data=_executor_status_data(subtask_id=node.id, skill_error=True),
+                data=_skill_status_data(subtask_id=node.id, skill_error=True),
             )
             yield self._skill_failure_stream_end(node, search.summary)
             return
@@ -842,9 +997,10 @@ class OrchestratorLoop:
         yield AgentEvent(
             type=EventType.STATUS,
             content=f"SkillExecutor [{node.id}] · code_edit",
-            data=_executor_status_data(
+            data=_skill_status_data(
                 subtask_id=node.id,
                 spinner_only=True,
+                llm_loading=True,
                 skill="code_edit",
             ),
         )
@@ -866,7 +1022,7 @@ class OrchestratorLoop:
                 f"(success={edit.success}, changed={list(edit.changed_files)})"
             ),
             data={
-                "phase": "executor",
+                "phase": "skill_executor",
                 "executor_activity": True,
                 "subtask_id": node.id,
                 "skill": "code_edit",
@@ -881,7 +1037,7 @@ class OrchestratorLoop:
             yield AgentEvent(
                 type=EventType.STATUS,
                 content=f"SkillExecutor [{node.id}] · code_edit failed: {edit.summary}",
-                data=_executor_status_data(subtask_id=node.id, skill_error=True),
+                data=_skill_status_data(subtask_id=node.id, skill_error=True),
             )
             yield self._skill_failure_stream_end(
                 node,
@@ -907,7 +1063,7 @@ class OrchestratorLoop:
                 f"(success={validation.success}, result={validation.validation_result})"
             ),
             data={
-                "phase": "executor",
+                "phase": "skill_executor",
                 "executor_activity": True,
                 "subtask_id": node.id,
                 "skill": "validator",
@@ -921,7 +1077,7 @@ class OrchestratorLoop:
             yield AgentEvent(
                 type=EventType.STATUS,
                 content=f"SkillExecutor [{node.id}] · validator failed: {validation.summary}",
-                data=_executor_status_data(subtask_id=node.id, skill_error=True),
+                data=_skill_status_data(subtask_id=node.id, skill_error=True),
             )
             yield self._skill_failure_stream_end(
                 node,
@@ -962,6 +1118,7 @@ class OrchestratorLoop:
         *,
         requires_executor_fallback: bool = True,
         exploration_digest: str | None = None,
+        final_message: str | None = None,
     ) -> AgentEvent:
         return AgentEvent(
             type=EventType.STREAM_END,
@@ -972,7 +1129,7 @@ class OrchestratorLoop:
                 "changed_files": [],
                 "file_diffs": {},
                 "error_trace": [reason],
-                "final_message": reason,
+                "final_message": final_message or reason,
                 "failure_code": "skill_executor",
                 "quality_gate_failures": 0,
                 "requires_executor_fallback": requires_executor_fallback,
@@ -1119,6 +1276,36 @@ class OrchestratorLoop:
             task_template="planner",
         )
 
+    async def _context_pack_for_subtask(
+        self,
+        *,
+        task_tree: TaskTree,
+        node: SubTaskNode,
+    ):
+        if not self.settings.context_retriever_enabled:
+            return None
+        await self._await_repo_map()
+        service = getattr(self.context, "repo_map_service", None)
+        retriever = ContextRetriever(
+            project_root=self.harness.project_root,
+            repo_map=service,
+        )
+        prior = collect_prior_summaries(
+            task_tree,
+            node,
+            self.state.subtask_summaries,
+        )
+        request = _subtask_context_request(task_tree.root_task, node)
+        return await asyncio.to_thread(
+            retriever.build,
+            user_request=request,
+            task_template=f"subtask:{node.kind.value}",
+            current_files=tuple(effective_context_files(task_tree, node)),
+            recent_files=tuple(self.state.agent_state.file_changes[-5:]),
+            previous_handoff=_previous_handoff_from_summaries(prior),
+            mode=node.kind.value,
+        )
+
     def _sync_repo_map_after_exec(
         self,
         node: SubTaskNode,
@@ -1218,8 +1405,26 @@ class OrchestratorLoop:
         )
         return cp_id or ""
 
-    def _build_summary(self, task_tree: TaskTree) -> str:
-        return build_terminal_run_summary(task_tree, self.state.subtask_summaries)
+    async def _build_summary(self, user_msg: str, task_tree: TaskTree) -> tuple[str, bool]:
+        fallback = build_deterministic_user_summary(
+            user_request=user_msg,
+            task_tree=task_tree,
+            subtask_summaries=self.state.subtask_summaries,
+        )
+        if not fallback.strip():
+            fallback = build_terminal_run_summary(task_tree, self.state.subtask_summaries)
+        try:
+            summary = await self._final_summarizer.summarize(
+                user_request=user_msg,
+                task_tree=task_tree,
+                subtask_summaries=self.state.subtask_summaries,
+            )
+        except Exception as exc:
+            log.warning("Final summarizer failed; using template summary: %s", exc)
+            return fallback, True
+        if not summary:
+            return fallback, True
+        return summary, False
 
     async def list_checkpoints(self) -> list[dict[str, Any]]:
         return await self.harness.checkpoint_store.list_checkpoints()
@@ -1243,7 +1448,72 @@ class OrchestratorLoop:
         )
 
 
-def _apply_context_pack_to_task_tree(task_tree: TaskTree, context_pack: Any | None) -> None:
+def _subtask_context_request(root_task: str, node: SubTaskNode) -> str:
+    parts = [
+        f"Root task: {root_task}",
+        f"Subtask [{node.id}] kind={node.kind.value}: {node.description}",
+    ]
+    if node.acceptance_criteria:
+        parts.append(f"Acceptance: {node.acceptance_criteria}")
+    if node.context_files:
+        parts.append("Context files: " + ", ".join(node.context_files))
+    if node.depends_on:
+        parts.append("Depends on: " + ", ".join(node.depends_on))
+    return "\n".join(parts)
+
+
+def _should_use_diagnose_skill_executor(
+    node: SubTaskNode,
+    *,
+    prior_summaries: dict[str, str],
+    attempt_num: int,
+) -> bool:
+    if node.kind != SubTaskKind.DIAGNOSE:
+        return False
+    if attempt_num != 1 or prior_summaries:
+        return False
+    return True
+
+
+def _previous_handoff_from_summaries(summaries: dict[str, str]) -> dict[str, Any]:
+    facts: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
+    known_negatives: list[dict[str, Any]] = []
+    next_focus: list[dict[str, Any]] = []
+    for sid, text in summaries.items():
+        parsed = parse_executor_final(text)
+        if parsed is not None:
+            for item in parsed.evidence:
+                evidence.append({"source_subtask": sid, **item})
+            if parsed.handoff:
+                for item in parsed.handoff.get("facts", []) or []:
+                    if isinstance(item, dict):
+                        facts.append({"source_subtask": sid, **item})
+                    elif str(item).strip():
+                        facts.append({"source_subtask": sid, "fact": str(item)})
+                for item in parsed.handoff.get("known_negatives", []) or []:
+                    if isinstance(item, dict):
+                        known_negatives.append({"source_subtask": sid, **item})
+                for item in parsed.handoff.get("next_focus", []) or []:
+                    if isinstance(item, dict):
+                        next_focus.append({"source_subtask": sid, **item})
+                    elif str(item).strip():
+                        next_focus.append({"source_subtask": sid, "focus": str(item)})
+            if parsed.blocker:
+                known_negatives.append({"source_subtask": sid, "reason": parsed.blocker})
+            continue
+        lower = text.lower()
+        if any(marker in lower for marker in ("no matches", "not found", "没有命中", "未找到")):
+            known_negatives.append({"source_subtask": sid, "reason": text[:500]})
+    return {
+        "facts": facts[:20],
+        "evidence": evidence[:30],
+        "known_negatives": known_negatives[:12],
+        "next_focus": next_focus[:20],
+    }
+
+
+def _apply_context_pack_to_subtask(node: SubTaskNode, context_pack: Any | None) -> None:
     if context_pack is None:
         return
     files = [
@@ -1255,8 +1525,7 @@ def _apply_context_pack_to_task_tree(task_tree: TaskTree, context_pack: Any | No
         files = list(getattr(context_pack, "relevant_files", ())[:5])
     if not files:
         return
-    for node in task_tree.nodes:
-        if node.context_files:
-            continue
-        if node.kind in {SubTaskKind.DIAGNOSE, SubTaskKind.EDIT}:
-            node.context_files = list(files)
+    if node.context_files:
+        return
+    if node.kind in {SubTaskKind.DIAGNOSE, SubTaskKind.EDIT}:
+        node.context_files = list(files)

@@ -20,6 +20,7 @@ class ParseResult:
     functions: list[Symbol] = field(default_factory=list)
     classes: list[Symbol] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
+    references: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def all_symbols(self) -> list[Symbol]:
@@ -85,6 +86,7 @@ class CodeParser:
                     signature=line.strip(),
                 ))
 
+        result.references.extend(_python_call_references(path, lines, result.functions))
         return result
 
     _SQL_OBJECT_RE = re.compile(
@@ -172,3 +174,49 @@ class CodeParser:
             if indent <= base_indent:
                 return i
         return len(lines)
+
+
+_PY_CALL_RE = re.compile(r"(?:^|[^\w])([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_PY_CALL_EXCLUDE = frozenset({
+    "assert",
+    "bool",
+    "dict",
+    "float",
+    "int",
+    "len",
+    "list",
+    "max",
+    "min",
+    "print",
+    "range",
+    "set",
+    "str",
+    "super",
+    "tuple",
+})
+
+
+def _python_call_references(
+    path: str,
+    lines: list[str],
+    functions: list[Symbol],
+) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for sym in functions:
+        body = lines[sym.start_line : sym.end_line]
+        src = f"{path}:{sym.name}"
+        for line in body:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            for match in _PY_CALL_RE.finditer(line):
+                name = match.group(1)
+                if name in _PY_CALL_EXCLUDE or name == sym.name:
+                    continue
+                key = (src, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                refs.append(key)
+    return refs

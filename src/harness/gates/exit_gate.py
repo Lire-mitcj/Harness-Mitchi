@@ -9,6 +9,19 @@ from src.harness.gates.types import GateResult
 from src.planner.task_tree import SubTaskKind, SubTaskNode
 
 _MIN_SUMMARY_CHARS = 20
+_REQUIRED_FINAL_JSON_KEYS = frozenset({
+    "result",
+    "acceptance_met",
+    "evidence",
+    "blocker",
+})
+_REQUIRED_AGENT_OUTPUT_KEYS = frozenset({
+    "status",
+    "changed_files",
+    "validation",
+    "risks",
+    "handoff",
+})
 
 _ACCEPTANCE_FAILURE_PHRASES = (
     "not met",
@@ -31,6 +44,9 @@ _ACCEPTANCE_FAILURE_PHRASES = (
     "none found",
     "no relevant",
     "target not found",
+    "未定位到可交接",
+    "证据不足",
+    "不能作为后续",
     "llm_call failed",
     "midstreamfallbackerror",
     "apiconnectionerror",
@@ -87,6 +103,21 @@ def validate_exit(data: ExitCheckInput) -> GateResult:
 
     if not message:
         blocks.append("Executor finished with an empty final answer.")
+
+    if structured is not None and structured.raw is not None:
+        raw_keys = set(structured.raw)
+        required = (
+            _REQUIRED_AGENT_OUTPUT_KEYS
+            if ("status" in raw_keys or "handoff" in raw_keys)
+            else _REQUIRED_FINAL_JSON_KEYS
+        )
+        missing_keys = sorted(required - raw_keys)
+        if missing_keys:
+            blocks.append(
+                "Executor final JSON is missing required key(s): "
+                + ", ".join(missing_keys)
+                + "."
+            )
 
     if len(message) < _MIN_SUMMARY_CHARS and kind in {
         SubTaskKind.DIAGNOSE,
@@ -181,6 +212,10 @@ def _structured_evidence_flags(final_data: dict[str, Any] | None) -> tuple[bool,
     if not isinstance(final_data, dict):
         return False, False, False
     evidence = final_data.get("evidence")
+    if not isinstance(evidence, list):
+        handoff = final_data.get("handoff")
+        if isinstance(handoff, dict):
+            evidence = handoff.get("evidence")
     if not isinstance(evidence, list):
         return False, False, False
     has_file_line = False

@@ -148,6 +148,13 @@ def _index_with_parser(project_root: Path) -> CtagsIndexResult:
             bases = _class_bases(cls.signature)
             for base in bases:
                 references.append((f"{rel}:{cls.name}", base))
+        symbol_starts = {
+            sym.name: sym.start_line
+            for sym in result.all_symbols
+        }
+        for src, dst in result.references:
+            src_rel = _relative_reference_src(src, path, rel, symbol_starts)
+            references.append((src_rel, dst))
 
     return CtagsIndexResult(symbols=symbols, references=references, source="parser")
 
@@ -181,3 +188,20 @@ def _class_bases(signature: str) -> list[str]:
         return []
     inner = signature.split("(", 1)[1].split(")", 1)[0]
     return [b.strip() for b in inner.split(",") if b.strip() and b.strip() != "object"]
+
+
+def _relative_reference_src(
+    src: str,
+    path: Path,
+    rel: str,
+    symbol_starts: dict[str, int],
+) -> str:
+    prefix = str(path)
+    if src.startswith(prefix + ":"):
+        suffix = src[len(prefix) + 1:]
+        name = suffix.split(":", 1)[0]
+        start = symbol_starts.get(name)
+        if start is not None:
+            return f"{rel}:{name}:{start}"
+        return f"{rel}:{suffix}"
+    return src

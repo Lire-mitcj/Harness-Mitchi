@@ -90,7 +90,12 @@ def _search_calls(
 
     if context.context_pack is not None and context.context_pack.search_plan:
         for plan in context.context_pack.search_plan[:4]:
-            plan_pattern = "|".join(re.escape(term) for term in plan.patterns[:12]) or pattern
+            plan_terms = [
+                str(term)
+                for term in plan.patterns[:12]
+                if str(term).strip()
+            ]
+            plan_pattern = _search_pattern(query, plan_terms) or pattern
             globs = plan.globs or ("*",)
             path = plan.files[0] if len(plan.files) == 1 else "."
             for glob in globs[:2]:
@@ -103,15 +108,62 @@ def _search_calls(
                         "max_results": 80,
                     },
                 ))
+        _append_fallback_search_calls(
+            calls,
+            queries=queries,
+            pattern=pattern,
+            project_root=project_root,
+            search_paths=search_paths,
+        )
         return calls
 
+    _append_fallback_search_calls(
+        calls,
+        queries=queries,
+        pattern=pattern,
+        project_root=project_root,
+        search_paths=search_paths,
+    )
+    return calls
+
+
+def _append_fallback_search_calls(
+    calls: list[tuple[str, dict[str, object]]],
+    *,
+    queries: list[str],
+    pattern: str,
+    project_root: Path,
+    search_paths: tuple[str, ...] = (),
+) -> None:
+    seen = {
+        (
+            name,
+            str(args.get("query") or args.get("pattern") or ""),
+            str(args.get("path") or ""),
+            str(args.get("include") or ""),
+        )
+        for name, args in calls
+    }
+
+    def add(name: str, args: dict[str, object]) -> None:
+        key = (
+            name,
+            str(args.get("query") or args.get("pattern") or ""),
+            str(args.get("path") or ""),
+            str(args.get("include") or ""),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        calls.append((name, args))
+
     for map_query in queries[:3]:
-        calls.append(("map_search", {"query": map_query, "limit": 20}))
+        add("map_search", {"query": map_query, "limit": 20})
     grep_paths = search_paths or (".",)
     for path in grep_paths[:4]:
         grep_path = str((project_root / path).resolve()) if not Path(path).is_absolute() else path
         for include in ("*.py", "*.sql"):
-            calls.append((
+            add(
                 "grep_search",
                 {
                     "pattern": pattern,
@@ -119,8 +171,7 @@ def _search_calls(
                     "include": include,
                     "max_results": 80,
                 },
-            ))
-    return calls
+            )
 
 
 def _search_pattern(query: str, queries: list[str]) -> str:

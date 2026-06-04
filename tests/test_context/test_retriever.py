@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.context.retriever import ContextRetriever, build_context_queries
+from src.indexer.ctags import CtagsIndexResult, CtagsSymbol
+from src.indexer.repo_map import build_repo_map
 
 
 @dataclass(frozen=True)
@@ -172,3 +174,102 @@ def test_context_pack_agent_json_contains_builder_sections(tmp_path: Path) -> No
     assert data["evidence"]
     assert "delete_file" in data["tool_policy"]["denied_tools"]
     assert data["budget"]["max_input_tokens"] == 24000
+
+
+def test_context_pack_merges_previous_handoff(tmp_path: Path) -> None:
+    main = tmp_path / "main.py"
+    main.write_text("def query_orders():\n    return 'ok'\n", encoding="utf-8")
+    repo_map = FakeRepoMap([
+        FakeSymbol(
+            file_path="main.py",
+            name="query_orders",
+            kind="function",
+            start_line=1,
+            end_line=2,
+            signature="def query_orders()",
+            score=0.9,
+        )
+    ])
+
+    pack = ContextRetriever(project_root=tmp_path, repo_map=repo_map).build(
+        user_request="修改 query_orders",
+        previous_handoff={
+            "facts": [{"source_subtask": "st-1", "fact": "query_orders is target"}],
+            "evidence": [{"source_subtask": "st-1", "file": "main.py", "symbol": "query_orders"}],
+            "known_negatives": [{"source_subtask": "st-1", "reason": "no matches in tests"}],
+            "next_focus": [{"source_subtask": "st-1", "focus": "main.py"}],
+        },
+        mode="edit",
+    )
+    data = pack.to_agent_json()
+
+    assert any(item.get("type") == "prior_handoff" for item in data["evidence"])
+    assert any(item.get("type") == "prior_fact" for item in data["evidence"])
+    assert data["known_negatives"]
+    assert pack.metadata["previous_next_focus"] == "main.py"
+
+
+def test_context_pack_scores_recent_files(tmp_path: Path) -> None:
+    target = tmp_path / "recent.py"
+    target.write_text("def touched():\n    return 1\n", encoding="utf-8")
+    repo_map = FakeRepoMap([])
+
+    pack = ContextRetriever(project_root=tmp_path, repo_map=repo_map).build(
+        user_request="继续修改刚才的文件",
+        recent_files=("recent.py",),
+        mode="edit",
+    )
+
+    assert pack.candidate_files[0]["file"] == "recent.py"
+    assert "recent_edit" in pack.candidate_files[0]["reasons"]
+
+
+def test_context_builder_uses_repo_map_reference_graph() -> None:
+    fixture = Path(__file__).resolve().parents[1] / "fixtures" / "repo_map_sample"
+    repo_map = build_repo_map(fixture, top_k=50)
+
+    pack = ContextRetriever(project_root=fixture, repo_map=repo_map).build(
+        user_request="检查 AppService 的调用链",
+        mode="diagnose",
+    )
+
+    assert "AppService -> BaseService" in pack.call_chain
+    assert any(symbol.name == "BaseService" for symbol in pack.symbols)
+    assert any(snippet.file_path == "base.py" for snippet in pack.focused_snippets)
+
+
+def test_context_builder_expands_two_layer_function_call_chain(tmp_path: Path) -> None:
+    main = tmp_path / "main.py"
+    main.write_text(
+        "def query_orders():\n"
+        "    return build_order_query()\n"
+        "\n"
+        "def build_order_query():\n"
+        "    return format_order_response()\n"
+        "\n"
+        "def format_order_response():\n"
+        "    return {}\n",
+        encoding="utf-8",
+    )
+    indexed = CtagsIndexResult(
+        symbols=[
+            CtagsSymbol("main.py", "query_orders", "function", 1, 2, "def query_orders()"),
+            CtagsSymbol("main.py", "build_order_query", "function", 4, 5, "def build_order_query()"),
+            CtagsSymbol("main.py", "format_order_response", "function", 7, 8, "def format_order_response()"),
+        ],
+        references=[
+            ("main.py:query_orders:1", "build_order_query"),
+            ("main.py:build_order_query:4", "format_order_response"),
+        ],
+        source="test",
+    )
+    repo_map = build_repo_map(tmp_path, indexed=indexed)
+
+    pack = ContextRetriever(project_root=tmp_path, repo_map=repo_map).build(
+        user_request="修改 query_orders",
+        mode="edit",
+    )
+
+    assert "query_orders -> build_order_query" in pack.call_chain
+    assert "build_order_query -> format_order_response" in pack.call_chain
+    assert any(symbol.name == "format_order_response" for symbol in pack.symbols)

@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from src.agent.types import ToolResult
+from src.context.pack import ContextPack, SearchPlan
 from src.planner.patch_plan import PatchEdit, PatchPlan
 from src.skills import (
     CodeEditSkill,
@@ -252,6 +253,47 @@ async def test_code_search_skill_view_definition_uses_definition_pattern(tmp_pat
     assert grep_patterns
     assert all(r"\bview\b" not in pattern for pattern in grep_patterns)
     assert all("CREATE" in pattern and "VIEW" in pattern for pattern in grep_patterns)
+
+
+@pytest.mark.asyncio
+async def test_code_search_skill_context_pack_search_plan_keeps_domain_pattern(tmp_path) -> None:
+    registry = FakeToolRegistry()
+    skill = CodeSearchSkill(project_root=tmp_path, tools=registry)  # type: ignore[arg-type]
+    pack = ContextPack(
+        user_request="把登机牌查询接口改成用视图查询",
+        search_plan=(
+            SearchPlan(
+                module=".",
+                files=("main.py",),
+                patterns=("查询", "query", "接口", "api", "boarding_pass", "view"),
+                globs=("*.py", "*.sql"),
+            ),
+        ),
+    )
+
+    result = await skill.run(
+        SkillContext(
+            user_request="把登机牌查询接口改成用视图查询",
+            context_pack=pack,
+        ),
+    )
+
+    assert result.success
+    grep_patterns = [
+        str(args["pattern"])
+        for name, args in registry.calls
+        if name == "grep_search"
+    ]
+    assert grep_patterns
+    assert all("boarding_pass" in pattern for pattern in grep_patterns)
+    assert all("CREATE" in pattern and "VIEW" in pattern for pattern in grep_patterns)
+    assert all("api" not in pattern.lower() for pattern in grep_patterns)
+    assert all("query" not in pattern.lower() for pattern in grep_patterns)
+    assert any(name == "map_search" for name, _args in registry.calls)
+    assert any(
+        name == "grep_search" and args.get("path") == str(tmp_path.resolve())
+        for name, args in registry.calls
+    )
 
 
 @pytest.mark.asyncio

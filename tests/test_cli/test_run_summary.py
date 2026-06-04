@@ -24,5 +24,6 @@ def test_build_terminal_run_summary_is_compact() -> None:
     assert "Done (1/1 steps)" in text
     assert "Task: Find project views" in text
     assert "[st-1]" in text
+    assert "a.sql" in text
     assert "## Step results" not in text
     assert "done when:" not in text

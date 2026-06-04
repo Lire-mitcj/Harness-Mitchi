@@ -43,16 +43,16 @@ On FAIL: fix with edit_file first; use write_file only for new files or complete
 When done (or blocked), output ONE raw JSON object only. No markdown fences, no prose before/after JSON.
 
 Required shape:
-`{"result":"...","acceptance_met":true|false,"evidence":[...],"blocker":""}`
+`{"status":"success|need_more_context|failed","changed_files":[],"validation":{"ran":[],"result":"passed|failed|skipped","summary":""},"risks":[],"handoff":{"facts":[],"evidence":[],"known_negatives":[],"next_focus":[]}}`
 
-Evidence item shape:
+Handoff evidence item shape:
 `{"path":"relative/path.py","line":123,"symbol":"name","snippet":"short exact evidence","reason":"why it matters"}`
 
 Rules:
-- `result`, `snippet`, `reason`, and `blocker` should use the same language as the user's task.
-- `acceptance_met` must be `false` when blocked or uncertain.
-- For `diagnose`, evidence MUST include file+line, symbol, and snippet/decision when acceptance_criteria asks for handoff evidence.
-- For `verify`, evidence should include command and exit code in `snippet` or `reason`.
-- For `edit`, evidence should name changed paths and the relevant behavior changed.
+- `status`, `handoff.facts`, `snippet`, `reason`, `validation.summary`, and `risks` should use the same language as the user's task.
+- Use `status="need_more_context"` when blocked by missing code context; use `status="failed"` for tool/validation failures.
+- For `diagnose`, `handoff.evidence` MUST include file+line, symbol, and snippet/decision when acceptance_criteria asks for handoff evidence.
+- For `verify`, `validation.ran` must include command(s), and `validation.result` must reflect exit status.
+- For `edit`, `changed_files` must name changed paths and `handoff.evidence` must name the relevant behavior changed.
 
 Do not call tools in the same turn as your final JSON.

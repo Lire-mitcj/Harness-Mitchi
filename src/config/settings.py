@@ -12,6 +12,7 @@ _ENV_KEYS_TO_SANITIZE = (
     "OPENAI_API_KEY",
     "MITKII_MODEL",
     "MITKII_PLANNER_MODEL",
+    "MITKII_FINAL_SUMMARY_MODEL",
     "MITKII_JUDGE_MODEL",
     "ANTHROPIC_API_KEY",
 )
@@ -135,6 +136,25 @@ class MitKIISettings(BaseSettings):
         ge=5,
         le=180,
         description="Timeout seconds for no-tool Executor summary calls.",
+    )
+    final_summary_model: str | None = Field(
+        default="openai/deepseek-ai/DeepSeek-V3",
+        description=(
+            "Model for final user-facing run summary. Defaults to a stronger "
+            "SiliconFlow-compatible DeepSeek model; override with MITKII_FINAL_SUMMARY_MODEL."
+        ),
+    )
+    final_summary_max_tokens: int = Field(
+        default=1024,
+        ge=256,
+        le=4096,
+        description="Max completion tokens for final user-facing summarizer.",
+    )
+    final_summary_timeout: int = Field(
+        default=45,
+        ge=5,
+        le=180,
+        description="Timeout seconds for final user-facing summarizer.",
     )
     orchestrator_max_replans: int = Field(default=3, ge=0, le=10)
     subtask_max_retries: int = Field(
@@ -263,8 +283,11 @@ class MitKIISettings(BaseSettings):
         ),
     )
     executor_skill_enabled: bool = Field(
-        default=True,
-        description="Use deterministic skills for edit subtasks before LLM execution.",
+        default=False,
+        description=(
+            "Deprecated: pre-Agent SkillExecutor fast path. Plan-driven execution "
+            "uses a single Executor Agent with Harness-governed tools."
+        ),
     )
 
     # --- Prompt caching (prefix snapshot) -------------------------------------
@@ -331,6 +354,17 @@ class MitKIISettings(BaseSettings):
             return self.planner_model
         if self.scout_model:
             return self.scout_model
+        return self.model
+
+    @property
+    def effective_final_summary_model(self) -> str:
+        """Model used for final natural-language user summaries."""
+        if self.final_summary_model:
+            return self.final_summary_model
+        if self.scout_model:
+            return self.scout_model
+        if self.planner_model:
+            return self.planner_model
         return self.model
 
     def ensure_dirs(self) -> None:

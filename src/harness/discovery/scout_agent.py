@@ -204,7 +204,7 @@ class ScoutAgent:
             yield AgentEvent(
                 type=EventType.STATUS,
                 content=f"Scout exploring (tool turn {tool_turn}/{tool_cap})...",
-                data={"spinner_only": True, "phase": "scout"},
+                data={"spinner_only": True, "llm_loading": True, "phase": "scout"},
             )
             response = await self._call_llm(
                 messages,
@@ -266,7 +266,7 @@ class ScoutAgent:
                         f"Scout writing manifest (attempt {attempt}/{manifest_cap}, "
                         f"turn {turns_used}/{total_budget})..."
                     ),
-                    data={"spinner_only": True, "phase": "scout"},
+                    data={"spinner_only": True, "llm_loading": True, "phase": "scout"},
                 )
                 response = await self._call_llm(
                     messages,

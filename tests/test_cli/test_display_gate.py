@@ -80,3 +80,18 @@ def test_executor_activity_tool_calls_shown() -> None:
         ),
     )
     assert ("event", EventType.TOOL_CALL) in r.calls
+
+
+def test_llm_loading_spinner_status_is_not_swallowed() -> None:
+    gate = OrchestratorDisplayGate(enabled=True)
+    r = _FakeRenderer()
+    gate.render(
+        r,
+        AgentEvent(
+            type=EventType.STATUS,
+            content="Planner",
+            data={"spinner_only": True, "llm_loading": True, "phase": "planner"},
+        ),
+    )
+
+    assert ("event", EventType.STATUS) in r.calls

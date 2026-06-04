@@ -357,6 +357,7 @@ class SubTaskExecutor:
                 content=f"Executor [{subtask.id}] · preparing context…",
                 data={
                     "spinner_only": True,
+                    "llm_loading": True,
                     "phase": "executor",
                     "subtask_id": subtask.id,
                 },
@@ -1061,6 +1062,8 @@ def _diagnose_handoff_from_seed_if_ready(
     digest = merge_exploration_digests(session_memory.running_digest, state.messages)
     if not digest.strip():
         return None
+    if not _diagnose_findings_from_digest(subtask, digest):
+        return None
     final_message = _diagnose_summary_from_digest(subtask, digest, error_trace)
     exit_result = validate_exit(
         ExitCheckInput(
@@ -1161,13 +1164,23 @@ def _diagnose_summary_from_digest(
             f"Conclusion: acceptance met。以上路径和行号可作为 {subtask.id} 的交接证据。"
         )
         return "\n".join(lines)
-    return (
-        "Result: 已根据已有工具证据生成诊断摘要，但未抽取到清晰的路径行号列表。\n"
-        "Evidence:\n"
-        f"{body[:6000]}\n"
-        "Conclusion: 使用上面的路径、行号和 context_search 命中作为 "
-        f"{subtask.id} 的交接证据。"
+    searched = _diagnose_searches_from_digest(body)
+    lines = [
+        "Result: 未定位到可交接的具体路径和行号。",
+        "Evidence:",
+    ]
+    if searched:
+        lines.append("已执行的搜索:")
+        lines.extend(f"- {item}" for item in searched[:6])
+    else:
+        lines.append("- 未记录到有效的 context_search/map_search/grep 命中。")
+    if error_trace:
+        lines.append("近期错误:")
+        lines.extend(f"- {item}" for item in error_trace[-3:])
+    lines.append(
+        "Conclusion: 当前证据不足，不能作为后续 edit 的 handoff；需要扩大或改写搜索策略。"
     )
+    return "\n".join(lines)
 
 
 def _diagnose_findings_from_digest(subtask: SubTaskNode, digest: str) -> list[str]:
@@ -1211,6 +1224,27 @@ def _diagnose_findings_from_digest(subtask: SubTaskNode, digest: str) -> list[st
 
 def _looks_like_location_hit(line: str) -> bool:
     return bool(re.match(r"[\w./-]+\.(?:py|sql|md|tsx?|jsx?):\d+", line))
+
+
+def _diagnose_searches_from_digest(digest: str) -> list[str]:
+    searches: list[str] = []
+    in_search_section = False
+    for raw in digest.splitlines():
+        line = raw.strip()
+        if line in {
+            "Context/map searches already run:",
+            "Grep queries already run:",
+        }:
+            in_search_section = True
+            continue
+        if in_search_section and line.startswith("- "):
+            value = line[2:].strip()
+            if value and value not in searches:
+                searches.append(value)
+            continue
+        if in_search_section and line and not line.startswith("- "):
+            in_search_section = False
+    return searches
 
 
 def _finding_score(line: str, *, wants_view_definition: bool) -> int:

@@ -197,7 +197,7 @@ def build_executor_handoff_json(
         }
         for node in task_tree.nodes
     ]
-    evidence, known_negatives = _prior_evidence_and_negatives(
+    prior = _prior_handoff(
         prior_summaries,
         project_root,
     )
@@ -218,8 +218,10 @@ def build_executor_handoff_json(
             "preload_mode": "paths_only" if context_files and runtime_tools and "context_search" in runtime_tools else "full_or_none",
         },
         "prior": {
-            "evidence": evidence,
-            "known_negatives": known_negatives,
+            "facts": prior["facts"],
+            "evidence": prior["evidence"],
+            "known_negatives": prior["known_negatives"],
+            "next_focus": prior["next_focus"],
         },
         "plan_state": {
             "nodes": siblings,
@@ -227,7 +229,13 @@ def build_executor_handoff_json(
         "requirements": {
             "final_output": {
                 "format": "json_object",
-                "required_keys": ["result", "acceptance_met", "evidence", "blocker"],
+                "required_keys": [
+                    "status",
+                    "changed_files",
+                    "validation",
+                    "risks",
+                    "handoff",
+                ],
             },
             "tool_policy": (
                 "Only tools in allowed_tools are available. Denied tools are not "
@@ -269,17 +277,33 @@ def _denied_tools_for_allowed(allowed_tools: list[str]) -> list[str]:
     return sorted(catalog - set(allowed_tools))
 
 
-def _prior_evidence_and_negatives(
+def _prior_handoff(
     prior_summaries: dict[str, str],
     project_root: Path,
-) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+) -> dict[str, list[dict[str, Any]]]:
+    facts: list[dict[str, Any]] = []
     evidence: list[dict[str, Any]] = []
-    negatives: list[dict[str, str]] = []
+    negatives: list[dict[str, Any]] = []
+    next_focus: list[dict[str, Any]] = []
     for sid, text in prior_summaries.items():
         parsed = parse_executor_final(text)
         if parsed is not None:
             for item in parsed.evidence:
                 evidence.append({"source_subtask": sid, **item})
+            if parsed.handoff:
+                for item in parsed.handoff.get("facts", []) or []:
+                    if isinstance(item, dict):
+                        facts.append({"source_subtask": sid, **item})
+                    elif str(item).strip():
+                        facts.append({"source_subtask": sid, "fact": str(item)})
+                for item in parsed.handoff.get("known_negatives", []) or []:
+                    if isinstance(item, dict):
+                        negatives.append({"source_subtask": sid, **item})
+                for item in parsed.handoff.get("next_focus", []) or []:
+                    if isinstance(item, dict):
+                        next_focus.append({"source_subtask": sid, **item})
+                    elif str(item).strip():
+                        next_focus.append({"source_subtask": sid, "focus": str(item)})
             if parsed.blocker or parsed.acceptance_met is False:
                 negatives.append({
                     "source_subtask": sid,
@@ -303,7 +327,12 @@ def _prior_evidence_and_negatives(
         lower = text.lower()
         if any(marker in lower for marker in ("no matches", "not found", "没有命中", "未找到")):
             negatives.append({"source_subtask": sid, "reason": text[:500]})
-    return _dedupe_dicts(evidence, limit=20), _dedupe_dicts(negatives, limit=10)
+    return {
+        "facts": _dedupe_dicts(facts, limit=20),
+        "evidence": _dedupe_dicts(evidence, limit=20),
+        "known_negatives": _dedupe_dicts(negatives, limit=10),
+        "next_focus": _dedupe_dicts(next_focus, limit=20),
+    }
 
 
 def _dedupe_dicts(items: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
