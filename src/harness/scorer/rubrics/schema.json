@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RubricVerdict",
+  "description": "Structured output from the LLM judge evaluating code changes against rubrics.",
+  "type": "object",
+  "required": ["verdict", "results", "blockers", "warnings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["pass", "fail"]
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "passed", "severity", "reason", "evidence"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Rubric ID (e.g. TC-01, SC-01, SEC-01)"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["blocker", "warning"]
+          },
+          "reason": {
+            "type": "string",
+            "description": "Brief explanation for the pass/fail judgement."
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "Concrete references supporting the judgement. Format: 'user: ...', 'diff: ...', 'tool: ...'."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "IDs of blocker-severity rubrics that failed."
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "IDs of warning-severity rubrics that failed."
+    }
+  },
+  "additionalProperties": false
+}

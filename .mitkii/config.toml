@@ -1,0 +1,22 @@
+# MitKII Project Configuration
+# This file overrides global settings for this project.
+
+[model]
+name = "claude-sonnet-4-20250514"
+temperature = 0
+max_tokens = 8192
+
+[context]
+max_tokens = 128000
+budget_ratio = 0.75
+
+[permissions]
+auto_approve_edits = false
+shell_whitelist = ["pytest", "ruff check", "ruff format", "uv run"]
+never_auto = ["git push", "rm -rf"]
+
+[scorer]
+enable_l0 = true
+enable_l1 = true
+enable_l2 = false
+max_retries = 3
