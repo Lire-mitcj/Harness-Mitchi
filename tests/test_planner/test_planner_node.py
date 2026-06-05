@@ -7,6 +7,7 @@ from src.planner.planner_node import (
     _merge_replanned_tree,
     _parse_task_tree,
     extract_planning_trace,
+    fallback_replan_for_failed_edit,
     planner_output_instruction,
 )
 from src.planner.task_tree import SubTaskKind, SubTaskNode, SubTaskStatus, TaskTree
@@ -140,6 +141,7 @@ def test_merge_replanned_tree_replaces_failed_preserves_tail() -> None:
                 id="st-3",
                 description="verify unchanged",
                 status=SubTaskStatus.PENDING,
+                depends_on=["st-2"],
             ),
         ],
     )
@@ -155,6 +157,7 @@ def test_merge_replanned_tree_replaces_failed_preserves_tail() -> None:
     assert ids == ["st-1", "st-2a", "st-2b", "st-3"]
     assert merged.nodes[0].status == SubTaskStatus.SUCCESS
     assert merged.nodes[3].description == "verify unchanged"
+    assert merged.nodes[3].depends_on == ["st-2b"]
     assert all(n.status == SubTaskStatus.PENDING for n in merged.nodes[1:3])
 
 
@@ -186,3 +189,29 @@ def test_merge_replanned_tree_skips_duplicate_completed_ids() -> None:
     assert ids == ["st-1", "st-2b"]
     assert merged.nodes[0].status == SubTaskStatus.SUCCESS
     assert merged.nodes[1].status == SubTaskStatus.PENDING
+
+
+def test_fallback_replan_for_failed_edit_inserts_diagnose_and_edit() -> None:
+    current = TaskTree(
+        root_task="把登机牌查询接口改成用视图查询",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.EDIT,
+                description="修改 make_boarding_pass_pdf 函数以使用视图查询",
+                context_files=["app.py"],
+                allowed_tools=["context_search", "edit_file"],
+                status=SubTaskStatus.FAILED,
+            )
+        ],
+    )
+
+    merged = fallback_replan_for_failed_edit(current, failed_subtask_id="st-1")
+
+    assert merged is not None
+    assert [node.kind for node in merged.nodes] == [
+        SubTaskKind.DIAGNOSE,
+        SubTaskKind.EDIT,
+    ]
+    assert merged.nodes[1].depends_on == ["st-1a"]
+    assert "HANDOFF_CONTRACT_JSON" in merged.nodes[0].acceptance_criteria

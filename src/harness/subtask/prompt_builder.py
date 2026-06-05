@@ -73,7 +73,7 @@ def _build_context_payload_block(
         ),
     }
     if context_pack is not None:
-        payload["context_pack"] = context_pack.to_agent_json()
+        payload["context_pack"] = context_pack.to_agent_json(max_snippet_chars=4_000)
     parts = [
         "CONTEXT_PAYLOAD_JSON",
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -244,7 +244,7 @@ def build_executor_handoff_json(
         },
     }
     if context_pack is not None:
-        pack_json = context_pack.to_agent_json(max_snippet_chars=8_000)
+        pack_json = context_pack.to_agent_json(max_snippet_chars=2_000)
         payload["context_pack_summary"] = {
             "confidence": pack_json.get("confidence"),
             "candidate_files": pack_json.get("candidate_files", []),

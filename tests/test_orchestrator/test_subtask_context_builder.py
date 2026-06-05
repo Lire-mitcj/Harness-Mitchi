@@ -3,7 +3,9 @@ from __future__ import annotations
 from src.context.pack import ContextPack
 from src.orchestrator.orchestrator import (
     _apply_context_pack_to_subtask,
+    _append_prior_edit_context,
     _previous_handoff_from_summaries,
+    _should_use_edit_skill_executor,
     _subtask_context_request,
 )
 from src.planner.kinds import SubTaskKind
@@ -97,3 +99,48 @@ def test_previous_handoff_from_agent_output_schema() -> None:
     assert handoff["known_negatives"][0]["query"] == "boarding_pass"
     assert handoff["facts"][0]["fact"] == "checked"
     assert handoff["next_focus"][0]["focus"] == "main.py"
+
+
+def test_prior_edit_context_is_appended_to_edit_search_output() -> None:
+    prior = {
+        "st-1": (
+            "Result: found\n\n"
+            "EDIT_CONTEXT_JSON\n"
+            '{"schema":"mitkii.edit_context.v1","code_edit_ready":true,'
+            '"builder":"EditPlanBuilder",'
+            '"snippets":[{"file":"app.py","start_line":1,'
+            '"end_line":2,"current_code":"def x():\\n    pass",'
+            '"intended_change":"change",'
+            '"acceptance_criteria":["changed"]}],'
+            '"editable_targets":[{"file":"app.py","start_line":1,'
+            '"end_line":2,"current_code":"def x():\\n    pass",'
+            '"intended_change":"change",'
+            '"acceptance_criteria":["changed"]}],'
+            '"intended_change":"change",'
+            '"acceptance_criteria":["changed"],'
+            '"tool_policy":{"allowed_tools":["edit_file"],"scope":["app.py"]}}'
+        )
+    }
+
+    out = _append_prior_edit_context("current search", prior)
+
+    assert "current search" in out
+    assert "EDIT_CONTEXT_JSON" in out
+    assert '"builder":"EditPlanBuilder"' in out
+    assert '"snippets"' in out
+    assert '"editable_targets"' in out
+
+
+def test_edit_uses_skill_executor_by_default() -> None:
+    node = SubTaskNode(id="st-2", kind=SubTaskKind.EDIT, description="edit")
+
+    assert _should_use_edit_skill_executor(
+        node,
+        prior_summaries={},
+        attempt_num=1,
+    )
+    assert _should_use_edit_skill_executor(
+        node,
+        prior_summaries={"st-1": "Result: found"},
+        attempt_num=2,
+    )

@@ -52,7 +52,7 @@ def create_mitkii_session(
     """Bootstrap MitKII with repo map background build and shared context."""
     settings = settings or get_settings()
     settings.ensure_dirs()
-    root = (project_root or Path.cwd()).resolve()
+    root = (project_root or settings.project_root or Path.cwd()).resolve()
 
     file_tracker = FileTracker()
     repo_map_service: RepoMapService | None = None

@@ -76,7 +76,7 @@ def test_diagnose_acceptance_unmet_replans_immediately() -> None:
     assert v.action == EscalationAction.REPLAN
 
 
-def test_skill_executor_failure_aborts_without_retry_or_replan() -> None:
+def test_edit_skill_executor_failure_replans_without_legacy_executor_fallback() -> None:
     node = SubTaskNode(id="st-2", description="edit", kind=SubTaskKind.EDIT)
     result = {
         "success": False,
@@ -87,8 +87,8 @@ def test_skill_executor_failure_aborts_without_retry_or_replan() -> None:
     }
     verdict = decide_subtask_escalation(node, result, attempt=1, max_subtask_retries=3)
 
-    assert verdict.action == EscalationAction.ABORT
-    assert "Patch planner produced non-executable plan" in verdict.reason
+    assert verdict.action == EscalationAction.REPLAN
+    assert "Planner must revise search/edit strategy" in verdict.reason
 
 
 def test_success_must_not_escalate() -> None:

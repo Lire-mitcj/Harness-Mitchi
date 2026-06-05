@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -39,12 +40,18 @@ from src.orchestrator.final_summarizer import (
     FinalSummarizer,
     build_deterministic_user_summary,
 )
+from src.orchestrator.handoff_contract import (
+    build_handoff_contract,
+    format_handoff_contract,
+    merge_handoff_contracts,
+)
 from src.planner.context_policy import effective_context_files
 from src.planner.kinds import SubTaskKind
 from src.planner.patch_plan_parse import parse_patch_plan_output
 from src.planner.planner_node import (
     LiteLLMPlannerClient,
     PlannerNode,
+    fallback_replan_for_failed_edit,
     fallback_task_tree,
     parse_planner_output,
 )
@@ -85,6 +92,33 @@ def _compact_preview(text: str, *, limit: int = 500) -> str:
     if len(preview) <= limit:
         return preview
     return preview[: limit - 3] + "..."
+
+
+def _restore_original_files(project_root: Any, raw: str) -> str:
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return "failed to parse original file snapshot"
+    if not isinstance(payload, dict) or not payload:
+        return ""
+    root = project_root.resolve()
+    restored: list[str] = []
+    errors: list[str] = []
+    for rel, content in payload.items():
+        if not isinstance(rel, str) or not isinstance(content, str):
+            continue
+        try:
+            path = (root / rel.replace("\\", "/").lstrip("./")).resolve()
+            path.relative_to(root)
+            path.write_text(content, encoding="utf-8")
+            restored.append(rel)
+        except (OSError, ValueError) as exc:
+            errors.append(f"{rel}: {exc}")
+    if errors:
+        return "restored " + ", ".join(restored) + "; errors: " + "; ".join(errors)
+    return "restored " + ", ".join(restored)
 
 
 def _estimate_prompt_tokens(messages: list[dict[str, Any]]) -> int:
@@ -434,6 +468,23 @@ class OrchestratorLoop:
                         if "success" in data or data.get("failure_code"):
                             exec_result = data
                     yield event
+            elif _should_use_edit_skill_executor(
+                node,
+                prior_summaries=prior_ctx,
+                attempt_num=attempt_num,
+            ):
+                async for event in self._run_edit_skill_executor(
+                    user_msg=user_msg,
+                    task_tree=task_tree,
+                    node=node,
+                    project_structure=project_structure,
+                    context_pack=subtask_context_pack,
+                ):
+                    if event.type == EventType.STREAM_END and event.data:
+                        data = event.data
+                        if "success" in data or data.get("failure_code"):
+                            exec_result = data
+                    yield event
             else:
                 async for event in self._executor.run(
                     root_task=task_tree.root_task,
@@ -540,6 +591,8 @@ class OrchestratorLoop:
             gate_feedback: list[str] = []
             max_gate_attempts = self.settings.plan_gate_max_replans + 1
             plan_error: str | None = None
+            base_tree = task_tree
+            accepted_replan: TaskTree | None = None
 
             yield AgentEvent(
                 type=EventType.STATUS,
@@ -571,7 +624,7 @@ class OrchestratorLoop:
                         if exec_result
                         else []
                     ),
-                    context_files=effective_context_files(task_tree, node),
+                    context_files=effective_context_files(base_tree, node),
                     subtask_attempts=attempt,
                 )
                 if gate_attempt > 0:
@@ -583,9 +636,9 @@ class OrchestratorLoop:
 
                 pm.start("replan")
                 fresh_structure = await self._project_structure()
-                task_tree = await self._planner.re_plan(
+                candidate_tree = await self._planner.re_plan(
                     user_msg,
-                    task_tree,
+                    base_tree,
                     replan_evidence,
                     fresh_structure,
                     discovery_manifest=self._discovery_block(),
@@ -599,18 +652,48 @@ class OrchestratorLoop:
                     },
                 )
 
-                task_tree, plan_error = await self._apply_plan_gate(
-                    task_tree,
+                candidate_tree, plan_error = await self._apply_plan_gate(
+                    candidate_tree,
                     replan_context=replan_ctx,
                 )
                 if not plan_error:
+                    accepted_replan = candidate_tree
                     break
                 gate_feedback.append(f"PlanGate rejected re-plan: {plan_error}")
 
             if plan_error:
-                yield error_event(plan_error, {"subtask_id": node.id})
-                break
+                fallback_tree = fallback_replan_for_failed_edit(
+                    base_tree,
+                    failed_subtask_id=node.id,
+                )
+                if fallback_tree is not None:
+                    fallback_tree, fallback_error = await self._apply_plan_gate(
+                        fallback_tree,
+                        replan_context=replan_ctx,
+                    )
+                    if not fallback_error:
+                        accepted_replan = fallback_tree
+                        plan_error = None
+                        yield AgentEvent(
+                            type=EventType.STATUS,
+                            content=(
+                                f"Re-plan fallback inserted diagnose+edit for [{node.id}]"
+                            ),
+                            data={"phase": "planner", "subtask_id": node.id},
+                        )
+                    else:
+                        plan_error = f"{plan_error}; fallback: {fallback_error}"
+                if plan_error:
+                    yield error_event(plan_error, {"subtask_id": node.id})
+                    break
 
+            if accepted_replan is None:
+                yield error_event(
+                    "internal error: re-plan finished without accepted TaskTree",
+                    {"subtask_id": node.id},
+                )
+                break
+            task_tree = accepted_replan
             self.state.replan_count += 1
             self.state.subtask_attempts.clear()
             self.state.subtask_exploration_digests.clear()
@@ -875,7 +958,13 @@ class OrchestratorLoop:
             type=EventType.STATUS,
             content=(
                 f"SkillExecutor [{node.id}] · code_search took {elapsed:.1f}s "
-                f"(success={search.success}, output={len(search_output)} chars)"
+                f"(success={search.success}, output={len(search_output)} chars, "
+                f"edit_context_targets={search.metadata.get('edit_context_targets', '0')}, "
+                f"hydration_hits={search.metadata.get('hydration_hits', '0')}, "
+                f"hydration_version={search.metadata.get('hydration_version', 'unknown')}"
+                + _hydration_hit_paths_suffix(search.metadata)
+                + _hydration_failure_suffix(search.metadata)
+                + ")"
             ),
             data={
                 "phase": "skill_executor",
@@ -885,6 +974,12 @@ class OrchestratorLoop:
                 "elapsed": elapsed,
                 "success": search.success,
                 "output_chars": len(search_output),
+                "edit_context_targets": search.metadata.get("edit_context_targets", "0"),
+                "hydration_hits": search.metadata.get("hydration_hits", "0"),
+                "hydration_root": search.metadata.get("hydration_root", ""),
+                "hydration_failures": search.metadata.get("hydration_failures", ""),
+                "hydration_version": search.metadata.get("hydration_version", ""),
+                "hydration_hit_paths": search.metadata.get("hydration_hit_paths", ""),
                 "summary": search.summary,
             },
         )
@@ -897,6 +992,14 @@ class OrchestratorLoop:
             return
 
         final_message = _diagnose_summary_from_digest(node, search_output, [])
+        final_message = _append_current_edit_context(final_message, search)
+        contract = build_handoff_contract(
+            user_request=task_tree.root_task,
+            subtask_id=node.id,
+            summary=final_message,
+            search_output=search_output,
+        )
+        final_message = final_message + "\n\n" + format_handoff_contract(contract)
         exit_result = validate_exit(
             ExitCheckInput(
                 subtask=node,
@@ -945,7 +1048,7 @@ class OrchestratorLoop:
         task_tree: TaskTree,
         node: SubTaskNode,
         project_structure: str,
-        context_pack: Any,
+        context_pack: Any | None,
     ) -> AsyncIterator[AgentEvent]:
         yield AgentEvent(
             type=EventType.STATUS,
@@ -972,7 +1075,13 @@ class OrchestratorLoop:
             type=EventType.STATUS,
             content=(
                 f"SkillExecutor [{node.id}] · code_search took {search_elapsed:.1f}s "
-                f"(success={search.success}, output={len(search_output)} chars)"
+                f"(success={search.success}, output={len(search_output)} chars, "
+                f"edit_context_targets={search.metadata.get('edit_context_targets', '0')}, "
+                f"hydration_hits={search.metadata.get('hydration_hits', '0')}, "
+                f"hydration_version={search.metadata.get('hydration_version', 'unknown')}"
+                + _hydration_hit_paths_suffix(search.metadata)
+                + _hydration_failure_suffix(search.metadata)
+                + ")"
             ),
             data={
                 "phase": "skill_executor",
@@ -982,6 +1091,12 @@ class OrchestratorLoop:
                 "elapsed": search_elapsed,
                 "success": search.success,
                 "output_chars": len(search_output),
+                "edit_context_targets": search.metadata.get("edit_context_targets", "0"),
+                "hydration_hits": search.metadata.get("hydration_hits", "0"),
+                "hydration_root": search.metadata.get("hydration_root", ""),
+                "hydration_failures": search.metadata.get("hydration_failures", ""),
+                "hydration_version": search.metadata.get("hydration_version", ""),
+                "hydration_hit_paths": search.metadata.get("hydration_hit_paths", ""),
                 "summary": search.summary,
             },
         )
@@ -992,6 +1107,28 @@ class OrchestratorLoop:
                 data=_skill_status_data(subtask_id=node.id, skill_error=True),
             )
             yield self._skill_failure_stream_end(node, search.summary)
+            return
+        if str(search.metadata.get("edit_context_targets", "0")) == "0":
+            reason = (
+                "code_search found no editable SQL/query target for this edit. "
+                "Known negative: the current hits are not valid edit targets for "
+                "a view-query change; do not re-edit those symbols. Re-plan must "
+                "locate the actual query/API function containing SELECT/FROM/JOIN "
+                "before scheduling edit_file."
+            )
+            failures = str(search.metadata.get("hydration_failures") or "").strip()
+            if failures:
+                reason += f" Hydration failures: {failures}"
+            yield AgentEvent(
+                type=EventType.STATUS,
+                content=f"SkillExecutor [{node.id}] · code_search no edit target: {reason}",
+                data=_skill_status_data(subtask_id=node.id, skill_error=True),
+            )
+            yield self._skill_failure_stream_end(
+                node,
+                reason,
+                exploration_digest=str(search_output),
+            )
             return
 
         yield AgentEvent(
@@ -1005,6 +1142,17 @@ class OrchestratorLoop:
             ),
         )
         edit_started = time.perf_counter()
+        prior_ctx = collect_prior_summaries(
+            task_tree,
+            node,
+            self.state.subtask_summaries,
+        )
+        search_output = _append_prior_edit_context(str(search_output), prior_ctx)
+        contract = merge_handoff_contracts(
+            user_request=f"{task_tree.root_task}\n\nSubtask: {node.description}",
+            prior_summaries=prior_ctx,
+            current_search_output=str(search_output),
+        )
         edit = await self._skill_executor.run(
             "code_edit",
             SkillContext(
@@ -1013,6 +1161,7 @@ class OrchestratorLoop:
             ),
             instruction=f"{task_tree.root_task}\n\nSubtask: {node.description}",
             search_output=search_output,
+            handoff_contract=contract,
         )
         edit_elapsed = time.perf_counter() - edit_started
         yield AgentEvent(
@@ -1034,9 +1183,14 @@ class OrchestratorLoop:
             },
         )
         if not edit.success:
+            edit_preview = _compact_preview(edit.metadata.get("raw_preview", ""))
+            preview_suffix = f" raw_preview={edit_preview}" if edit_preview else ""
             yield AgentEvent(
                 type=EventType.STATUS,
-                content=f"SkillExecutor [{node.id}] · code_edit failed: {edit.summary}",
+                content=(
+                    f"SkillExecutor [{node.id}] · code_edit failed: "
+                    f"{edit.summary}{preview_suffix}"
+                ),
                 data=_skill_status_data(subtask_id=node.id, skill_error=True),
             )
             yield self._skill_failure_stream_end(
@@ -1074,14 +1228,22 @@ class OrchestratorLoop:
             },
         )
         if not validation.success:
+            rollback_summary = _restore_original_files(
+                self.harness.project_root,
+                edit.metadata.get("original_files_json", ""),
+            )
+            rollback_suffix = f"; rollback: {rollback_summary}" if rollback_summary else ""
             yield AgentEvent(
                 type=EventType.STATUS,
-                content=f"SkillExecutor [{node.id}] · validator failed: {validation.summary}",
+                content=(
+                    f"SkillExecutor [{node.id}] · validator failed: "
+                    f"{validation.summary}{rollback_suffix}"
+                ),
                 data=_skill_status_data(subtask_id=node.id, skill_error=True),
             )
             yield self._skill_failure_stream_end(
                 node,
-                validation.summary,
+                validation.summary + rollback_suffix,
                 requires_executor_fallback=False,
             )
             return
@@ -1475,6 +1637,16 @@ def _should_use_diagnose_skill_executor(
     return True
 
 
+def _should_use_edit_skill_executor(
+    node: SubTaskNode,
+    *,
+    prior_summaries: dict[str, str],
+    attempt_num: int,
+) -> bool:
+    _ = prior_summaries, attempt_num
+    return node.kind == SubTaskKind.EDIT
+
+
 def _previous_handoff_from_summaries(summaries: dict[str, str]) -> dict[str, Any]:
     facts: list[dict[str, Any]] = []
     evidence: list[dict[str, Any]] = []
@@ -1511,6 +1683,64 @@ def _previous_handoff_from_summaries(summaries: dict[str, str]) -> dict[str, Any
         "known_negatives": known_negatives[:12],
         "next_focus": next_focus[:20],
     }
+
+
+def _hydration_failure_suffix(metadata: dict[str, str]) -> str:
+    failures = str(metadata.get("hydration_failures") or "").strip()
+    if not failures:
+        return ""
+    compact = " ".join(failures.split())
+    if len(compact) > 180:
+        compact = compact[:177] + "..."
+    return f", hydration_failures={compact}"
+
+
+def _hydration_hit_paths_suffix(metadata: dict[str, str]) -> str:
+    hit_paths = str(metadata.get("hydration_hit_paths") or "").strip()
+    if not hit_paths:
+        return ""
+    compact = " ".join(hit_paths.split())
+    if len(compact) > 160:
+        compact = compact[:157] + "..."
+    return f", hydration_paths={compact}"
+
+
+def _append_current_edit_context(final_message: str, search_result: Any) -> str:
+    metadata = getattr(search_result, "metadata", {}) or {}
+    edit_context = str(metadata.get("edit_context_json") or "").strip()
+    if not edit_context or "EDIT_CONTEXT_JSON" in final_message:
+        return final_message
+    return final_message + "\n\nEDIT_CONTEXT_JSON\n" + edit_context
+
+
+def _append_prior_edit_context(search_output: str, prior_summaries: dict[str, str]) -> str:
+    if "EDIT_CONTEXT_JSON" in search_output:
+        return search_output
+    for text in prior_summaries.values():
+        block = _extract_marker_json_block(text, "EDIT_CONTEXT_JSON")
+        if block:
+            return search_output + "\n\nEDIT_CONTEXT_JSON\n" + block
+    return search_output
+
+
+def _extract_marker_json_block(text: str, marker: str) -> str:
+    if marker not in text:
+        return ""
+    payload = text.split(marker, 1)[1].strip()
+    start = payload.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    end = -1
+    for idx, ch in enumerate(payload[start:], start=start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = idx
+                break
+    return payload[start : end + 1] if end >= start else ""
 
 
 def _apply_context_pack_to_subtask(node: SubTaskNode, context_pack: Any | None) -> None:

@@ -21,11 +21,17 @@ def chat(
     session_id: Optional[str] = typer.Option(  # noqa: UP007
         None, "--session", "-s", help="Resume a specific session by ID.",
     ),
+    project: Optional[str] = typer.Option(  # noqa: UP007
+        None,
+        "--project",
+        "-p",
+        help="Target project root to index/read/edit (defaults to cwd or MITKII_PROJECT_ROOT).",
+    ),
 ) -> None:
     """Start an interactive coding session."""
     from src.cli.commands.chat import run_chat
 
-    run_chat(session_id=session_id)
+    run_chat(session_id=session_id, project_path=Path(project) if project else None)
 
 
 @app.command()
@@ -58,11 +64,18 @@ def resume(
 
 
 @app.command()
-def serve() -> None:
+def serve(
+    project: Optional[str] = typer.Option(  # noqa: UP007
+        None,
+        "--project",
+        "-p",
+        help="Target project root to index/read/edit (defaults to cwd or MITKII_PROJECT_ROOT).",
+    ),
+) -> None:
     """Start MitKII JSON-RPC server on stdio (same bootstrap as chat)."""
     from src.cli.commands.serve import run_server
 
-    run_server()
+    run_server(project_path=Path(project) if project else None)
 
 
 @app.command(name="config")

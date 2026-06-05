@@ -122,9 +122,15 @@ def decide_subtask_escalation(
 
     if failure_code == "skill_executor":
         detail = errors[-1] if errors else "no detail"
+        if subtask.kind in {SubTaskKind.DIAGNOSE, SubTaskKind.EDIT}:
+            return EscalationVerdict(
+                EscalationAction.REPLAN,
+                f"skill executor failed for [{subtask.id}] — Planner must revise "
+                f"search/edit strategy ({detail})",
+            )
         return EscalationVerdict(
-            EscalationAction.ABORT,
-            f"skill executor failed: {detail}",
+            EscalationAction.RETRY_SUBTASK,
+            f"skill executor failed — retry subtask ({attempt}/{max_subtask_retries}): {detail}",
         )
 
     return EscalationVerdict(

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from src.harness.gates.types import GateResult
 from src.planner.context_policy import enrich_task_tree_context_files
 from src.planner.dependency_graph import DependencyGraph
-from src.planner.task_tree import SubTaskKind, SubTaskNode, TaskTree
+from src.planner.task_tree import SubTaskKind, SubTaskNode, SubTaskStatus, TaskTree
 from src.planner.tool_policy import validate_node_tools
 
 _MUTATION_HINTS = re.compile(r"\b(INSERT|DELETE|UPDATE|TRUNCATE|DROP)\b", re.I)
@@ -53,6 +54,24 @@ class ReplanGateContext:
 
 def _normalize_description(text: str) -> str:
     return " ".join(text.lower().strip().split())
+
+
+def _semantic_key(text: str) -> str:
+    text = _normalize_description(text)
+    text = re.sub(r"^(定位目标代码|定位|查找|搜索|修改|修复|验证|run|fix|patch)[:：\s]+", "", text)
+    text = re.sub(r"[\s,，。.!！?？:：;；、\"'`]+", "", text)
+    return text
+
+
+def _compact_raw(text: str) -> str:
+    text = _normalize_description(text)
+    return re.sub(r"[\s,，。.!！?？:：;；、\"'`]+", "", text)
+
+
+def _similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
 
 
 def _normalize_path_set(paths: tuple[str, ...] | list[str]) -> frozenset[str]:
@@ -139,6 +158,7 @@ def validate_plan(
     if replan_context is not None:
         blocks.extend(find_replan_duplicates(tree, replan_context))
         blocks.extend(find_replan_structure_repeats(tree, replan_context))
+        blocks.extend(_check_replan_preserves_failed_objective(tree, replan_context))
 
     if not tree.nodes:
         blocks.append("TaskTree has no subtasks.")
@@ -188,6 +208,7 @@ def validate_plan(
     if graph.has_cycle():
         blocks.append("TaskTree dependency cycle detected.")
 
+    blocks.extend(_check_distinct_milestones(tree))
     blocks.extend(_check_milestone_structure(tree))
 
     root = project_root.resolve()
@@ -258,6 +279,78 @@ def _check_milestone_structure(tree: TaskTree) -> list[str]:
                 "handoff output: file:line, symbol, and snippet/decision."
             )
     return blocks
+
+
+def _check_distinct_milestones(tree: TaskTree) -> list[str]:
+    blocks: list[str] = []
+    if len(tree.nodes) <= 1:
+        return blocks
+
+    root_key = _compact_raw(tree.root_task)
+    seen: dict[str, SubTaskNode] = {}
+    for node in tree.nodes:
+        desc_key = _semantic_key(node.description)
+        if not desc_key:
+            continue
+
+        raw_desc_key = _compact_raw(node.description)
+        if root_key and node.kind != SubTaskKind.VERIFY:
+            generic_prefixed_copy = bool(
+                re.match(
+                    r"^\s*(定位目标代码|定位目标|修改目标|执行任务|完成任务)[:：]",
+                    node.description,
+                    re.I,
+                )
+            ) and root_key in raw_desc_key
+            root_copied = raw_desc_key == root_key or generic_prefixed_copy
+            if root_copied:
+                blocks.append(
+                    f"Subtask [{node.id}] description copies root_task instead of a "
+                    "stage-specific milestone. Rewrite it as a concrete diagnose/edit "
+                    "output, not the whole user request."
+                )
+
+        prior = seen.get(desc_key)
+        if prior is not None and node.kind != SubTaskKind.VERIFY:
+            blocks.append(
+                f"Subtask [{node.id}] duplicates [{prior.id}] description. Each plan "
+                "step must have a distinct milestone output."
+            )
+        else:
+            seen[desc_key] = node
+
+    non_verify = [node for node in tree.nodes if node.kind != SubTaskKind.VERIFY]
+    for idx, left in enumerate(non_verify):
+        left_key = _semantic_key(left.description)
+        for right in non_verify[idx + 1 :]:
+            right_key = _semantic_key(right.description)
+            if _similarity(left_key, right_key) >= 0.9:
+                blocks.append(
+                    f"Subtasks [{left.id}] and [{right.id}] have near-duplicate "
+                    "descriptions. Split diagnose handoff, edit target, and verify "
+                    "milestones explicitly."
+                )
+    return blocks
+
+
+def _check_replan_preserves_failed_objective(
+    tree: TaskTree,
+    ctx: ReplanGateContext,
+) -> list[str]:
+    if ctx.failed_kind != SubTaskKind.EDIT:
+        return []
+    has_pending_edit = any(
+        node.kind == SubTaskKind.EDIT
+        and node.status in {SubTaskStatus.PENDING, SubTaskStatus.RUNNING}
+        for node in tree.nodes
+    )
+    if has_pending_edit:
+        return []
+    return [
+        f"Re-plan for failed edit [{ctx.failed_subtask_id}] removed the edit objective. "
+        "Replacement nodes may add diagnose first, but must include a follow-up edit "
+        "subtask that completes the original user change."
+    ]
 
 
 def _is_low_value_diagnose(diag: SubTaskNode, edits: list[SubTaskNode]) -> bool:

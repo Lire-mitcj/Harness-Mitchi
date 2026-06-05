@@ -37,6 +37,38 @@ def test_create_mitkii_session_starts_background_repo_map(tmp_path: Path, monkey
     assert session.repo_map_service.wait_until_ready(timeout=30.0)
 
 
+def test_create_mitkii_session_uses_settings_project_root(tmp_path: Path) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("x = 1\n", encoding="utf-8")
+    settings = MitKIISettings(
+        data_dir=tmp_path / ".mitkii",
+        repo_map_enabled=False,
+        project_root=project,
+    )
+
+    session = create_mitkii_session(settings=settings)
+
+    assert session.project_root == project.resolve()
+    assert session.harness.project_root == project.resolve()
+
+
+def test_create_mitkii_session_explicit_project_root_overrides_settings(tmp_path: Path) -> None:
+    configured = tmp_path / "configured"
+    explicit = tmp_path / "explicit"
+    configured.mkdir()
+    explicit.mkdir()
+    settings = MitKIISettings(
+        data_dir=tmp_path / ".mitkii",
+        repo_map_enabled=False,
+        project_root=configured,
+    )
+
+    session = create_mitkii_session(project_root=explicit, settings=settings)
+
+    assert session.project_root == explicit.resolve()
+
+
 def test_preflight_repo_map_slices(tmp_path: Path) -> None:
     big = tmp_path / "big.py"
     big.write_text("x = 1\n" + "def target_fn():\n    return 42\n" + ("pass\n" * 12000))

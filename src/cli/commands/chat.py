@@ -50,7 +50,7 @@ class AgentLoopAdapter:
         return state.agent_state if hasattr(state, "agent_state") else state
 
 
-def run_chat(session_id: str | None = None) -> None:
+def run_chat(session_id: str | None = None, project_path: Path | None = None) -> None:
     """Set up and launch the interactive chat REPL."""
     settings = get_settings()
     theme = get_theme()
@@ -58,7 +58,7 @@ def run_chat(session_id: str | None = None) -> None:
     renderer = CLIRenderer(console=console, theme=theme)
     permission_handler = CLIPermissionHandler(renderer=renderer, console=console)
 
-    session = create_mitkii_session()
+    session = create_mitkii_session(project_root=project_path)
     if session.repo_map_service is not None:
         console.print("[dim]Repo map building in background (ctags/parser + PageRank)...[/]")
 
@@ -67,6 +67,7 @@ def run_chat(session_id: str | None = None) -> None:
         "Scout→Planner→Executor" if settings.orchestrator_mode else "legacy ReAct"
     )
     console.print(f"[dim]MitKII mode: {mode_label}[/]")
+    console.print(f"[dim]Project root: {session.project_root}[/]")
     if settings.orchestrator_mode:
         console.print(
             f"[dim]Planner: {settings.effective_planner_model} | "

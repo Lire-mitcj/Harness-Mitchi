@@ -443,6 +443,14 @@ class PlannerNode:
                 )
                 + "\n"
             )
+            if failed.kind == SubTaskKind.EDIT:
+                prompt_parts.append(
+                    "The failed subtask was kind=edit. Replacement nodes MUST still "
+                    "complete the edit objective. You may output diagnose + edit "
+                    "when the failure needs better evidence, but do NOT output only "
+                    "diagnose/verify. The final replacement node for this failure "
+                    "must be kind=edit with edit_file allowed.\n"
+                )
         prompt_parts.extend([
             f"Replace ONLY failed subtask [{evidence.subtask_id}]. "
             + planner_output_instruction(require_trace=self._require_trace)
@@ -495,25 +503,80 @@ def _merge_replanned_tree(
             node.checkpoint_id = None
             merged.nodes.append(node)
             merged_ids.add(node.id)
-        merged.version = current_tree.version + 1
-        return merged
+    else:
+        merged.nodes = list(current_tree.nodes[:failed_idx])
+        merged_ids = {n.id for n in merged.nodes}
 
-    merged.nodes = list(current_tree.nodes[:failed_idx])
-    merged_ids = {n.id for n in merged.nodes}
+        for node in revised.nodes:
+            if node.id in merged_ids:
+                continue
+            node.status = SubTaskStatus.PENDING
+            node.checkpoint_id = None
+            merged.nodes.append(node)
+            merged_ids.add(node.id)
 
-    for node in revised.nodes:
-        if node.id in merged_ids:
+        for node in current_tree.nodes[failed_idx + 1 :]:
+            merged.nodes.append(node)
+
+    replacement_id = revised.nodes[-1].id if revised.nodes else None
+    for node in merged.nodes:
+        if node in revised.nodes:
             continue
-        node.status = SubTaskStatus.PENDING
-        node.checkpoint_id = None
-        merged.nodes.append(node)
-        merged_ids.add(node.id)
-
-    for node in current_tree.nodes[failed_idx + 1 :]:
-        merged.nodes.append(node)
+        if failed_subtask_id in node.depends_on:
+            if replacement_id:
+                node.depends_on = [
+                    replacement_id if dep == failed_subtask_id else dep
+                    for dep in node.depends_on
+                ]
+            else:
+                node.depends_on = [dep for dep in node.depends_on if dep != failed_subtask_id]
 
     merged.version = current_tree.version + 1
     return merged
+
+
+def fallback_replan_for_failed_edit(
+    current_tree: TaskTree,
+    *,
+    failed_subtask_id: str,
+) -> TaskTree | None:
+    """Deterministic replacement when Planner drops the edit during re-plan."""
+    failed = current_tree.get(failed_subtask_id)
+    if failed is None or failed.kind != SubTaskKind.EDIT:
+        return None
+
+    diag_id = f"{failed.id}a"
+    edit_id = f"{failed.id}b"
+    desc = failed.description.strip() or current_tree.root_task
+    revised = TaskTree(
+        root_task=current_tree.root_task,
+        nodes=[
+            SubTaskNode(
+                id=diag_id,
+                kind=SubTaskKind.DIAGNOSE,
+                description=f"定位{desc}的目标代码、当前 SQL 和可用视图"[:120],
+                acceptance_criteria="输出 HANDOFF_CONTRACT_JSON：file:line、symbol、SQL、视图、片段/决策",
+                allowed_tools=["context_search"],
+                context_files=list(failed.context_files),
+                needs_l1=False,
+            ),
+            SubTaskNode(
+                id=edit_id,
+                kind=SubTaskKind.EDIT,
+                description=f"基于 handoff 完成：{desc}"[:120],
+                acceptance_criteria="仅修改 handoff 指定代码，查询使用目标视图且 old/new 不同",
+                allowed_tools=["context_search", "edit_file"],
+                context_files=list(failed.context_files),
+                depends_on=[diag_id],
+                needs_l1=failed.needs_l1 if isinstance(failed.needs_l1, bool) else True,
+            ),
+        ],
+    )
+    return _merge_replanned_tree(
+        current_tree,
+        revised,
+        failed_subtask_id=failed_subtask_id,
+    )
 
 
 def parse_planner_output(raw: str, *, fallback_task: str) -> PlannerParseResult:

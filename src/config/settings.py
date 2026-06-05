@@ -45,6 +45,14 @@ class MitKIISettings(BaseSettings):
     working directory is also read automatically.
     """
 
+    project_root: Path | None = Field(
+        default=None,
+        description=(
+            "Target project root to index/read/edit. Defaults to current working "
+            "directory. Set MITKII_PROJECT_ROOT when running MitKII from another repo."
+        ),
+    )
+
     # --- LLM ------------------------------------------------------------------
     model: str = "claude-sonnet-4-20250514"
     planner_model: str | None = Field(

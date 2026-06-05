@@ -140,15 +140,17 @@ def select_task_template(user_request: str) -> TaskTemplate:
 
 def task_tree_from_template(user_request: str, template: TaskTemplate) -> TaskTree:
     if template.mode == TaskMode.INVESTIGATE:
+        target = _infer_target_label(user_request)
+        desired = _infer_desired_change(user_request)
         return TaskTree(
             root_task=user_request,
             nodes=[
                 SubTaskNode(
                     id="st-1",
-                    description=f"定位目标代码：{user_request}"[:120],
+                    description=f"定位{target}、当前查询和可用视图"[:120],
                     kind=SubTaskKind.DIAGNOSE,
                     acceptance_criteria=(
-                        "Output file:line, symbol, and snippet/decision for the edit target"
+                        "输出 HANDOFF_CONTRACT_JSON：file:line、symbol、SQL、视图、片段/决策"
                     ),
                     allowed_tools=["context_search"],
                     context_files=[],
@@ -156,9 +158,9 @@ def task_tree_from_template(user_request: str, template: TaskTemplate) -> TaskTr
                 ),
                 SubTaskNode(
                     id="st-2",
-                    description=user_request[:120],
+                    description=f"将{target}改为{desired}"[:120],
                     kind=SubTaskKind.EDIT,
-                    acceptance_criteria="Target behavior is changed as requested",
+                    acceptance_criteria="仅修改 handoff 指定代码，查询使用目标视图且 old/new 不同",
                     allowed_tools=["context_search", "edit_file"],
                     context_files=[],
                     depends_on=["st-1"],
@@ -166,7 +168,7 @@ def task_tree_from_template(user_request: str, template: TaskTemplate) -> TaskTr
                 ),
                 SubTaskNode(
                     id="st-3",
-                    description="验证相关行为",
+                    description=f"验证{target}查询行为"[:120],
                     kind=SubTaskKind.VERIFY,
                     acceptance_criteria=(
                         "Relevant verification command exits 0 or blocker is reported"
@@ -184,9 +186,9 @@ def task_tree_from_template(user_request: str, template: TaskTemplate) -> TaskTr
         nodes=[
             SubTaskNode(
                 id="st-1",
-                description=user_request[:120],
+                description=f"查找{_infer_target_label(user_request)}并总结证据"[:120],
                 kind=SubTaskKind.DIAGNOSE,
-                acceptance_criteria="Search project and list relevant file paths with evidence",
+                acceptance_criteria="输出用户可读结论，并列出 file:line、symbol、片段/决策证据",
                 allowed_tools=["context_search"],
                 context_files=[],
                 needs_l1=False,
@@ -203,3 +205,43 @@ def _contains_term(text: str, term: str) -> bool:
     if re.search(r"[a-z]", term):
         return bool(re.search(rf"\b{re.escape(term)}\b", text, re.IGNORECASE))
     return term in text
+
+
+def _infer_target_label(user_request: str) -> str:
+    text = user_request.strip()
+    lower = text.lower()
+    if "登机牌" in text:
+        if "接口" in text or "查询" in text:
+            return "登机牌查询接口"
+        return "登机牌相关代码"
+    if "视图" in text or "view" in lower:
+        if any(word in text for word in ("哪些", "查找", "搜索", "列出")):
+            return "项目视图使用情况"
+        return "视图相关查询"
+    if "接口" in text:
+        return _short_phrase_before_change(text, "接口")
+    if "sql" in lower:
+        return "目标 SQL"
+    if "查询" in text:
+        return "目标查询"
+    return "目标代码"
+
+
+def _infer_desired_change(user_request: str) -> str:
+    text = user_request.strip()
+    lower = text.lower()
+    if "视图" in text or "view" in lower:
+        return "使用目标视图查询"
+    if "接口" in text:
+        return "符合请求的接口行为"
+    return "符合请求的实现"
+
+
+def _short_phrase_before_change(text: str, marker: str) -> str:
+    idx = text.find(marker)
+    if idx < 0:
+        return "目标代码"
+    start = max(0, idx - 10)
+    phrase = text[start : idx + len(marker)]
+    phrase = re.sub(r"^[，。！？、\s]*(把|将|当前|现在)?", "", phrase)
+    return phrase or "目标代码"

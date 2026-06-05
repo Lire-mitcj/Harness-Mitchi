@@ -334,3 +334,67 @@ def test_plan_gate_blocks_replan_same_structure_with_new_words(tmp_path: Path) -
 
     assert result.verdict == GateVerdict.BLOCK
     assert any("repeats failed" in msg for msg in result.messages)
+
+
+def test_plan_gate_blocks_multistep_root_task_copy_descriptions(tmp_path: Path) -> None:
+    root = "登机牌的查询接口是不是没用到视图，你改成使用视图查询"
+    tree = TaskTree(
+        root_task=root,
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.DIAGNOSE,
+                description=f"定位目标代码：{root}",
+                allowed_tools=["context_search"],
+                acceptance_criteria="输出文件:行号、符号和代码片段/决策",
+            ),
+            SubTaskNode(
+                id="st-2",
+                kind=SubTaskKind.EDIT,
+                description=root,
+                allowed_tools=["context_search", "edit_file"],
+                acceptance_criteria="查询改为使用目标视图",
+                depends_on=["st-1"],
+                needs_l1=True,
+            ),
+            SubTaskNode(
+                id="st-3",
+                kind=SubTaskKind.VERIFY,
+                description="验证相关行为",
+                allowed_tools=["shell_exec"],
+                acceptance_criteria="Relevant verification command exits 0",
+                depends_on=["st-2"],
+            ),
+        ],
+    )
+
+    result = validate_plan(tree, tmp_path)
+
+    assert result.verdict == GateVerdict.BLOCK
+    assert any("description copies root_task" in msg for msg in result.messages)
+
+
+def test_plan_gate_blocks_edit_replan_that_only_diagnoses(tmp_path: Path) -> None:
+    ctx = ReplanGateContext(
+        failed_subtask_id="st-1",
+        failed_kind=SubTaskKind.EDIT,
+        failed_description="将登机牌查询接口改为使用视图",
+        failed_context_files=("app.py",),
+    )
+    tree = TaskTree(
+        root_task="把登机牌查询的接口改成使用视图查询",
+        nodes=[
+            SubTaskNode(
+                id="st-2a",
+                kind=SubTaskKind.DIAGNOSE,
+                description="定位登机牌查询接口和当前 SQL",
+                allowed_tools=["context_search"],
+                acceptance_criteria="输出文件:行号，符号，和 SQL 查询片段/决策",
+            )
+        ],
+    )
+
+    result = validate_plan(tree, tmp_path, replan_context=ctx)
+
+    assert result.verdict == GateVerdict.BLOCK
+    assert any("removed the edit objective" in msg for msg in result.messages)

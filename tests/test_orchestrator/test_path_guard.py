@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from src.orchestrator.path_guard import is_path_allowed, normalize_rel_path
@@ -54,3 +55,22 @@ def test_format_whitelist_denial_outside_project(tmp_path: Path) -> None:
     assert "outside the project" in msg
     assert "/tmp" in msg
     assert "context_search" in msg
+
+
+def test_restore_original_files_restores_only_project_files(tmp_path: Path) -> None:
+    from src.orchestrator.orchestrator import _restore_original_files
+
+    target = tmp_path / "app.py"
+    target.write_text("broken", encoding="utf-8")
+
+    result = _restore_original_files(
+        tmp_path,
+        json.dumps({
+            "app.py": "original",
+            "../outside.py": "nope",
+        }),
+    )
+
+    assert target.read_text(encoding="utf-8") == "original"
+    assert "restored app.py" in result
+    assert "outside.py" in result
