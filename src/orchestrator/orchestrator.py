@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import json
 import logging
 import time
@@ -19,7 +20,6 @@ from src.cli.run_summary import build_terminal_run_summary
 from src.cli.stream_preview import planner_status_hint
 from src.context.retriever import ContextRetriever
 from src.executor.final_output import parse_executor_final
-from src.executor.subtask_executor import SubTaskExecutor, _diagnose_summary_from_digest
 from src.harness.discovery.input_parser import parse_turn_input
 from src.harness.discovery.manifest import DiagnosticsManifest, manifest_actionable
 from src.harness.discovery.manifest_gate import validate_manifest
@@ -63,6 +63,7 @@ from src.skills import (
     SkillContext,
     SkillExecutor,
     ValidatorSkill,
+    VerifySkill,
 )
 
 if TYPE_CHECKING:
@@ -165,14 +166,6 @@ class OrchestratorLoop:
         self.permissions = permissions
         self.settings = settings
         self.state = OrchestratorState()
-        self._executor = SubTaskExecutor(
-            llm=llm,
-            tools=tools,
-            harness=harness,
-            permissions=permissions,
-            settings=settings,
-            max_turns=settings.orchestrator_executor_max_turns,
-        )
         self._planner = planner or PlannerNode(
             LiteLLMPlannerClient(
                 model=settings.effective_planner_model,
@@ -205,6 +198,7 @@ class OrchestratorLoop:
             ),
             CodeSearchSkill(project_root=harness.project_root, tools=tools),
             ValidatorSkill(project_root=harness.project_root),
+            VerifySkill(project_root=harness.project_root),
         ])
         scout_model = settings.scout_model
         self._scout = ScoutAgent(
@@ -453,11 +447,9 @@ class OrchestratorLoop:
             )
             attempt_num = self.state.subtask_attempts.get(node.id, 0) + 1
             prior_exploration = self.state.subtask_exploration_digests.get(node.id)
-            if _should_use_diagnose_skill_executor(
-                node,
-                prior_summaries=prior_ctx,
-                attempt_num=attempt_num,
-            ):
+            from src.planner.kinds import SubTaskKind
+
+            if node.kind == SubTaskKind.DIAGNOSE:
                 async for event in self._run_diagnose_skill_executor(
                     task_tree=task_tree,
                     node=node,
@@ -468,11 +460,7 @@ class OrchestratorLoop:
                         if "success" in data or data.get("failure_code"):
                             exec_result = data
                     yield event
-            elif _should_use_edit_skill_executor(
-                node,
-                prior_summaries=prior_ctx,
-                attempt_num=attempt_num,
-            ):
+            elif node.kind == SubTaskKind.EDIT:
                 async for event in self._run_edit_skill_executor(
                     user_msg=user_msg,
                     task_tree=task_tree,
@@ -485,26 +473,24 @@ class OrchestratorLoop:
                         if "success" in data or data.get("failure_code"):
                             exec_result = data
                     yield event
-            else:
-                async for event in self._executor.run(
-                    root_task=task_tree.root_task,
+            elif node.kind == SubTaskKind.VERIFY:
+                async for event in self._run_verify_skill_executor(
+                    user_msg=user_msg,
                     task_tree=task_tree,
-                    subtask=node,
-                    truncation_policy=policy,
-                    retry_feedback=prior_errors or None,
-                    quality_gate_retry_limit=self.settings.subtask_quality_gate_retries,
-                    prior_summaries=prior_ctx or None,
-                    subtask_attempt=attempt_num,
-                    prior_exploration=prior_exploration,
+                    node=node,
                     context_pack=subtask_context_pack,
                 ):
                     if event.type == EventType.STREAM_END and event.data:
                         data = event.data
-                        if not data.get("heartbeat") and (
-                            "success" in data or data.get("failure_code")
-                        ):
+                        if "success" in data or data.get("failure_code"):
                             exec_result = data
                     yield event
+            else:
+                yield error_event(
+                    f"Unsupported subtask kind: {node.kind}",
+                    {"subtask_id": node.id},
+                )
+                break
 
             if exec_result:
                 pm.end(
@@ -1208,14 +1194,18 @@ class OrchestratorLoop:
                 context_pack=context_pack,
             ),
             changed_files=edit.changed_files,
+            handoff_contract=contract,
         )
         validation_elapsed = time.perf_counter() - validation_started
+        content = (
+            f"SkillExecutor [{node.id}] · validator took {validation_elapsed:.1f}s "
+            f"(success={validation.success}, result={validation.validation_result})"
+        )
+        if validation.success and validation.summary:
+            content += f" — {validation.summary}"
         yield AgentEvent(
             type=EventType.STATUS,
-            content=(
-                f"SkillExecutor [{node.id}] · validator took {validation_elapsed:.1f}s "
-                f"(success={validation.success}, result={validation.validation_result})"
-            ),
+            content=content,
             data={
                 "phase": "skill_executor",
                 "executor_activity": True,
@@ -1265,6 +1255,82 @@ class OrchestratorLoop:
                 "turns_used": 0,
                 "success": True,
                 "changed_files": list(edit.changed_files),
+                "file_diffs": {},
+                "error_trace": [],
+                "final_message": final_message,
+                "failure_code": "",
+                "quality_gate_failures": 0,
+            },
+        )
+
+    async def _run_verify_skill_executor(
+        self,
+        *,
+        user_msg: str,
+        task_tree: TaskTree,
+        node: SubTaskNode,
+        context_pack: Any | None,
+    ) -> AsyncIterator[AgentEvent]:
+        yield AgentEvent(
+            type=EventType.STATUS,
+            content=f"SkillExecutor [{node.id}] · verify",
+            data=_skill_status_data(
+                subtask_id=node.id,
+                spinner_only=True,
+                skill="verify",
+            ),
+        )
+        changed_files = self.context.file_tracker.get_modified_files()
+        started = time.perf_counter()
+        verify_result = await self._skill_executor.run(
+            "verify",
+            SkillContext(
+                user_request=user_msg,
+                context_pack=context_pack,
+            ),
+            changed_files=changed_files,
+        )
+        elapsed = time.perf_counter() - started
+        yield AgentEvent(
+            type=EventType.STATUS,
+            content=(
+                f"SkillExecutor [{node.id}] · verify took {elapsed:.1f}s "
+                f"(success={verify_result.success}, result={verify_result.validation_result})"
+            ),
+            data={
+                "phase": "skill_executor",
+                "executor_activity": True,
+                "subtask_id": node.id,
+                "skill": "verify",
+                "elapsed": elapsed,
+                "success": verify_result.success,
+                "summary": verify_result.summary,
+            },
+        )
+        if not verify_result.success:
+            yield self._skill_failure_stream_end(
+                node,
+                verify_result.summary,
+                requires_executor_fallback=False,
+            )
+            return
+
+        final_message = (
+            f"SkillExecutor completed verification.\n"
+            f"Validation: {verify_result.summary}"
+        )
+        yield final_answer_event(
+            final_message,
+            intermediate=True,
+            subtask_id=node.id,
+        )
+        yield AgentEvent(
+            type=EventType.STREAM_END,
+            data={
+                "subtask_id": node.id,
+                "turns_used": 0,
+                "success": True,
+                "changed_files": [],
                 "file_diffs": {},
                 "error_trace": [],
                 "final_message": final_message,
@@ -1623,30 +1689,6 @@ def _subtask_context_request(root_task: str, node: SubTaskNode) -> str:
         parts.append("Depends on: " + ", ".join(node.depends_on))
     return "\n".join(parts)
 
-
-def _should_use_diagnose_skill_executor(
-    node: SubTaskNode,
-    *,
-    prior_summaries: dict[str, str],
-    attempt_num: int,
-) -> bool:
-    if node.kind != SubTaskKind.DIAGNOSE:
-        return False
-    if attempt_num != 1 or prior_summaries:
-        return False
-    return True
-
-
-def _should_use_edit_skill_executor(
-    node: SubTaskNode,
-    *,
-    prior_summaries: dict[str, str],
-    attempt_num: int,
-) -> bool:
-    _ = prior_summaries, attempt_num
-    return node.kind == SubTaskKind.EDIT
-
-
 def _previous_handoff_from_summaries(summaries: dict[str, str]) -> dict[str, Any]:
     facts: list[dict[str, Any]] = []
     evidence: list[dict[str, Any]] = []
@@ -1714,12 +1756,45 @@ def _append_current_edit_context(final_message: str, search_result: Any) -> str:
 
 
 def _append_prior_edit_context(search_output: str, prior_summaries: dict[str, str]) -> str:
-    if "EDIT_CONTEXT_JSON" in search_output:
-        return search_output
+    prior_block = ""
     for text in prior_summaries.values():
-        block = _extract_marker_json_block(text, "EDIT_CONTEXT_JSON")
-        if block:
-            return search_output + "\n\nEDIT_CONTEXT_JSON\n" + block
+        pb = _extract_marker_json_block(text, "EDIT_CONTEXT_JSON")
+        if pb:
+            prior_block = pb
+            break
+            
+    if not prior_block:
+        return search_output
+
+    try:
+        prior_ctx = json.loads(prior_block)
+    except Exception:
+        return search_output
+
+    if "EDIT_CONTEXT_JSON" not in search_output:
+        return search_output + "\n\nEDIT_CONTEXT_JSON\n" + prior_block
+
+    current_block = _extract_marker_json_block(search_output, "EDIT_CONTEXT_JSON")
+    if not current_block:
+        return search_output
+
+    try:
+        current_ctx = json.loads(current_block)
+        modified = False
+        if not current_ctx.get("target_view") and prior_ctx.get("target_view"):
+            current_ctx["target_view"] = prior_ctx["target_view"]
+            modified = True
+        if not current_ctx.get("available_views") and prior_ctx.get("available_views"):
+            current_ctx["available_views"] = prior_ctx["available_views"]
+            modified = True
+        
+        if modified:
+            new_block = json.dumps(current_ctx, ensure_ascii=False, indent=2)
+            prefix = search_output.split("EDIT_CONTEXT_JSON", 1)[0]
+            return prefix + "EDIT_CONTEXT_JSON\n" + new_block
+    except Exception:
+        pass
+
     return search_output
 
 
@@ -1759,3 +1834,159 @@ def _apply_context_pack_to_subtask(node: SubTaskNode, context_pack: Any | None) 
         return
     if node.kind in {SubTaskKind.DIAGNOSE, SubTaskKind.EDIT}:
         node.context_files = list(files)
+
+
+def _diagnose_summary_from_digest(
+    subtask: SubTaskNode,
+    digest: str,
+    error_trace: list[str],
+) -> str:
+    body = digest.strip()
+    if not body:
+        recent = "\n".join(f"- {e}" for e in error_trace[-5:])
+        body = recent or "The diagnose step reached summary mode before more tool output."
+    findings = _diagnose_findings_from_digest(subtask, body)
+    if findings:
+        lines = [
+            f"Result: 已定位 {len(findings)} 个相关代码位置。",
+            "Evidence:",
+        ]
+        lines.extend(f"- {item}" for item in findings)
+        lines.append(
+            f"Conclusion: acceptance met。以上路径和行号可作为 {subtask.id} 的交接证据。"
+        )
+        return "\n".join(lines)
+    searched = _diagnose_searches_from_digest(body)
+    lines = [
+        "Result: 未定位到可交接的具体路径和行号。",
+        "Evidence:",
+    ]
+    if searched:
+        lines.append("已执行的搜索:")
+        lines.extend(f"- {item}" for item in searched[:6])
+    else:
+        lines.append("- 未记录到有效的 context_search/map_search/grep 命中。")
+    if error_trace:
+        lines.append("近期错误:")
+        lines.extend(f"- {item}" for item in error_trace[-3:])
+    lines.append(
+        "Conclusion: 当前证据不足，不能作为后续 edit 的 handoff；需要扩大或改写搜索策略。"
+    )
+    return "\n".join(lines)
+
+
+def _diagnose_findings_from_digest(subtask: SubTaskNode, digest: str) -> list[str]:
+    intent = f"{subtask.description} {subtask.acceptance_criteria}".lower()
+    wants_view_definition = (
+        ("视图" in intent or "view" in intent)
+        and ("定义" in intent or "definition" in intent or "create" in intent)
+    )
+    snippets = _code_snippets_from_digest(digest)
+    candidates: list[tuple[int, str]] = []
+    for raw in digest.splitlines():
+        line = raw.strip()
+        if line.startswith("- "):
+            line = line[2:].strip()
+        if not _looks_like_location_hit(line):
+            continue
+        score = _finding_score(line, wants_view_definition=wants_view_definition)
+        if score <= 0:
+            continue
+        candidates.append((
+            score,
+            _format_finding_line(
+                line,
+                wants_view_definition,
+                fallback_snippet=snippets[0] if snippets else "",
+            ),
+        ))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    out: list[str] = []
+    seen_locations: set[str] = set()
+    for _score, text in candidates:
+        location = text.split(" | ", 1)[0]
+        if location in seen_locations:
+            continue
+        seen_locations.add(location)
+        out.append(text)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _looks_like_location_hit(line: str) -> bool:
+    return bool(re.match(r"[\w./-]+\.(?:py|sql|md|tsx?|jsx?):\d+", line))
+
+
+def _diagnose_searches_from_digest(digest: str) -> list[str]:
+    searches: list[str] = []
+    in_search_section = False
+    for raw in digest.splitlines():
+        line = raw.strip()
+        if line in {
+            "Context/map searches already run:",
+            "Grep queries already run:",
+        }:
+            in_search_section = True
+            continue
+        if in_search_section and line.startswith("- "):
+            value = line[2:].strip()
+            if value and value not in searches:
+                searches.append(value)
+            continue
+        if in_search_section and line and not line.startswith("- "):
+            in_search_section = False
+    return searches
+
+
+def _finding_score(line: str, *, wants_view_definition: bool) -> int:
+    lower = line.lower()
+    score = 1
+    if ".sql:" in lower:
+        score += 3
+    if "create view" in lower or "create or replace view" in lower:
+        score += 8
+    if "视图" in line:
+        score += 3
+    if "-- 视图" in line or "视图：" in line or "视图:" in line:
+        score += 5
+    if wants_view_definition and not (
+        ".sql:" in lower
+        or "create view" in lower
+        or "-- 视图" in line
+        or "视图：" in line
+        or "视图:" in line
+    ):
+        return 0
+    return score
+
+
+def _format_finding_line(
+    line: str,
+    wants_view_definition: bool,
+    *,
+    fallback_snippet: str = "",
+) -> str:
+    location, _, snippet = line.partition(":")
+    line_no, _, rest = snippet.partition(":")
+    loc = f"{location}:{line_no}" if line_no else location
+    symbol = "视图定义" if wants_view_definition else "目标代码"
+    evidence = rest.strip() or fallback_snippet or line
+    return f"{loc} | {symbol} | {evidence[:220]}"
+
+
+def _code_snippets_from_digest(digest: str) -> list[str]:
+    snippets: list[str] = []
+    in_section = False
+    for raw in digest.splitlines():
+        line = raw.strip()
+        if line == "Code / SQL seen (snippets):":
+            in_section = True
+            continue
+        if in_section and line and not line.startswith("- "):
+            break
+        if in_section and line.startswith("- "):
+            snippet = line[2:].strip()
+            if snippet:
+                snippets.append(snippet)
+    return snippets

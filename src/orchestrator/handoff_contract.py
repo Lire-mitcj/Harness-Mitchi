@@ -8,7 +8,7 @@ _LOCATION_RE = re.compile(
     r"(?P<path>[\w./-]+\.(?:py|sql|tsx?|jsx?|json|ya?ml|toml)):"
     r"(?P<line>\d+)\s*(?:\|\s*(?P<symbol>[^|]+)\|\s*(?P<snippet>.*))?"
 )
-_VIEW_RE = re.compile(r"\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(?P<name>[\w.]+)", re.I)
+_VIEW_RE = re.compile(r"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FORCE\s+)?(?:VIEW|TABLE)\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"'\`\[]?(?P<name>[\w.]+)", re.I)
 _FROM_RE = re.compile(r"\bFROM\s+(?P<table>[\w.]+)", re.I)
 
 
@@ -213,13 +213,46 @@ def _extract_current_sql(locations: list[dict[str, Any]]) -> str:
 
 
 def _infer_target_view(user_request: str, views: list[dict[str, Any]]) -> str:
+    if not views:
+        return ""
     lowered = user_request.lower()
-    if "登机牌" in user_request or "boarding" in lowered:
-        for view in views:
-            name = str(view.get("name") or "")
-            if "boarding" in name.lower() or "ticket" in name.lower():
-                return name
-    return str(views[0].get("name") or "") if views else ""
+    
+    best_view = ""
+    best_score = -1
+    for view in views:
+        name = str(view.get("name") or "")
+        name_lower = name.lower()
+        score = 0
+        
+        # Keyword matching
+        if "登机牌" in user_request or "boarding" in lowered:
+            if "boarding" in name_lower or "ticket" in name_lower:
+                score += 20
+        if "订单" in user_request or "order" in lowered:
+            if "order" in name_lower or "report" in name_lower or "detail" in name_lower:
+                score += 20
+        if "机票" in user_request or "ticket" in lowered:
+            if "ticket" in name_lower or "report" in name_lower or "detail" in name_lower:
+                score += 20
+        if "监控" in user_request or "monitor" in lowered or "flight" in lowered:
+            if "monitor" in name_lower or "flight" in name_lower:
+                score += 20
+                
+        # Basic substring matches from user_request words
+        words = re.findall(r"\b[a-zA-Z0-9_]+\b", user_request.replace("_", " ").lower())
+        for w in words:
+            if len(w) > 2 and w not in {"use", "view", "sql", "query", "replace", "change"}:
+                if w in name_lower:
+                    score += 5
+                    
+        if score > best_score:
+            best_score = score
+            best_view = name
+            
+    if best_score <= 0:
+        return str(views[0].get("name") or "")
+    return best_view
+
 
 
 def _dedupe_views(views: list[dict[str, Any]]) -> list[dict[str, Any]]:

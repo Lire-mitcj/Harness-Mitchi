@@ -273,3 +273,25 @@ def test_context_builder_expands_two_layer_function_call_chain(tmp_path: Path) -
     assert "query_orders -> build_order_query" in pack.call_chain
     assert "build_order_query -> format_order_response" in pack.call_chain
     assert any(symbol.name == "format_order_response" for symbol in pack.symbols)
+
+
+def test_build_context_queries_with_jieba_and_mixed_inputs() -> None:
+    # 1. Test Chinese tokenization via jieba (length limit relaxed)
+    queries = build_context_queries("项目里面改签逻辑有哪些")
+    # Verify that it extracted correct segmented words
+    assert "改签" in queries
+    assert "逻辑" in queries
+
+    # 2. Test mixed Chinese and English inputs
+    queries_mixed = build_context_queries("修改 query_orders 改签状态")
+    assert "query_orders" in queries_mixed
+    assert "改签" in queries_mixed
+    assert "状态" in queries_mixed
+
+    # 3. Test empty-result fallback query
+    queries_fallback = build_context_queries("  ")
+    assert isinstance(queries_fallback, list)
+
+    queries_fallback_2 = build_context_queries("a")
+    assert "a" in queries_fallback_2
+

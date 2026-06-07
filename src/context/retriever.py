@@ -186,9 +186,11 @@ def build_context_queries(text: str, *, limit: int = 10) -> list[str]:
     """Build a bounded batch of retrieval queries from user intent."""
     terms: list[str] = []
 
-    def add(term: str) -> None:
+    def add(term: str, force: bool = False) -> None:
         term = term.strip()
-        if len(term) >= 2 and term not in terms:
+        if not term:
+            return
+        if (force or len(term) >= 2) and term not in terms:
             terms.append(term)
 
     domain_terms = {
@@ -212,11 +214,32 @@ def build_context_queries(text: str, *, limit: int = 10) -> list[str]:
         for part in token.split("_"):
             add(part)
 
-    for phrase in re.findall(r"[\u4e00-\u9fff]{2,}", text):
-        if len(phrase) <= 8:
-            add(phrase)
+    # Chinese tokenization using jieba with relaxed length limits
+    chinese_text = "".join(re.findall(r"[\u4e00-\u9fff]+", text))
+    if chinese_text:
+        try:
+            import jieba
+            words = jieba.lcut(chinese_text)
+            for word in words:
+                if len(word) >= 2:
+                    add(word)
+        except ImportError:
+            for phrase in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+                # Relaxed limit for phrase matching when jieba is not available
+                if len(phrase) <= 30:
+                    add(phrase)
+
+    # Fallback to make sure queries are never empty
+    if not terms:
+        for token in re.split(r"\s+", text):
+            if token.strip():
+                add(token, force=True)
+        if not terms and text.strip():
+            add(text.strip(), force=True)
+
 
     return terms[:limit]
+
 
 
 def _dedupe_symbols(raw_symbols: list[object]) -> list[object]:

@@ -7,7 +7,6 @@ from src.planner.task_tree import SubTaskNode, TaskTree
 
 
 def test_rebuild_retry_uses_paths_only_not_full_files(tmp_path: Path) -> None:
-    import src.executor.subtask_executor  # noqa: F401 — full isolation module load
 
     from src.orchestrator.isolation import rebuild_executor_retry_messages
     main = tmp_path / "main.py"

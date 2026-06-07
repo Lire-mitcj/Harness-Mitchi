@@ -8,7 +8,7 @@ from src.context.retriever import build_context_queries
 from src.skills.base import SkillContext, SkillResult
 from src.tools.registry import ToolRegistry
 
-_HYDRATION_VERSION = "edit_context_hydration_v3_pipe_hits"
+_HYDRATION_VERSION = "edit_context_hydration_v4_view_dependency_columns"
 
 
 class CodeSearchSkill:
@@ -123,7 +123,8 @@ def _search_calls(
     queries = build_context_queries(query, limit=10)
     if not queries:
         queries = [query]
-    pattern = _search_pattern(query, queries, root_query=context.user_request)
+    py_pattern = _search_pattern(query, queries, root_query=context.user_request, file_type="py")
+    sql_pattern = _search_pattern(query, queries, root_query=context.user_request, file_type="sql")
     calls: list[tuple[str, dict[str, object]]] = []
 
     if context.context_pack is not None and context.context_pack.search_plan:
@@ -133,10 +134,12 @@ def _search_calls(
                 for term in plan.patterns[:12]
                 if str(term).strip()
             ]
-            plan_pattern = _search_pattern(query, plan_terms, root_query=context.user_request) or pattern
             globs = plan.globs or ("*",)
             path = plan.files[0] if len(plan.files) == 1 else "."
             for glob in globs[:2]:
+                is_sql = glob.endswith(".sql") or "sql" in glob.lower()
+                p_type = "sql" if is_sql else "py"
+                plan_pattern = _search_pattern(query, plan_terms, root_query=context.user_request, file_type=p_type) or (sql_pattern if is_sql else py_pattern)
                 calls.append((
                     "grep_search",
                     {
@@ -149,7 +152,8 @@ def _search_calls(
         _append_fallback_search_calls(
             calls,
             queries=queries,
-            pattern=pattern,
+            py_pattern=py_pattern,
+            sql_pattern=sql_pattern,
             project_root=project_root,
             search_paths=search_paths,
         )
@@ -158,7 +162,8 @@ def _search_calls(
     _append_fallback_search_calls(
         calls,
         queries=queries,
-        pattern=pattern,
+        py_pattern=py_pattern,
+        sql_pattern=sql_pattern,
         project_root=project_root,
         search_paths=search_paths,
     )
@@ -169,7 +174,8 @@ def _append_fallback_search_calls(
     calls: list[tuple[str, dict[str, object]]],
     *,
     queries: list[str],
-    pattern: str,
+    py_pattern: str,
+    sql_pattern: str,
     project_root: Path,
     search_paths: tuple[str, ...] = (),
 ) -> None:
@@ -200,21 +206,48 @@ def _append_fallback_search_calls(
     grep_paths = search_paths or (".",)
     for path in grep_paths[:4]:
         grep_path = str((project_root / path).resolve()) if not Path(path).is_absolute() else path
-        for include in ("*.py", "*.sql"):
-            add(
-                "grep_search",
-                {
-                    "pattern": pattern,
-                    "path": grep_path,
-                    "include": include,
-                    "max_results": 80,
-                },
-            )
+        add(
+            "grep_search",
+            {
+                "pattern": py_pattern,
+                "path": grep_path,
+                "include": "*.py",
+                "max_results": 80,
+            },
+        )
+        add(
+            "grep_search",
+            {
+                "pattern": sql_pattern,
+                "path": grep_path,
+                "include": "*.sql",
+                "max_results": 80,
+            },
+        )
 
 
-def _search_pattern(query: str, queries: list[str], root_query: str = "") -> str:
+def _search_pattern(query: str, queries: list[str], root_query: str = "", file_type: str = "py") -> str:
     text = query.lower()
     root_text = root_query.lower()
+    
+    is_view_change = (
+        "视图" in query
+        or "view" in text
+        or "视图" in root_query
+        or "view" in root_text
+        or "查询" in query
+        or "query" in text
+        or "sql" in text
+        or "sql" in root_text
+    )
+
+    if file_type == "sql":
+        if is_view_change:
+            sql_patterns = [r"CREATE\s+(?:OR\s+REPLACE\s+)?VIEW"]
+            views_in_query = _extract_views_from_text(query) + _extract_views_from_text(root_query)
+            for v in views_in_query:
+                sql_patterns.append(rf"\b{re.escape(v)}\b")
+            return "|".join(dict.fromkeys(sql_patterns))
     
     # 1. symbol 精确匹配
     symbols = _extract_symbols(query)
@@ -269,16 +302,18 @@ def _search_pattern(query: str, queries: list[str], root_query: str = "") -> str
             if t.lower() not in {"file", "line", "symbol", "snippet", "code"}
         ]
         
-    if "视图" in query or "view" in text or "视图" in root_query or "view" in root_text:
+    if is_view_change:
         if "定义" in query or "definition" in text or "create" in text or "定义" in root_query or "definition" in root_text or "create" in root_text:
+            if file_type != "py":
+                terms.append(r"CREATE\s+(?:OR\s+REPLACE\s+)?VIEW")
             terms.extend([
-                r"CREATE\s+(?:OR\s+REPLACE\s+)?VIEW",
                 r"--\s*视图",
                 r"视图[:：]",
             ])
         else:
+            if file_type != "py":
+                terms.append(r"CREATE\s+(?:OR\s+REPLACE\s+)?VIEW")
             terms.extend([
-                r"CREATE\s+(?:OR\s+REPLACE\s+)?VIEW",
                 r"\bview\b",
                 r"视图",
             ])
@@ -339,18 +374,33 @@ class _HydratedSearch:
         self.hit_paths = hit_paths
 
 
-def _merge_ranges(ranges: list[tuple[int, int]], gap: int = 20) -> list[tuple[int, int]]:
+def _merge_ranges(ranges: list[tuple[int, int]], gap: int = 20, max_lines: int = 140) -> list[tuple[int, int]]:
     if not ranges:
         return []
-    sorted_ranges = sorted(ranges, key=lambda r: r[0])
+    
+    # First split any range that is too large
+    split_inputs = []
+    for r_start, r_end in ranges:
+        if r_end - r_start + 1 > max_lines:
+            curr = r_start
+            while curr <= r_end:
+                seg_end = min(r_end, curr + max_lines - 1)
+                split_inputs.append((curr, seg_end))
+                curr = seg_end + 1
+        else:
+            split_inputs.append((r_start, r_end))
+            
+    sorted_ranges = sorted(split_inputs, key=lambda r: r[0])
     merged = [sorted_ranges[0]]
     for current in sorted_ranges[1:]:
         prev_start, prev_end = merged[-1]
         curr_start, curr_end = current
         if curr_start <= prev_end + gap:
-            merged[-1] = (prev_start, max(prev_end, curr_end))
-        else:
-            merged.append(current)
+            potential_end = max(prev_end, curr_end)
+            if potential_end - prev_start + 1 <= max_lines:
+                merged[-1] = (prev_start, potential_end)
+                continue
+        merged.append(current)
     return merged
 
 
@@ -363,6 +413,7 @@ def _hydrate_snippets(
     padding: int = 3,
     max_chars: int = 10_000,
     context: SkillContext | None = None,
+    **kwargs: object,
 ) -> _HydratedSearch:
     """Read bounded snippets around repo_map/grep hits; never expose raw full-file IO."""
     if context is not None and context.context_pack is not None:
@@ -403,7 +454,7 @@ def _hydrate_snippets(
 
     flat_hits: list[tuple[Path, str, int, int]] = []
     for display, (resolved, ranges) in file_hits.items():
-        merged = _merge_ranges(ranges, gap=20)
+        merged = _merge_ranges(ranges, gap=20, max_lines=1000)
         for start, end in merged:
             flat_hits.append((resolved, display, start, end))
 
@@ -442,6 +493,14 @@ def _hydrate_snippets(
                 lines,
                 target_start,
                 target_end,
+                max_lines=1000,
+            )
+        elif path.suffix == ".sql":
+            target_start, target_end = _expand_sql_symbol_range(
+                lines,
+                target_start,
+                target_end,
+                max_lines=1000,
             )
         if target_end < target_start:
             failures.append(
@@ -453,7 +512,7 @@ def _hydrate_snippets(
         if not target_code.strip():
             failures.append(f"{display}:{target_start}-{target_end}: empty target code")
             continue
-        if path.suffix in {".py", ".ts", ".tsx", ".js", ".jsx"}:
+        if path.suffix in {".py", ".ts", ".tsx", ".js", ".jsx", ".sql"}:
             if _is_editable_target(target_code, display, intended_change, context):
                 editable_targets.append({
                     "file": display,
@@ -479,18 +538,45 @@ def _hydrate_snippets(
             for line_no in range(s, e + 1)
         )
         chunk = f'<snippet path="{display}" lines="{s}-{e}">\n{body}\n</snippet>'
-        if used_chars + len(chunk) > max_chars:
-            failures.append(
-                f"{display}:{s}-{e}: snippet skipped by display token budget"
+        if used_chars + len(chunk) <= max_chars:
+            snippets.append(chunk)
+            used_chars += len(chunk)
+        else:
+            core_body = "\n".join(
+                f"{line_no}: {lines[line_no - 1]}"
+                for line_no in range(start, end + 1)
             )
-            continue
-        snippets.append(chunk)
-        used_chars += len(chunk)
+            core_chunk = (
+                f'<snippet path="{display}" lines="{start}-{end}" status="truncated_to_core">\n'
+                f"# Padding lines omitted due to token budget limits. Use read_file/view_file to view context.\n"
+                f"{core_body}\n"
+                f"</snippet>"
+            )
+            if used_chars + len(core_chunk) <= max_chars:
+                snippets.append(core_chunk)
+                used_chars += len(core_chunk)
+                failures.append(f"{display}:{s}-{e}: snippet padded lines omitted due to budget")
+            else:
+                ref_chunk = (
+                    f'<snippet path="{display}" lines="{start}-{end}" status="omitted_due_to_budget">\n'
+                    f"# Full snippet omitted due to token budget limits. Use read_file/view_file to view lines {start}-{end}.\n"
+                    f"</snippet>"
+                )
+                if used_chars + len(ref_chunk) <= max_chars:
+                    snippets.append(ref_chunk)
+                    used_chars += len(ref_chunk)
+                    failures.append(f"{display}:{s}-{e}: snippet omitted due to budget")
+                else:
+                    failures.append(f"{display}:{s}-{e}: snippet skipped by display token budget")
+
     return _HydratedSearch(
         snippets=snippets,
         edit_context=_build_edit_plan_context(
             editable_targets,
             intended_change=intended_change,
+            project_root=project_root,
+            context=context,
+            **kwargs,
         ),
         hit_count=len(file_hits),
         failures=failures,
@@ -498,10 +584,213 @@ def _hydrate_snippets(
     )
 
 
+def _find_all_views(project_root: Path) -> list[str]:
+    views = set()
+    pattern = re.compile(
+        r"\bCREATE\s+[^;]*?\bVIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_\.\"'\`\[\]]+)",
+        re.IGNORECASE
+    )
+    for path in project_root.rglob("*"):
+        try:
+            if path.suffix.lower() in {".sql", ".py"} and path.is_file():
+                content = path.read_text(encoding="utf-8", errors="ignore")
+                for match in pattern.finditer(content):
+                    raw_name = match.group(1)
+                    cleaned = re.sub(r'[\"\'\`\[\]]', '', raw_name)
+                    views.add(cleaned.lower())
+                    if '.' in cleaned:
+                        views.add(cleaned.split('.')[-1].lower())
+        except Exception:
+            pass
+    return sorted(list(views))
+
+
+def _find_all_view_details(project_root: Path) -> dict[str, dict[str, object]]:
+    details: dict[str, dict[str, object]] = {}
+    pattern = re.compile(
+        r"\bCREATE\s+[^;]*?\bVIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?P<name>[a-zA-Z0-9_\.\"'\`\[\]]+)\s+AS\s+"
+        r"(?P<select>SELECT\b[\s\S]*?)(?:;|$)",
+        re.IGNORECASE,
+    )
+    for path in project_root.rglob("*"):
+        try:
+            if path.suffix.lower() not in {".sql", ".py"} or not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for match in pattern.finditer(content):
+            raw_name = match.group("name")
+            cleaned = re.sub(r'[\"\'\`\[\]]', '', raw_name).strip()
+            if not cleaned:
+                continue
+            columns = _extract_select_output_columns(match.group("select"))
+            replaces = _extract_all_tables_from_sql(match.group("select"))
+            detail = {
+                "role": "replacement_source",
+                "kind": "database_view",
+                "name": cleaned,
+                "columns": columns,
+                "replaces_objects": replaces,
+                "evidence": [str(path.relative_to(project_root)).replace("\\", "/")],
+                "confidence": 0.95,
+            }
+            for key in {cleaned.lower(), cleaned.split(".")[-1].lower()}:
+                details[key] = detail
+    return details
+
+
+def _extract_select_output_columns(sql: str) -> list[str]:
+    try:
+        import sqlparse
+
+        parsed = sqlparse.parse(sql)
+        if not parsed:
+            return []
+        stmt = parsed[0]
+        tokens = list(stmt.tokens)
+        select_idx = -1
+        from_idx = -1
+        for idx, token in enumerate(tokens):
+            if token.ttype is sqlparse.tokens.Keyword.DML and token.value.upper() == "SELECT":
+                select_idx = idx
+            elif token.ttype is sqlparse.tokens.Keyword and token.value.upper() == "FROM":
+                from_idx = idx
+                break
+        if select_idx < 0 or from_idx <= select_idx:
+            return []
+        columns: list[str] = []
+        for token in tokens[select_idx + 1 : from_idx]:
+            if token.is_whitespace:
+                continue
+            if isinstance(token, sqlparse.sql.IdentifierList):
+                items = list(token.get_identifiers())
+            elif isinstance(token, sqlparse.sql.Identifier):
+                items = [token]
+            else:
+                items = [token] if token.value.strip() and token.value.strip() != "," else []
+            for item in items:
+                if "*" in item.value:
+                    continue
+                alias = item.get_alias() if hasattr(item, "get_alias") else None
+                real_name = item.get_real_name() if hasattr(item, "get_real_name") else None
+                name = alias or real_name or item.value
+                clean = _clean_sql_identifier(name)
+                if clean and clean.lower() not in {"as", "case", "when", "then", "else", "end"}:
+                    columns.append(clean)
+        return list(dict.fromkeys(columns))
+    except Exception:
+        return []
+
+
+def _extract_all_tables_from_sql(sql: str) -> list[str]:
+    tables: list[str] = []
+    for match in re.finditer(
+        r"\b(?:FROM|JOIN)\s+[`\"\[]?([a-zA-Z0-9_.]+)[`\"\]]?",
+        sql,
+        re.IGNORECASE,
+    ):
+        tables.append(match.group(1).split(".")[-1].lower())
+    return list(dict.fromkeys(tables))
+
+
+def _clean_sql_identifier(raw: str) -> str:
+    text = raw.strip().split(".")[-1]
+    text = re.sub(r'[\"\'\`\[\]]', "", text)
+    text = re.sub(r"\W+$", "", text)
+    return text.strip()
+
+
+
+
+def _extract_views_from_text(text: str) -> list[str]:
+    pattern1 = re.compile(r"\b(v_[a-zA-Z0-9_]+|[a-zA-Z0-9_]+_view[s]?)\b", re.IGNORECASE)
+    views = set(pattern1.findall(text))
+    pattern2 = re.compile(
+        r"\b(?:view|视图|视图名)[:：\s`']*\b([a-zA-Z0-9_.]+)\b",
+        re.IGNORECASE
+    )
+    for name in pattern2.findall(text):
+        if name.lower() not in {"name", "definition", "schema", "the", "a", "to", "and", "or", "of", "in"}:
+            views.add(name)
+    return sorted(list(views))
+
+
+def _infer_target_view(
+    intended_change: str,
+    views: list[str],
+    editable_targets: list[dict[str, object]]
+) -> str:
+    if not views:
+        return ""
+    
+    def tokenize(s: str) -> list[str]:
+        return re.findall(r"\b[a-zA-Z0-9]+\b", s.replace("_", " ").lower())
+    
+    terms = set(tokenize(intended_change))
+    for target in editable_targets:
+        file = str(target.get("file") or "")
+        terms.update(tokenize(file))
+        current_code = str(target.get("current_code") or "")
+        for m in re.finditer(r"\bdef\s+([a-zA-Z0-9_]+)\b", current_code, re.IGNORECASE):
+            terms.update(tokenize(m.group(1)))
+        for m in re.finditer(r"\b(?:FROM|JOIN)\s+[`\"]?([a-zA-Z0-9_.]+)[`\"]?", current_code, re.IGNORECASE):
+            terms.update(tokenize(m.group(1)))
+
+    stopwords = {
+        "def", "class", "async", "await", "return", "import", "from", "as",
+        "if", "else", "elif", "for", "while", "in", "not", "and", "or", "try", "except",
+        "view", "query", "sql", "db", "api", "file", "line", "symbol", "snippet",
+        "code", "evidence", "test", "v", "视图", "查询", "接口", "方法",
+        "change", "replace", "use", "with", "the", "this", "method", "function",
+        "using", "into", "to", "for", "of", "a", "an", "is"
+    }
+    filtered_terms = {t for t in terms if t not in stopwords}
+    
+    best_view = ""
+    best_score = -1
+    for view in views:
+        view_tokens = set(tokenize(view))
+        score = 0
+        for token in view_tokens:
+            if token in stopwords:
+                continue
+            if token in filtered_terms:
+                score += 10
+            for term in filtered_terms:
+                if term in token or token in term:
+                    score += 2
+        
+        view_lower = view.lower()
+        if "登机牌" in intended_change or "boarding" in intended_change.lower():
+            if "boarding" in view_lower or "ticket" in view_lower:
+                score += 20
+        if "订单" in intended_change or "order" in intended_change.lower():
+            if "order" in view_lower:
+                score += 20
+        if "机票" in intended_change or "ticket" in intended_change.lower():
+            if "ticket" in view_lower or "passenger" in view_lower:
+                score += 20
+
+        if score > best_score:
+            best_score = score
+            best_view = view
+            
+    if best_score <= 0:
+        if len(views) == 1:
+            return views[0]
+        return ""
+    return best_view
+
+
 def _build_edit_plan_context(
     editable_targets: list[dict[str, object]],
     *,
     intended_change: str,
+    project_root: Path,
+    context: SkillContext | None = None,
+    **kwargs: object,
 ) -> dict[str, object] | None:
     if not editable_targets:
         return None
@@ -510,18 +799,111 @@ def _build_edit_plan_context(
         for target in editable_targets
         if str(target.get("file") or "")
     ]
+    views = _find_all_views(project_root)
+    view_details = _find_all_view_details(project_root)
+    if not views:
+        views = _extract_views_from_text(intended_change)
+    
+    target_view = ""
+    if context is not None:
+        if context.context_pack is not None:
+            target_view = context.context_pack.metadata.get("target_view") or ""
+        if not target_view:
+            target_view = context.metadata.get("target_view") or ""
+    if not target_view:
+        target_view = str(kwargs.get("target_view") or "").strip()
+    if not target_view:
+        target_view = _infer_target_view(intended_change, views, editable_targets)
+        
+    target_symbols = _extract_symbols(intended_change)
+    target_symbol = target_symbols[0] if target_symbols else "目标代码"
+    
+    is_view = "视图" in intended_change or "view" in intended_change.lower() or "sql" in intended_change.lower()
+    operation = "replace_dependency" if is_view else "general_edit"
+    
+    replaces = []
+    for target in editable_targets:
+        code = str(target.get("current_code") or "")
+        replaces.extend(_extract_all_tables_from_python_code(code))
+    replaces = list(dict.fromkeys(replaces))
+    
+    resolved_deps = []
+    if target_view:
+        detail = view_details.get(target_view.lower()) or view_details.get(target_view.split(".")[-1].lower())
+        dep_replaces = replaces
+        columns: list[str] = []
+        evidence: list[str] = []
+        if isinstance(detail, dict):
+            columns = [str(col) for col in detail.get("columns") or [] if str(col).strip()]
+            evidence = [str(item) for item in detail.get("evidence") or [] if str(item).strip()]
+            dep_replaces = list(dict.fromkeys(
+                dep_replaces
+                + [str(obj) for obj in detail.get("replaces_objects") or [] if str(obj).strip()]
+            ))
+        resolved_deps.append({
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": target_view,
+            "columns": columns,
+            "replaces_objects": dep_replaces,
+            "evidence": evidence,
+            "confidence": 0.95
+        })
+        
+    edit_targets = []
+    for target in editable_targets[:4]:
+        edit_targets.append({
+            "file": str(target.get("file") or ""),
+            "symbol": str(target.get("symbol") or target.get("name") or target_symbol),
+            "current_code": str(target.get("current_code") or ""),
+            "start_line": target.get("start_line"),
+            "end_line": target.get("end_line")
+        })
+        
     return {
-        "schema": "mitkii.edit_context.v1",
+        "schema": "mitkii.edit_context.v2",
         "builder": "EditPlanBuilder",
         "code_edit_ready": True,
-        "snippets": editable_targets[:4],
-        "editable_targets": editable_targets[:4],
-        "intended_change": intended_change,
-        "acceptance_criteria": ["Target behavior is changed as requested."],
+        "task_intent": {
+            "operation": operation,
+            "target_symbol": target_symbol,
+            "goal": "use existing implementation/object instead of current query builder" if is_view else "edit code as requested"
+        },
+        "edit_targets": edit_targets,
+        "resolved_dependencies": resolved_deps,
+        "constraints": [
+            "Do not invent dependencies",
+            "Only use resolved_dependencies",
+            "Preserve public function signature",
+            "Preserve returned field names used by callers",
+            "For SQL replacement, rebuild SELECT from replacement_source.columns and remove only replaces_objects JOINs"
+        ],
+        "acceptance": [
+            {
+                "type": "diff_must_touch_symbol",
+                "symbol": target_symbol
+            },
+            {
+                "type": "must_reference_dependency",
+                "role": "replacement_source"
+            },
+            {
+                "type": "must_not_reference_unresolved_dependency"
+            },
+            {
+                "type": "compile_or_syntax_check"
+            }
+        ],
         "tool_policy": {
             "allowed_tools": ["edit_file"],
             "scope": list(dict.fromkeys(scope)),
         },
+        "snippets": editable_targets[:4],
+        "editable_targets": editable_targets[:4],
+        "intended_change": intended_change,
+        "available_views": views,
+        "target_view": target_view,
+        "acceptance_criteria": ["Target behavior is changed as requested."],
     }
 
 
@@ -580,10 +962,87 @@ def _expand_python_symbol_range(
     lines: list[str],
     start: int,
     end: int,
+    max_lines: int = 140,
 ) -> tuple[int, int]:
     sym_start, _ = _find_enclosing_python_symbol_range(lines, start)
     _, sym_end = _find_enclosing_python_symbol_range(lines, end)
-    return sym_start, max(sym_end, sym_start)
+    
+    if sym_end - sym_start + 1 <= max_lines:
+        return sym_start, max(sym_end, sym_start)
+        
+    mid = (start + end) // 2
+    target_start = max(sym_start, mid - max_lines // 2)
+    target_end = min(sym_end, target_start + max_lines - 1)
+    return target_start, target_end
+
+
+def _find_enclosing_sql_range(lines: list[str], line_no: int) -> tuple[int, int]:
+    if not lines:
+        return line_no, line_no
+    
+    target_idx = line_no - 1
+    start_idx = target_idx
+    for idx in range(target_idx, -1, -1):
+        line = lines[idx]
+        if ";" in line and idx < target_idx:
+            start_idx = idx + 1
+            break
+        line_upper = line.strip().upper()
+        if re.search(r"\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b", line_upper):
+            start_idx = idx
+            break
+        if line_upper.startswith("SELECT"):
+            start_idx = idx
+            # Do not break, keep scanning upward to find CREATE VIEW if it exists
+            
+    end_idx = target_idx
+    for idx in range(target_idx, len(lines)):
+        line = lines[idx]
+        if ";" in line:
+            end_idx = idx
+            break
+        if idx + 1 < len(lines):
+            next_line = lines[idx + 1].strip().upper()
+            if re.search(r"\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b", next_line) or next_line.startswith("SELECT"):
+                end_idx = idx
+                break
+        end_idx = idx
+        
+    return start_idx + 1, end_idx + 1
+
+
+def _expand_sql_symbol_range(
+    lines: list[str],
+    start: int,
+    end: int,
+    max_lines: int = 140,
+) -> tuple[int, int]:
+    sql_start, _ = _find_enclosing_sql_range(lines, start)
+    _, sql_end = _find_enclosing_sql_range(lines, end)
+    
+    if sql_end - sql_start + 1 <= max_lines:
+        return sql_start, max(sql_end, sql_start)
+        
+    mid = (start + end) // 2
+    target_start = max(sql_start, mid - max_lines // 2)
+    target_end = min(sql_end, target_start + max_lines - 1)
+    return target_start, target_end
+
+
+def _extract_all_search_terms(query: str) -> list[str]:
+    terms = _extract_symbols(query)
+    terms = [t.lower() for t in terms]
+    
+    domain_map = {
+        "登机牌": ["boarding", "pass", "ticket"],
+        "订单": ["order"],
+        "机票": ["ticket", "passenger"],
+        "航班": ["flight"],
+    }
+    for zh, eng_list in domain_map.items():
+        if zh in query:
+            terms.extend(eng_list)
+    return list(dict.fromkeys(terms))
 
 
 def _is_editable_target(
@@ -592,32 +1051,63 @@ def _is_editable_target(
     intended_change: str,
     context: SkillContext | None,
 ) -> bool:
-    # 1. 命中用户明确 symbol
-    user_symbols = _extract_symbols(intended_change)
+    user_symbols = _extract_all_search_terms(intended_change)
+    symbol_matched = False
     for sym in user_symbols:
-        if re.search(rf"\b{re.escape(sym)}\b", current_code):
-            return True
+        if re.search(rf"(?:\b|_){re.escape(sym)}(?:\b|_)", current_code, re.IGNORECASE):
+            symbol_matched = True
+            break
             
-    # 2. 命中 plan 指定 file/symbol
-    if context is not None and context.patch_plan is not None:
-        plan = context.patch_plan
-        for plan_file in plan.files_to_edit:
-            if display_file == plan_file or display_file.endswith("/" + plan_file) or plan_file.endswith("/" + display_file):
-                return True
-        for plan_sym in plan.target_symbols:
-            if re.search(rf"\b{re.escape(plan_sym)}\b", current_code):
-                return True
-        for edit in plan.edits:
-            if edit.path and (display_file == edit.path or display_file.endswith("/" + edit.path) or edit.path.endswith("/" + display_file)):
-                return True
-            if edit.symbol and re.search(rf"\b{re.escape(edit.symbol)}\b", current_code):
-                return True
-
-    # 3. 命中 SQL 结构
-    if bool(re.search(r"(?is)\bSELECT\b.{0,200}\bFROM\b|\b(?:FROM|JOIN)\s+[`\"]?[A-Za-z_][A-Za-z0-9_]*", current_code)):
-        return True
-
-    return False
+    handoff_matched = False
+    if context is not None:
+        if context.patch_plan is not None:
+            plan = context.patch_plan
+            for plan_file in plan.files_to_edit:
+                if display_file == plan_file or display_file.endswith("/" + plan_file) or plan_file.endswith("/" + display_file):
+                    handoff_matched = True
+                    break
+            if not handoff_matched:
+                for plan_sym in plan.target_symbols:
+                    if re.search(rf"(?:\b|_){re.escape(plan_sym)}(?:\b|_)", current_code, re.IGNORECASE):
+                        handoff_matched = True
+                        break
+            if not handoff_matched:
+                for edit in plan.edits:
+                    if edit.path and (display_file == edit.path or display_file.endswith("/" + edit.path) or edit.path.endswith("/" + display_file)):
+                        handoff_matched = True
+                        break
+                    if edit.symbol and re.search(rf"(?:\b|_){re.escape(edit.symbol)}(?:\b|_)", current_code, re.IGNORECASE):
+                        handoff_matched = True
+                        break
+                        
+        if context.context_pack is not None:
+            for f_info in context.context_pack.candidate_files:
+                f_path = str(f_info.get("file") or "")
+                if display_file == f_path or display_file.endswith("/" + f_path) or f_path.endswith("/" + display_file):
+                    handoff_matched = True
+                    break
+            if not handoff_matched:
+                for s_info in context.context_pack.candidate_symbols:
+                    s_name = str(s_info.get("name") or "")
+                    if re.search(rf"(?:\b|_){re.escape(s_name)}(?:\b|_)", current_code, re.IGNORECASE):
+                        handoff_matched = True
+                        break
+            if not handoff_matched:
+                for r_path in context.context_pack.relevant_files:
+                    if display_file == r_path or display_file.endswith("/" + r_path) or r_path.endswith("/" + display_file):
+                        handoff_matched = True
+                        break
+                        
+    has_sql = bool(re.search(r"(?is)\bSELECT\b.{0,200}\bFROM\b|\b(?:FROM|JOIN)\s+[`\"]?[A-Za-z_][A-Za-z0-9_]*", current_code))
+    is_sql_change = _is_sql_view_change(intended_change)
+    
+    if display_file.endswith(".sql"):
+        return has_sql and (symbol_matched or handoff_matched or is_sql_change)
+        
+    if is_sql_change:
+        return (symbol_matched or handoff_matched) and has_sql
+        
+    return symbol_matched or handoff_matched
 
 
 def _is_sql_view_change(text: str) -> bool:
@@ -680,3 +1170,18 @@ def _edit_context_target_count(edit_context: dict[str, object] | None) -> int:
         return 0
     targets = edit_context.get("editable_targets")
     return len(targets) if isinstance(targets, list) else 0
+
+
+def _extract_all_tables_from_python_code(code: str) -> list[str]:
+    string_pattern = re.compile(
+        r'(?P<quote>"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\')',
+        re.DOTALL
+    )
+    tables = set()
+    for match in string_pattern.finditer(code):
+        quote_content = match.group("quote")
+        inner = quote_content[3:-3] if quote_content.startswith(('"""', "'''")) else quote_content[1:-1]
+        if "SELECT" in inner.upper() and "FROM" in inner.upper():
+            for m in re.finditer(r"\b(?:FROM|JOIN)\s+[`\"]?([a-zA-Z0-9_.]+)[`\"]?", inner, re.IGNORECASE):
+                tables.add(m.group(1).split(".")[-1].lower())
+    return sorted(list(tables))

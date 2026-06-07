@@ -5,7 +5,6 @@ from src.orchestrator.orchestrator import (
     _apply_context_pack_to_subtask,
     _append_prior_edit_context,
     _previous_handoff_from_summaries,
-    _should_use_edit_skill_executor,
     _subtask_context_request,
 )
 from src.planner.kinds import SubTaskKind
@@ -131,16 +130,28 @@ def test_prior_edit_context_is_appended_to_edit_search_output() -> None:
     assert '"editable_targets"' in out
 
 
-def test_edit_uses_skill_executor_by_default() -> None:
-    node = SubTaskNode(id="st-2", kind=SubTaskKind.EDIT, description="edit")
-
-    assert _should_use_edit_skill_executor(
-        node,
-        prior_summaries={},
-        attempt_num=1,
+def test_prior_edit_context_is_merged_when_current_exists() -> None:
+    prior = {
+        "st-1": (
+            "Result: found\n\n"
+            "EDIT_CONTEXT_JSON\n"
+            '{"schema":"mitkii.edit_context.v1","code_edit_ready":true,'
+            '"builder":"EditPlanBuilder",'
+            '"target_view":"v_order_detail",'
+            '"available_views":["v_order_detail"]}'
+        )
+    }
+    
+    current_search_output = (
+        "current search\n\n"
+        "EDIT_CONTEXT_JSON\n"
+        '{"schema":"mitkii.edit_context.v1","code_edit_ready":true,'
+        '"builder":"EditPlanBuilder",'
+        '"editable_targets":[]}'
     )
-    assert _should_use_edit_skill_executor(
-        node,
-        prior_summaries={"st-1": "Result: found"},
-        attempt_num=2,
-    )
+    
+    out = _append_prior_edit_context(current_search_output, prior)
+    
+    assert "v_order_detail" in out
+    assert '"target_view": "v_order_detail"' in out
+    assert '"available_views": [\n    "v_order_detail"\n  ]' in out
