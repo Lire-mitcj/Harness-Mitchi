@@ -5,7 +5,7 @@ from typing import Any
 
 from src.planner.kinds import SubTaskKind
 from src.planner.task_tree import SubTaskNode, SubTaskStatus, TaskTree
-from src.planner.tool_policy import normalize_allowed_tools
+from src.planner.tool_policy import default_allowed_tools, normalize_allowed_tools
 
 _REQUIRED_NODE_FIELDS = (
     "id",
@@ -63,16 +63,28 @@ def normalize_planner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         node = dict(item)
         node["id"] = str(node.get("id") or f"st-{idx + 1}").strip() or f"st-{idx + 1}"
 
+        if "allowed_tools" not in node and "tools" in node:
+            node["allowed_tools"] = node["tools"]
+
         deps = node.get("depends_on")
         if not isinstance(deps, list):
-            node["depends_on"] = [] if idx == 0 else ["st-1"]
+            node["depends_on"] = [] if idx == 0 else [_previous_node_id(nodes_out, idx)]
         elif idx > 0 and not deps:
-            node["depends_on"] = ["st-1"]
+            node["depends_on"] = [_previous_node_id(nodes_out, idx)]
 
         if not isinstance(node.get("context_files"), list):
             node["context_files"] = []
         if not isinstance(node.get("allowed_tools"), list):
             node["allowed_tools"] = []
+        if not node["allowed_tools"]:
+            try:
+                node["allowed_tools"] = default_allowed_tools(SubTaskKind(str(node.get("kind") or "")))
+            except ValueError:
+                node["allowed_tools"] = []
+        if not isinstance(node.get("handoff_outputs"), list):
+            node["handoff_outputs"] = []
+        if not isinstance(node.get("requires_handoff"), list):
+            node["requires_handoff"] = []
 
         crit = node.get("acceptance_criteria")
         if not isinstance(crit, str) or not crit.strip():
@@ -82,7 +94,14 @@ def normalize_planner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if "needs_l1" not in node:
             node["needs_l1"] = False
 
+        for key in ("description", "acceptance_criteria"):
+            value = node.get(key)
+            if isinstance(value, str) and len(value) > 120:
+                node[key] = value[:117].rstrip() + "..."
+
         nodes_out.append(node)
+
+    _repair_sequential_dependencies(nodes_out)
 
     out["nodes"] = nodes_out
     root = out.get("root_task")
@@ -91,6 +110,49 @@ def normalize_planner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(first, dict):
             out["root_task"] = str(first.get("description") or "Task")[:200]
     return out
+
+
+def _previous_node_id(nodes: list[Any], idx: int) -> str:
+    if idx <= 0:
+        return "st-1"
+    previous = nodes[idx - 1]
+    if isinstance(previous, dict):
+        raw_id = str(previous.get("id") or "").strip()
+        if raw_id:
+            return raw_id
+    return f"st-{idx}"
+
+
+def _repair_sequential_dependencies(nodes: list[Any]) -> None:
+    latest_design_id = ""
+    latest_edit_id = ""
+    for idx, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or f"st-{idx + 1}")
+        kind = str(node.get("kind") or "")
+        deps = [
+            str(dep)
+            for dep in (node.get("depends_on") or [])
+            if isinstance(dep, str) and dep.strip()
+        ]
+        requires = {
+            str(item)
+            for item in (node.get("requires_handoff") or [])
+            if isinstance(item, str)
+        }
+        if kind == SubTaskKind.EDIT.value and latest_design_id:
+            if "PATCH_INTENT_JSON" in requires or idx > 0:
+                if latest_design_id not in deps:
+                    deps.append(latest_design_id)
+        if kind == SubTaskKind.VERIFY.value and latest_edit_id:
+            if latest_edit_id not in deps:
+                deps.append(latest_edit_id)
+        node["depends_on"] = deps
+        if kind == SubTaskKind.DESIGN.value:
+            latest_design_id = node_id
+        elif kind == SubTaskKind.EDIT.value:
+            latest_edit_id = node_id
 
 
 def validate_planner_payload(payload: dict[str, Any]) -> list[str]:
@@ -115,32 +177,37 @@ def validate_planner_payload(payload: dict[str, Any]) -> list[str]:
     for idx, item in enumerate(nodes, start=1):
         label = f"nodes[{idx - 1}]"
         if not isinstance(item, dict):
-            errors.append(f"{label} must be an object.")
+            errors.append(f"nodes[{idx - 1}] must be object, got {type(item).__name__}: {item!r}")
             continue
         for key in _REQUIRED_NODE_FIELDS:
-            if key not in item:
-                errors.append(f"{label} missing required field '{key}'.")
+            if key == "allowed_tools":
+                if "allowed_tools" not in item and "tools" not in item:
+                    errors.append(f"{label} missing required field 'tools'.")
+            else:
+                if key not in item:
+                    errors.append(f"{label} missing required field '{key}'.")
         node_id = item.get("id")
         if isinstance(node_id, str) and node_id.strip():
             ids.append(node_id.strip())
         kind = str(item.get("kind") or "")
         if kind and kind not in _VALID_KINDS:
-            errors.append(f"{label} kind '{kind}' invalid — use diagnose|edit|verify|shell.")
+            errors.append(f"{label} kind '{kind}' invalid — use diagnose|design|edit|verify|shell.")
         desc = item.get("description")
         if isinstance(desc, str) and len(desc) > 120:
             errors.append(f"{label} description exceeds 120 characters.")
         crit = item.get("acceptance_criteria")
         if isinstance(crit, str) and len(crit) > 120:
             errors.append(f"{label} acceptance_criteria exceeds 120 characters.")
-        tools = item.get("allowed_tools")
+        
+        tools = item.get("allowed_tools") or item.get("tools")
         if tools is not None and not isinstance(tools, list):
-            errors.append(f"{label} allowed_tools must be an array.")
+            errors.append(f"{label} tools must be an array.")
         elif isinstance(tools, list):
             for tool in tools:
                 if not isinstance(tool, str):
-                    errors.append(f"{label} allowed_tools must contain strings only.")
+                    errors.append(f"{label} tools must contain strings only.")
                     break
-        for list_field in ("context_files", "depends_on"):
+        for list_field in ("context_files", "depends_on", "handoff_outputs", "requires_handoff"):
             val = item.get(list_field)
             if val is not None and not isinstance(val, list):
                 errors.append(f"{label} {list_field} must be an array.")
@@ -176,7 +243,7 @@ def build_task_tree_from_payload(
         except ValueError:
             kind = SubTaskKind.EDIT
         needs_l1 = item.get("needs_l1")
-        raw_tools = item.get("allowed_tools")
+        raw_tools = item.get("allowed_tools") or item.get("tools")
         tools_list = (
             [str(t) for t in raw_tools if isinstance(t, str)]
             if isinstance(raw_tools, list)
@@ -194,6 +261,8 @@ def build_task_tree_from_payload(
                 depends_on=[str(d) for d in item.get("depends_on") or []],
                 status=SubTaskStatus(str(item.get("status", SubTaskStatus.PENDING))),
                 checkpoint_id=item.get("checkpoint_id"),
+                handoff_outputs=[str(h) for h in item.get("handoff_outputs") or []],
+                requires_handoff=[str(r) for r in item.get("requires_handoff") or []],
             )
         )
     return TaskTree(

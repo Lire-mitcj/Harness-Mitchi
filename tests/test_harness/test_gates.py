@@ -11,7 +11,8 @@ from src.harness.gates.plan_gate import (
 )
 from src.harness.gates.preflight_probe import assess_preflight
 from src.harness.gates.types import GateVerdict
-from src.planner.task_tree import SubTaskKind, SubTaskNode, TaskTree
+from src.harness.task_analysis import HarnessTaskAnalysis, analyze_task
+from src.planner.task_tree import SubTaskKind, SubTaskNode, SubTaskStatus, TaskTree
 
 
 def test_plan_gate_blocks_empty_tree(tmp_path: Path) -> None:
@@ -91,6 +92,71 @@ def test_plan_gate_allows_edit_first_subtask(tmp_path: Path) -> None:
     )
     result = validate_plan(tree, tmp_path)
     assert result.verdict in {GateVerdict.PASS, GateVerdict.WARN}
+
+
+def test_plan_gate_blocks_edit_first_for_function_refactor(tmp_path: Path) -> None:
+    f = tmp_path / "main.py"
+    f.write_text("x = 1\n")
+    tree = TaskTree(
+        root_task="重构订单详情处理，复用 normalize_order_record 做脱敏",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.EDIT,
+                description="重构订单详情处理",
+                context_files=["main.py"],
+                allowed_tools=["context_search", "edit_file"],
+                acceptance_criteria="订单详情查询和脱敏逻辑统一",
+            ),
+        ],
+    )
+    result = validate_plan(tree, tmp_path)
+    assert result.verdict == GateVerdict.BLOCK
+    assert "must start with a diagnose" in result.messages[0]
+
+
+def test_plan_gate_requires_design_for_high_complexity_function_refactor(tmp_path: Path) -> None:
+    tree = TaskTree(
+        root_task="重构订单详情处理，统一脱敏",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.DIAGNOSE,
+                description="定位订单详情调用点",
+                allowed_tools=["context_search"],
+                acceptance_criteria="Output file:line, symbol, and snippet/decision",
+            ),
+            SubTaskNode(
+                id="st-2",
+                kind=SubTaskKind.EDIT,
+                description="重构订单详情处理",
+                allowed_tools=["context_search", "edit_file"],
+                acceptance_criteria="订单详情查询和脱敏逻辑统一",
+                depends_on=["st-1"],
+            ),
+        ],
+    )
+    result = validate_plan(tree, tmp_path, task_analysis=analyze_task(tree.root_task))
+    assert result.verdict == GateVerdict.BLOCK
+    assert "requires design step" in "; ".join(result.messages)
+
+
+def test_plan_gate_blocks_edit_first_when_harness_not_ready(tmp_path: Path) -> None:
+    tree = TaskTree(
+        root_task="重构订单详情处理，统一脱敏",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.EDIT,
+                description="重构订单详情处理",
+                allowed_tools=["context_search", "edit_file"],
+                acceptance_criteria="订单详情查询和脱敏逻辑统一",
+            )
+        ],
+    )
+    result = validate_plan(tree, tmp_path, task_analysis=analyze_task(tree.root_task))
+    assert result.verdict == GateVerdict.BLOCK
+    assert "edit_ready=false" in "; ".join(result.messages)
 
 
 def test_preflight_green_small_task(tmp_path: Path) -> None:
@@ -395,6 +461,219 @@ def test_plan_gate_blocks_edit_replan_that_only_diagnoses(tmp_path: Path) -> Non
     )
 
     result = validate_plan(tree, tmp_path, replan_context=ctx)
-
     assert result.verdict == GateVerdict.BLOCK
     assert any("removed the edit objective" in msg for msg in result.messages)
+
+
+def test_plan_gate_allows_replan_with_completed_steps(tmp_path: Path) -> None:
+    from src.harness.task_analysis import HarnessTaskAnalysis
+    from src.planner.task_tree import SubTaskStatus
+    
+    analysis = HarnessTaskAnalysis(
+        intent="sql_view_rewrite",
+        confidence=1.0,
+        edit_ready=False,
+        edit_strategy="sql_view_rewrite",
+        complexity="high",
+        resolved_dependencies=[{"kind": "database_view", "name": "v"}]
+    )
+    
+    tree = TaskTree(
+        root_task="把当前登机牌查询接口改成用视图查询",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.DIAGNOSE,
+                status=SubTaskStatus.SUCCESS,
+                description="定位登机牌查询接口和当前 SQL",
+                allowed_tools=["context_search"],
+                acceptance_criteria="输出文件:行号，符号，和 SQL 查询片段/决策",
+            ),
+            SubTaskNode(
+                id="st-2",
+                kind=SubTaskKind.DESIGN,
+                status=SubTaskStatus.SUCCESS,
+                description="设计视图替换补丁意图",
+                allowed_tools=["context_search"],
+                acceptance_criteria="输出 PATCH_INTENT_JSON",
+                depends_on=["st-1"],
+            ),
+            SubTaskNode(
+                id="st-3a",
+                kind=SubTaskKind.DIAGNOSE,
+                status=SubTaskStatus.PENDING,
+                description="根据最新的失败证据，重新诊断并寻找代码变更点",
+                allowed_tools=["context_search"],
+                acceptance_criteria="输出文件:行号，符号，和 SQL 查询片段/决策",
+                depends_on=["st-2"],
+            ),
+            SubTaskNode(
+                id="st-3b",
+                kind=SubTaskKind.DESIGN,
+                status=SubTaskStatus.PENDING,
+                description="在新的诊断基础上重构视图补丁意图设计方案",
+                allowed_tools=["context_search"],
+                acceptance_criteria="输出 PATCH_INTENT_JSON",
+                depends_on=["st-3a"],
+            ),
+            SubTaskNode(
+                id="st-3c",
+                kind=SubTaskKind.EDIT,
+                status=SubTaskStatus.PENDING,
+                description="将登机牌查询改为使用视图",
+                allowed_tools=["context_search", "edit_file"],
+                acceptance_criteria="查询已改为使用目标视图",
+                depends_on=["st-3b"],
+            ),
+            SubTaskNode(
+                id="st-4",
+                kind=SubTaskKind.VERIFY,
+                status=SubTaskStatus.PENDING,
+                description="验证登机牌查询接口",
+                allowed_tools=["shell_exec"],
+                acceptance_criteria="Relevant verification command exits 0",
+                depends_on=["st-3c"],
+            ),
+        ],
+    )
+    
+    result = validate_plan(tree, tmp_path, max_nodes=10, task_analysis=analysis)
+    assert result.verdict in {GateVerdict.PASS, GateVerdict.WARN}
+
+
+def test_plan_gate_skips_successful_nodes(tmp_path: Path) -> None:
+    # A tree that would normally fail validation (e.g. edit step has no context files, or duplicates description)
+    # but the failing node is marked SUCCESS, so it should not block validation.
+    tree = TaskTree(
+        root_task="add health",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.EDIT,
+                status=SubTaskStatus.SUCCESS, # SUCCESS!
+                description="", # empty description!
+                context_files=[], # empty context files!
+                allowed_tools=[], # invalid tools!
+                acceptance_criteria="", # empty acceptance!
+            ),
+            SubTaskNode(
+                id="st-2",
+                kind=SubTaskKind.VERIFY,
+                status=SubTaskStatus.PENDING,
+                description="Run validation",
+                allowed_tools=["shell_exec"],
+                acceptance_criteria="verification command exits 0",
+            ),
+        ],
+    )
+    result = validate_plan(tree, tmp_path)
+    # st-1 is skipped, st-2 is valid, so this should pass/warn (not block)
+    assert result.verdict in {GateVerdict.PASS, GateVerdict.WARN}
+
+
+def test_plan_gate_blocks_edit_requiring_patch_intent_without_design_dependency(tmp_path: Path) -> None:
+    tree = TaskTree(
+        root_task="change target",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.DIAGNOSE,
+                description="定位目标",
+                acceptance_criteria="输出 file:line、symbol、片段/决策",
+                allowed_tools=["context_search"],
+            ),
+            SubTaskNode(
+                id="st-2",
+                kind=SubTaskKind.DESIGN,
+                description="设计补丁意图",
+                acceptance_criteria="输出 PATCH_INTENT_JSON",
+                allowed_tools=["context_search"],
+                depends_on=["st-1"],
+                handoff_outputs=["PATCH_INTENT_JSON"],
+            ),
+            SubTaskNode(
+                id="st-3",
+                kind=SubTaskKind.EDIT,
+                description="修改目标",
+                acceptance_criteria="patched",
+                allowed_tools=["context_search", "edit_file"],
+                context_files=["main.py"],
+                depends_on=["st-1"],
+                requires_handoff=["PATCH_INTENT_JSON"],
+            ),
+        ],
+    )
+    (tmp_path / "main.py").write_text("def f(): pass\n", encoding="utf-8")
+
+    result = validate_plan(tree, tmp_path, max_nodes=5)
+    assert result.verdict == GateVerdict.BLOCK
+    assert "requires PATCH_INTENT_JSON" in "; ".join(result.messages)
+
+
+def test_plan_gate_allows_split_edits_for_multiple_harness_targets(tmp_path: Path) -> None:
+    for name in ("a.py", "b.py"):
+        (tmp_path / name).write_text("def f(): pass\n", encoding="utf-8")
+    analysis = HarnessTaskAnalysis(
+        intent="function_refactor",
+        confidence=0.91,
+        complexity="high",
+        edit_ready=False,
+        edit_strategy="function_refactor",
+        readiness_checks={},
+        editable_targets=(
+            {"file": "a.py", "symbol": "a"},
+            {"file": "b.py", "symbol": "b"},
+        ),
+    )
+    tree = TaskTree(
+        root_task="重构多个调用点",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.DIAGNOSE,
+                description="定位调用点",
+                acceptance_criteria="输出 file:line、symbol、片段/决策",
+                allowed_tools=["context_search"],
+            ),
+            SubTaskNode(
+                id="st-2",
+                kind=SubTaskKind.DESIGN,
+                description="设计补丁意图",
+                acceptance_criteria="输出 PATCH_INTENT_JSON",
+                allowed_tools=["context_search"],
+                depends_on=["st-1"],
+                handoff_outputs=["PATCH_INTENT_JSON"],
+            ),
+            SubTaskNode(
+                id="st-3a",
+                kind=SubTaskKind.EDIT,
+                description="修改 a",
+                acceptance_criteria="patched a",
+                allowed_tools=["context_search", "edit_file"],
+                context_files=["a.py"],
+                depends_on=["st-2"],
+                requires_handoff=["PATCH_INTENT_JSON"],
+            ),
+            SubTaskNode(
+                id="st-3b",
+                kind=SubTaskKind.EDIT,
+                description="修改 b",
+                acceptance_criteria="patched b",
+                allowed_tools=["context_search", "edit_file"],
+                context_files=["b.py"],
+                depends_on=["st-3a"],
+                requires_handoff=["PATCH_INTENT_JSON"],
+            ),
+            SubTaskNode(
+                id="st-4",
+                kind=SubTaskKind.VERIFY,
+                description="验证重构",
+                acceptance_criteria="tests pass",
+                allowed_tools=["shell_exec"],
+                depends_on=["st-3b"],
+            ),
+        ],
+    )
+
+    result = validate_plan(tree, tmp_path, max_nodes=4, task_analysis=analysis)
+    assert result.verdict in {GateVerdict.PASS, GateVerdict.WARN}

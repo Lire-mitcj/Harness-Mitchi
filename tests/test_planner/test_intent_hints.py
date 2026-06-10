@@ -36,7 +36,7 @@ def test_fallback_change_request_uses_diagnose_edit_verify() -> None:
     assert "登机牌查询接口" in tree.nodes[0].description
     assert "HANDOFF_CONTRACT_JSON" in tree.nodes[0].acceptance_criteria
     assert tree.nodes[1].description != tree.root_task
-    assert "使用目标视图查询" in tree.nodes[1].description
+    assert "符合请求的实现" in tree.nodes[1].description
 
 
 def test_task_template_selection_scores_change_request() -> None:

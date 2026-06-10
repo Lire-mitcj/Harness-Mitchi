@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from src.executor.edit_guard import (
@@ -42,8 +43,12 @@ def classify_failure_pattern(errors: list[str]) -> str:
         return "quality_gate"
     if "exit gate" in text or "empty final answer" in text:
         return "exit_gate"
+    if "diagnose_strategy_mismatch" in text or "column_mapping" in text:
+        return "strategy_mismatch"
     if "not in context_files" in text:
         return "whitelist"
+    if "validation failed" in text or "snippet ranges" in text or "target symbols" in text:
+        return "validation_failed"
     return "unknown"
 
 
@@ -126,6 +131,29 @@ def build_executor_retry_strategy(
     )
 
 
+def parse_validation_error_details(errors: list[str]) -> dict[str, list[str]]:
+    text = " ".join(errors)
+    wrong_modified_lines = re.findall(r"modified line (\d+)", text)
+    expected_target_symbols = []
+    wrong_modified_symbols = []
+    
+    ts_match = re.search(r"target symbols (\[.*?\])", text)
+    if not ts_match:
+        ts_match = re.search(r"target symbols (\{.*?\})", text)
+    if ts_match:
+        expected_target_symbols = [s.strip(" '\"") for s in ts_match.group(1).replace("[", "").replace("]", "").split(",") if s.strip()]
+        
+    ms_match = re.search(r"All modified symbols: (\[.*?\])", text)
+    if ms_match:
+        wrong_modified_symbols = [s.strip(" '\"") for s in ms_match.group(1).replace("[", "").replace("]", "").split(",") if s.strip()]
+        
+    return {
+        "wrong_modified_lines": sorted(list(set(wrong_modified_lines))),
+        "expected_target_symbols": sorted(list(set(expected_target_symbols))),
+        "wrong_modified_symbols": sorted(list(set(wrong_modified_symbols))),
+    }
+
+
 def replan_revision_directive(
     *,
     failed_subtask: SubTaskNode,
@@ -155,6 +183,12 @@ def replan_revision_directive(
         lines.append(
             "Break work into smaller subtasks (diagnose → narrow edit → verify)."
         )
+    elif pattern == "strategy_mismatch":
+        lines.append(
+            "Do NOT keep searching for view columns. Add a diagnose subtask that "
+            "reclassifies the edit strategy: function_refactor vs sql_view_rewrite. "
+            "For refactor/reuse/normalize/masking tasks, follow with a function_refactor edit."
+        )
     elif pattern == "edit_ambiguous":
         lines.append(
             "Add a diagnose subtask that cites exact file:line and SQL snippet, "
@@ -165,6 +199,39 @@ def replan_revision_directive(
             "Diagnose must paste the exact multi-line code/SQL snippet into acceptance_criteria "
             "or context_files preload; edit subtask should not guess function signatures alone."
         )
+    elif pattern == "validation_failed":
+        details = parse_validation_error_details(error_trace)
+        lines.extend([
+            "Previous edit failed because it modified outside allowed ranges and touched wrong symbols.",
+            "",
+            "Expected target symbols:"
+        ])
+        for sym in details["expected_target_symbols"]:
+            lines.append(f"- {sym}")
+        lines.append("")
+        lines.append("Wrongly modified symbols:")
+        for sym in details["wrong_modified_symbols"]:
+            lines.append(f"- {sym}")
+        if details["wrong_modified_lines"]:
+            lines.append("")
+            lines.append("Wrongly modified lines:")
+            for l in details["wrong_modified_lines"]:
+                lines.append(f"- {l}")
+        lines.extend([
+            "",
+            "Rules for replan:",
+            "1. Do NOT add wrongly modified symbols to edit_targets.",
+            "2. Diagnose must locate the original expected target symbols and their valid editable ranges.",
+            "3. Design must produce PATCH_INTENT_JSON only for expected target symbols.",
+            "4. Edit must modify only those expected target symbols and stay within their ranges."
+        ])
+
+    lines.extend([
+        "\nCRITICAL PLANGATE REPLAN RULES:",
+        "- Avoid Duplicate/Structure Repeats: Do NOT repeat the exact same description, context_files, and acceptance_criteria as the failed subtask. You MUST modify the wording, widen/narrow context_files, or change the acceptance criteria (e.g., specifying distinct output details or a dynamic re-plan suffix) to make it unique.",
+        "- Preserve Edit Objectives: The final subtask replacing the failed edit step MUST be of kind=edit. You may schedule a diagnose step before it, but you cannot skip the edit step.",
+    ])
+
     if strategy and strategy.replan_hint:
         lines.append(strategy.replan_hint)
     return "\n".join(lines)

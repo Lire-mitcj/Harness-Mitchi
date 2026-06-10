@@ -266,7 +266,14 @@ class ValidatorSkill:
         edit_context = _extract_marker_json(evidence, "EDIT_CONTEXT_JSON")
         target_view = ""
         target_symbols = []
+        strict_symbols_check = False
         is_view_change = False
+        task_analysis = kwargs.get("task_analysis")
+        analysis_strategy = ""
+        if isinstance(task_analysis, dict):
+            analysis_strategy = str(task_analysis.get("edit_strategy") or task_analysis.get("intent") or "")
+            if analysis_strategy == "sql_view_rewrite":
+                is_view_change = True
 
         if isinstance(edit_context, dict):
             # 1. 提取 target_view / replacement_source
@@ -288,18 +295,29 @@ class ValidatorSkill:
                 tsym = task_intent.get("target_symbol")
                 if tsym:
                     target_symbols.append(str(tsym))
+                    strict_symbols_check = True
             
             edit_targets = edit_context.get("edit_targets")
             if isinstance(edit_targets, list):
                 for t in edit_targets:
                     if isinstance(t, dict) and t.get("symbol"):
                         target_symbols.append(str(t.get("symbol")))
+                        strict_symbols_check = True
             
             editable_targets = edit_context.get("editable_targets") or edit_context.get("snippets")
             if isinstance(editable_targets, list):
                 for t in editable_targets:
                     if isinstance(t, dict) and t.get("symbol"):
                         target_symbols.append(str(t.get("symbol")))
+                        strict_symbols_check = True
+            patch_intent = edit_context.get("patch_intent")
+            if isinstance(patch_intent, dict):
+                patch_targets = patch_intent.get("edit_targets")
+                if isinstance(patch_targets, list):
+                    for t in patch_targets:
+                        if isinstance(t, dict) and t.get("symbol"):
+                            target_symbols.append(str(t.get("symbol")))
+                            strict_symbols_check = True
 
         # Fallback to contract extraction
         handoff_contract = kwargs.get("handoff_contract")
@@ -315,16 +333,7 @@ class ValidatorSkill:
                     symbol_or_api = str(item.get("symbol_or_api") or "")
                     if symbol_or_api and symbol_or_api != "目标代码" and symbol_or_api not in target_symbols:
                         target_symbols.append(symbol_or_api)
-
-        # Fallback to keyword-based detection for view change
-        user_msg = context.user_request.lower()
-        if not is_view_change:
-            is_view_change = (
-                "视图" in context.user_request
-                or "view" in user_msg
-                or "query" in user_msg
-                or "sql" in user_msg
-            )
+                        strict_symbols_check = True
 
         if not target_symbols:
             target_symbols = _extract_symbols_from_text(context.user_request)
@@ -384,6 +393,9 @@ class ValidatorSkill:
                 tofile="new",
                 lineterm=""
             ))
+
+            if analysis_strategy == "function_refactor":
+                errors.extend(_validate_function_refactor_contract(old_content, new_content))
 
             if not diff_lines:
                 continue
@@ -536,8 +548,8 @@ class ValidatorSkill:
             }
             validation_details_list.append(details)
 
-        # 4. Check that target symbol was modified somewhere in the changes
-        if is_view_change and target_symbols:
+        # Check that target symbol was modified somewhere in the changes
+        if target_symbols and strict_symbols_check:
             all_modified_symbols = []
             for details in validation_details_list:
                 all_modified_symbols.extend(details["changed_symbols"])
@@ -547,12 +559,38 @@ class ValidatorSkill:
                     f"were modified in the changes. All modified symbols: {all_modified_symbols}"
                 )
 
+        # Check that target view dependency was used/referenced in the diff
+        if target_view:
+            view_referenced = False
+            for details in validation_details_list:
+                added_idents = [i.lower() for i in details.get("added_identifiers", [])]
+                if target_view.lower() in added_idents:
+                    view_referenced = True
+                    break
+            if not view_referenced:
+                errors.append(
+                    f"Intent validation failed: target dependency '{target_view}' is not referenced/used in the new code diff."
+                )
+
         if errors:
+            requires_fallback = _is_replannable_validation_error(errors)
             return SkillResult(
                 success=False,
                 summary="Validation failed: " + "; ".join(errors),
                 validation_result="failed",
                 missing_info=tuple(errors),
+                requires_fallback=requires_fallback,
+                metadata={
+                    "failure_code": (
+                        "validator_context_mismatch"
+                        if requires_fallback
+                        else "validator_acceptance_failed"
+                    ),
+                    "structured_errors": json.dumps(
+                        _structured_validation_errors(errors),
+                        ensure_ascii=False,
+                    ),
+                },
             )
 
         rich_summary = f"Validated {len(checked)} changed file(s)."
@@ -572,6 +610,37 @@ class ValidatorSkill:
                 "validation_details": json.dumps(validation_details_list, ensure_ascii=False)
             }
         )
+
+
+def _is_replannable_validation_error(errors: list[str]) -> bool:
+    patterns = (
+        "outside any allowed snippet ranges",
+        "none of the target symbols",
+        "patch_validator cannot locate current_code",
+        "symbol mismatch",
+        "range mismatch",
+        "target_context_missing",
+        "simplified_context_requires_deterministic_patch",
+    )
+    return any(any(pattern in error for pattern in patterns) for error in errors)
+
+
+def _structured_validation_errors(errors: list[str]) -> list[dict[str, str]]:
+    structured: list[dict[str, str]] = []
+    for error in errors:
+        code = "validator_acceptance_failed"
+        if "outside any allowed snippet ranges" in error:
+            code = "snippet_range_mismatch"
+        elif "none of the target symbols" in error:
+            code = "target_symbol_mismatch"
+        elif "patch_validator cannot locate current_code" in error:
+            code = "current_code_mismatch"
+        elif "target_context_missing" in error:
+            code = "target_context_missing"
+        elif "simplified_context_requires_deterministic_patch" in error:
+            code = "simplified_context_requires_deterministic_patch"
+        structured.append({"code": code, "message": error})
+    return structured
 
 
 def _resolve_under_root(project_root: Path, rel: str) -> Path | None:
@@ -838,6 +907,25 @@ def _validate_sql_replacement_contract(
                     "SQL replacement contract failed: old aliases still appear in "
                     f"SELECT/WHERE: {stale_aliases}"
                 )
+    return errors
+
+
+def _validate_function_refactor_contract(old_code: str, new_code: str) -> list[str]:
+    errors: list[str] = []
+    old_manual_refs = len(re.findall(r"\bpassenger_id_no\b", old_code))
+    new_manual_refs = len(re.findall(r"\bpassenger_id_no\b", new_code))
+    uses_unified_helper = bool(
+        re.search(r"\b(?:_fetch_order_detail|normalize_order_record)\b", new_code)
+    )
+    if old_manual_refs and not uses_unified_helper:
+        errors.append(
+            "Function refactor validation failed: expected unified helper "
+            "(_fetch_order_detail or normalize_order_record) to be used."
+        )
+    if old_manual_refs > 1 and new_manual_refs >= old_manual_refs and uses_unified_helper:
+        errors.append(
+            "Function refactor validation failed: manual passenger_id_no logic was not reduced."
+        )
     return errors
 
 

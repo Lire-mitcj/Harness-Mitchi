@@ -17,7 +17,7 @@ from src.planner.planner_parse import (
     normalize_planner_payload,
     validate_planner_payload,
 )
-from src.planner.task_templates import select_task_template, task_tree_from_template
+from src.planner.task_templates import select_task_template, task_tree_from_template, calculate_edit_complexity_score
 from src.planner.task_tree import SubTaskKind, SubTaskNode, SubTaskStatus, TaskTree
 from src.planner.tool_policy import default_allowed_tools
 
@@ -539,23 +539,144 @@ def fallback_replan_for_failed_edit(
     current_tree: TaskTree,
     *,
     failed_subtask_id: str,
+    task_analysis: Any | None = None,
+    error_trace: list[str] | None = None,
 ) -> TaskTree | None:
     """Deterministic replacement when Planner drops the edit during re-plan."""
     failed = current_tree.get(failed_subtask_id)
     if failed is None or failed.kind != SubTaskKind.EDIT:
         return None
 
+    from src.executor.retry_strategy import parse_validation_error_details
+
+    details = parse_validation_error_details(error_trace or [])
+    expected_syms = details["expected_target_symbols"]
+    wrong_syms = details["wrong_modified_symbols"]
+    wrong_lines = details["wrong_modified_lines"]
+
+    suffix = f" (re-plan {failed_subtask_id})"
+    custom_hint_diag = ""
+    custom_hint_crit = ""
+    custom_hint_design = ""
+    custom_hint_edit_crit = ""
+
+    if expected_syms or wrong_syms:
+        expected_str = ", ".join(expected_syms) if expected_syms else "原目标符号"
+        wrong_str = ", ".join(wrong_syms) if wrong_syms else "误修改符号"
+        
+        custom_hint_diag = f"，定位原目标符号 {expected_str} 的正确位置并避开错误修改的符号 {wrong_str}"
+        custom_hint_crit = f"，需输出正确目标符号 {expected_str} 的行范围且不包含错误修改的符号 {wrong_str}"
+        custom_hint_design = f"，仅针对原目标符号 {expected_str} 设计补丁，严禁包含错误符号 {wrong_str}"
+        custom_hint_edit_crit = f"，必须且仅修改原目标符号 {expected_str} 且限制在其正确允许范围内，不得修改错误符号 {wrong_str}"
+
     diag_id = f"{failed.id}a"
-    edit_id = f"{failed.id}b"
+    design_id = f"{failed.id}b"
+    edit_id = f"{failed.id}c"
     desc = failed.description.strip() or current_tree.root_task
-    revised = TaskTree(
-        root_task=current_tree.root_task,
-        nodes=[
+    strategy = _analysis_strategy(task_analysis)
+    complexity = "medium"
+    if hasattr(task_analysis, "complexity"):
+        complexity = str(getattr(task_analysis, "complexity") or "medium")
+    elif isinstance(task_analysis, dict):
+        complexity = str(task_analysis.get("complexity") or "medium")
+
+    if complexity == "high" or strategy in ("sql_view_rewrite", "function_refactor"):
+        if strategy == "sql_view_rewrite":
+            diag_desc = f"定位{desc}的目标代码、当前 SQL 和 Harness 解析的视图依赖{custom_hint_diag}{suffix}"[:120]
+            diag_crit = f"输出 HANDOFF_CONTRACT_JSON：file:line、symbol、SQL、resolved dependency、片段/决策{custom_hint_crit}"
+            design_desc = f"设计{desc}的视图替换补丁意图{custom_hint_design}{suffix}"[:120]
+            edit_crit = f"仅修改设计指定目标，使用 Harness 批准的视图依赖且 old/new 不同{custom_hint_edit_crit or suffix}"
+        elif strategy == "function_refactor":
+            diag_desc = f"定位{desc}的调用点、旧逻辑和可复用依赖{custom_hint_diag}{suffix}"[:120]
+            diag_crit = f"输出 HANDOFF_CONTRACT_JSON：file:line、symbol、调用点、可复用依赖、片段/决策{custom_hint_crit}"
+            design_desc = f"设计{desc}的函数重构补丁意图{custom_hint_design}{suffix}"[:120]
+            edit_crit = f"仅修改设计指定目标，复用 Harness 批准的 helper/function 并移除旧重复逻辑{custom_hint_edit_crit or suffix}"
+        else:
+            diag_desc = f"定位{desc}的目标代码和当前实现{custom_hint_diag}{suffix}"[:120]
+            diag_crit = f"输出 HANDOFF_CONTRACT_JSON：file:line、symbol、当前片段、片段/决策{custom_hint_crit}"
+            design_desc = f"设计{desc}的修改补丁意图{custom_hint_design}{suffix}"[:120]
+            edit_crit = f"仅修改设计指定目标，按 Harness/Design 批准的策略完成修改{custom_hint_edit_crit or suffix}"
+
+        nodes = [
             SubTaskNode(
                 id=diag_id,
                 kind=SubTaskKind.DIAGNOSE,
-                description=f"定位{desc}的目标代码、当前 SQL 和可用视图"[:120],
-                acceptance_criteria="输出 HANDOFF_CONTRACT_JSON：file:line、symbol、SQL、视图、片段/决策",
+                description=diag_desc,
+                acceptance_criteria=diag_crit,
+                allowed_tools=["context_search"],
+                context_files=list(failed.context_files),
+                needs_l1=False,
+            ),
+            SubTaskNode(
+                id=design_id,
+                kind=SubTaskKind.DESIGN,
+                description=design_desc,
+                acceptance_criteria=(
+                    f"输出完整 PATCH_INTENT_JSON：edit_ready=true、edit_strategy、"
+                    f"edit_targets、dependencies、acceptance_criteria、target_view{suffix}"
+                ),
+                allowed_tools=["context_search"],
+                context_files=list(failed.context_files),
+                depends_on=[diag_id],
+                needs_l1=False,
+                handoff_outputs=["PATCH_INTENT_JSON"],
+            ),
+        ]
+
+        editable_targets = []
+        if task_analysis is not None:
+            if hasattr(task_analysis, "editable_targets"):
+                editable_targets = list(getattr(task_analysis, "editable_targets") or [])
+            elif isinstance(task_analysis, dict):
+                editable_targets = list(task_analysis.get("editable_targets") or [])
+
+        score = calculate_edit_complexity_score(task_analysis)
+
+        if len(editable_targets) > 1 and score >= 2.0:
+            for idx, t_item in enumerate(editable_targets):
+                symbol_name = t_item.get("symbol") or f"target_{idx+1}"
+                file_name = t_item.get("file") or ""
+                sub_id = f"{failed.id}c_{idx+1}"
+                dep = [nodes[-1].id]
+                nodes.append(
+                    SubTaskNode(
+                        id=sub_id,
+                        kind=SubTaskKind.EDIT,
+                        description=f"分块修改第{idx+1}个目标 {symbol_name} ({file_name}){suffix}"[:120],
+                        acceptance_criteria=edit_crit,
+                        allowed_tools=["context_search", "edit_file"],
+                        context_files=[file_name] if file_name else list(failed.context_files),
+                        depends_on=dep,
+                        needs_l1=failed.needs_l1 if isinstance(failed.needs_l1, bool) else True,
+                        requires_handoff=["PATCH_INTENT_JSON"],
+                    )
+                )
+        else:
+            nodes.append(
+                SubTaskNode(
+                    id=edit_id,
+                    kind=SubTaskKind.EDIT,
+                    description=f"基于 PATCH_INTENT_JSON 分块修改单个 edit_target：{desc}{suffix}"[:120],
+                    acceptance_criteria=edit_crit,
+                    allowed_tools=["context_search", "edit_file"],
+                    context_files=list(failed.context_files),
+                    depends_on=[design_id],
+                    needs_l1=failed.needs_l1 if isinstance(failed.needs_l1, bool) else True,
+                    requires_handoff=["PATCH_INTENT_JSON"],
+                )
+            )
+    else:
+        edit_id = f"{failed.id}b"
+        diag_desc = f"定位{desc}的目标代码和当前实现{custom_hint_diag}{suffix}"[:120]
+        diag_crit = f"输出 HANDOFF_CONTRACT_JSON：file:line、symbol、当前片段、片段/决策{custom_hint_crit}"
+        edit_crit = f"仅修改 handoff 指定代码，按 Harness 批准的策略完成修改{custom_hint_edit_crit or suffix}"
+
+        nodes = [
+            SubTaskNode(
+                id=diag_id,
+                kind=SubTaskKind.DIAGNOSE,
+                description=diag_desc,
+                acceptance_criteria=diag_crit,
                 allowed_tools=["context_search"],
                 context_files=list(failed.context_files),
                 needs_l1=False,
@@ -563,14 +684,17 @@ def fallback_replan_for_failed_edit(
             SubTaskNode(
                 id=edit_id,
                 kind=SubTaskKind.EDIT,
-                description=f"基于 handoff 完成：{desc}"[:120],
-                acceptance_criteria="仅修改 handoff 指定代码，查询使用目标视图且 old/new 不同",
+                description=f"基于 handoff 完成：{desc}{suffix}"[:120],
+                acceptance_criteria=edit_crit,
                 allowed_tools=["context_search", "edit_file"],
                 context_files=list(failed.context_files),
                 depends_on=[diag_id],
                 needs_l1=failed.needs_l1 if isinstance(failed.needs_l1, bool) else True,
             ),
-        ],
+        ]
+    revised = TaskTree(
+        root_task=current_tree.root_task,
+        nodes=nodes,
     )
     return _merge_replanned_tree(
         current_tree,
@@ -605,9 +729,21 @@ def parse_planner_output(raw: str, *, fallback_task: str) -> PlannerParseResult:
     return result
 
 
-def fallback_task_tree(fallback_task: str) -> TaskTree:
+def fallback_task_tree(fallback_task: str, *, task_analysis: Any | None = None) -> TaskTree:
     """Last-resort plan when PlanGate exhausts rewrites."""
-    return task_tree_from_template(fallback_task, select_task_template(fallback_task))
+    return task_tree_from_template(
+        fallback_task,
+        select_task_template(fallback_task),
+        task_analysis=task_analysis,
+    )
+
+
+def _analysis_strategy(task_analysis: Any | None) -> str:
+    if hasattr(task_analysis, "edit_strategy"):
+        return str(getattr(task_analysis, "edit_strategy") or "")
+    if isinstance(task_analysis, dict):
+        return str(task_analysis.get("edit_strategy") or task_analysis.get("intent") or "")
+    return ""
 
 
 def _parse_task_tree(raw: str, *, fallback_task: str) -> TaskTree:

@@ -31,6 +31,8 @@ class SubTaskNode:
     depends_on: list[str] = field(default_factory=list)
     checkpoint_id: str | None = None
     error_trace: list[str] = field(default_factory=list)
+    handoff_outputs: list[str] = field(default_factory=list)
+    requires_handoff: list[str] = field(default_factory=list)
 
     def effective_needs_l1(self) -> bool:
         if self.needs_l1 is not None:
@@ -53,6 +55,8 @@ class SubTaskNode:
             "depends_on": list(self.depends_on),
             "checkpoint_id": self.checkpoint_id,
             "error_trace": list(self.error_trace),
+            "handoff_outputs": list(self.handoff_outputs),
+            "requires_handoff": list(self.requires_handoff),
         }
 
     @classmethod
@@ -63,7 +67,7 @@ class SubTaskNode:
         except ValueError:
             kind = SubTaskKind.EDIT
         needs_l1 = data.get("needs_l1")
-        raw_tools = data.get("allowed_tools")
+        raw_tools = data.get("allowed_tools") or data.get("tools")
         allowed_tools = (
             [str(t) for t in raw_tools if isinstance(t, str)]
             if isinstance(raw_tools, list)
@@ -83,6 +87,8 @@ class SubTaskNode:
             depends_on=[str(d) for d in data.get("depends_on") or []],
             checkpoint_id=data.get("checkpoint_id"),
             error_trace=[str(e) for e in data.get("error_trace") or []],
+            handoff_outputs=[str(h) for h in data.get("handoff_outputs") or []],
+            requires_handoff=[str(r) for r in data.get("requires_handoff") or []],
         )
 
 

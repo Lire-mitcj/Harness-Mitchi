@@ -30,6 +30,9 @@ KIND_DEFAULT_TOOLS: dict[SubTaskKind, frozenset[str]] = {
         "context_search",
         "git_status",
     }),
+    SubTaskKind.DESIGN: frozenset({
+        "context_search",
+    }),
     SubTaskKind.EDIT: frozenset({
         "context_search",
         "write_file",
@@ -48,6 +51,7 @@ KIND_DEFAULT_TOOLS: dict[SubTaskKind, frozenset[str]] = {
 
 KIND_FORBIDDEN_TOOLS: dict[SubTaskKind, frozenset[str]] = {
     SubTaskKind.DIAGNOSE: WRITE_TOOLS | frozenset({"shell_exec"}),
+    SubTaskKind.DESIGN: WRITE_TOOLS | frozenset({"shell_exec", "git_status"}),
     SubTaskKind.EDIT: frozenset({"shell_exec"}),
     SubTaskKind.VERIFY: WRITE_TOOLS,
     SubTaskKind.SHELL: WRITE_TOOLS,

@@ -117,7 +117,21 @@ class CodeEditSkill:
             )
         contract = kwargs.get("handoff_contract")
         edit_context = _extract_marker_json(evidence, "EDIT_CONTEXT_JSON")
-        if isinstance(edit_context, dict) and not edit_context.get("target_view"):
+        task_analysis = kwargs.get("task_analysis")
+        if isinstance(edit_context, dict) and isinstance(task_analysis, dict):
+            strategy = str(task_analysis.get("edit_strategy") or "").strip()
+            if strategy:
+                edit_context["edit_strategy"] = strategy
+            if task_analysis.get("edit_ready") is not None:
+                edit_context["harness_edit_ready"] = bool(task_analysis.get("edit_ready"))
+            if task_analysis.get("acceptance_contract"):
+                edit_context["acceptance_contract"] = task_analysis.get("acceptance_contract")
+        strategy_for_view = _edit_strategy(edit_context)
+        if (
+            isinstance(edit_context, dict)
+            and strategy_for_view == "sql_view_rewrite"
+            and not edit_context.get("target_view")
+        ):
             replacement_source_name = ""
             resolved_deps = edit_context.get("resolved_dependencies")
             if isinstance(resolved_deps, list):
@@ -127,16 +141,27 @@ class CodeEditSkill:
                         break
             if replacement_source_name:
                 edit_context["target_view"] = replacement_source_name
-            else:
-                t_view = _extract_target_view_from_contract(contract if isinstance(contract, dict) else None)
-                if not t_view:
-                    t_view = _select_target_view(
-                        evidence=evidence,
-                        instruction=instruction,
-                        handoff_contract=contract if isinstance(contract, dict) else None,
+
+        if isinstance(edit_context, dict):
+            authoritative_targets = _filter_authoritative_targets(
+                _editable_targets(edit_context),
+                edit_context,
+                self.project_root,
+            )
+            if authoritative_targets is not None:
+                if not authoritative_targets:
+                    return SkillResult(
+                        success=False,
+                        summary=(
+                            "code_edit not ready: target_context_missing; "
+                            "PATCH_INTENT_JSON target is not present in EDIT_CONTEXT_JSON hydration"
+                        ),
+                        missing_info=("target_context_missing",),
+                        metadata={"raw_preview": _preview(evidence)},
                     )
-                if t_view:
-                    edit_context["target_view"] = t_view
+                edit_context["editable_targets"] = authoritative_targets
+                edit_context["snippets"] = authoritative_targets
+                evidence = _replace_marker_json(evidence, "EDIT_CONTEXT_JSON", edit_context)
 
         ready_error = _validate_edit_context_ready(self.project_root, edit_context)
         if ready_error:
@@ -288,12 +313,42 @@ class CodeEditSkill:
             if not isinstance(target_index, int) or not (0 <= target_index < len(edit_targets)):
                 return None, raw_parts[0]
             current_code = str(edit_targets[target_index].get("current_code") or "")
+            display_code = str(edit_targets[target_index].get("display_code") or current_code)
             file = str(edit_targets[target_index].get("file") or "")
             
             operation = edit.get("operation")
             target_view = str(edit.get("target_view") or fallback_view).strip()
             new_string = None
-            if operation in ("replace_sql_source", "replace_dependency", "use_existing") and target_view:
+            strategy = _edit_strategy(edit_context)
+            if (
+                operation in ("replace_sql_source", "replace_dependency", "use_existing")
+                and strategy != "sql_view_rewrite"
+            ):
+                error_json = json.dumps({
+                    "expected_strategy": "sql_view_rewrite",
+                    "actual_strategy": strategy or "general_edit",
+                    "reason": f"Operation '{operation}' conflicts with Harness edit_strategy '{strategy}'"
+                })
+                return {
+                    "edits": [],
+                    "confidence": 0.0,
+                    "missing_info": ["diagnose_strategy_mismatch"],
+                }, f"diagnose_strategy_mismatch {error_json}"
+
+            target_symbol = ""
+            if isinstance(edit_context, dict):
+                task_intent = edit_context.get("task_intent")
+                if isinstance(task_intent, dict):
+                    target_symbol = str(task_intent.get("target_symbol") or "").strip()
+
+            is_view_op = (
+                operation in ("replace_sql_source", "replace_dependency", "use_existing")
+                and target_view
+                and strategy == "sql_view_rewrite"
+            )
+
+            last_projection_error = None
+            if is_view_op:
                 tmp_ctx = dict(edit_context or {})
                 tmp_ctx["target_view"] = target_view
                 if "resolved_dependencies" in tmp_ctx:
@@ -308,37 +363,132 @@ class CodeEditSkill:
                     tmp_ctx["resolved_dependencies"] = resolved_deps
                 try:
                     new_string = generate_sql_patch(current_code, tmp_ctx)
-                except ProjectionMappingError:
-                    return {
-                        "edits": [],
-                        "confidence": 0.0,
-                        "missing_info": ["column_mapping"],
-                    }, "failed to rewrite projection: missing column mapping"
-            
-            if new_string is not None:
-                built_edits.append({
-                    "target_index": target_index,
-                    "new_string": _clean_llm_code(new_string),
-                })
-                continue
+                    if new_string is not None and new_string.strip() == current_code.strip():
+                        new_string = None
+                except ProjectionMappingError as exc:
+                    last_projection_error = exc
+                    new_string = None
 
-            replacement_messages = _replacement_messages(
-                instruction=instruction,
-                file=file,
-                target_index=target_index,
-                current_code=current_code,
-                edit_plan=edit,
-                evidence=evidence,
-                target_view=target_view,
-            )
-            replacement_raw = await self.llm_complete(replacement_messages)
-            raw_parts.append(replacement_raw)
-            replacement_payload = _extract_json_payload(replacement_raw)
-            if replacement_payload is None:
-                return None, "\n\n".join(raw_parts)
-            new_string = str(replacement_payload.get("new_string") or "")
-            if not new_string:
-                return None, "\n\n".join(raw_parts)
+            if new_string is None:
+                if is_view_op:
+                    if bool(edit_targets[target_index].get("hydration_simplified")):
+                        return {
+                            "edits": [],
+                            "confidence": 0.0,
+                            "missing_info": ["simplified_context_requires_deterministic_patch"],
+                        }, "simplified_context_requires_deterministic_patch"
+                    # Bounded SQL replacement fallback
+                    available_columns = []
+                    replaces = []
+                    resolved_deps = edit_context.get("resolved_dependencies") or []
+                    for dep in resolved_deps:
+                        if isinstance(dep, dict) and dep.get("role") == "replacement_source":
+                            available_columns = list(dep.get("columns") or [])
+                            replaces = list(dep.get("replaces_objects") or [])
+                            break
+                    
+                    old_aliases = _extract_sql_aliases_from_python(current_code)
+                    table_aliases = _extract_table_aliases_from_sql(current_code)
+                    
+                    replacement_messages = _sql_bounded_replacement_messages(
+                        instruction=instruction,
+                        file=file,
+                        target_index=target_index,
+                        current_code=display_code,
+                        target_view=target_view,
+                        available_columns=available_columns,
+                        old_aliases=old_aliases,
+                        constraints=edit_context.get("constraints") or ["Do not invent dependencies"],
+                    )
+                    replacement_raw = await self.llm_complete(replacement_messages)
+                    raw_parts.append(replacement_raw)
+                    replacement_payload = _extract_json_payload(replacement_raw)
+                    new_string = str(replacement_payload.get("new_string") or "") if replacement_payload else ""
+                    
+                    # Validate the LLM fallback output
+                    validation_errors = []
+                    if not new_string or new_string.strip() == display_code.strip():
+                        validation_errors.append("LLM fallback generated empty or unchanged string")
+                    
+                    # 1. Full-file compile check
+                    if not validation_errors:
+                        path = _resolve_under_root(self.project_root, file)
+                        if path and path.is_file():
+                            try:
+                                orig_file_content = path.read_text(encoding="utf-8")
+                                new_file_content = orig_file_content.replace(current_code, new_string, 1)
+                                compile(new_file_content, str(path), "exec")
+                            except SyntaxError as e:
+                                validation_errors.append(f"LLM fallback has python syntax errors: {e.msg} at line {e.lineno}")
+                            except Exception as e:
+                                validation_errors.append(f"LLM fallback compilation failed: {str(e)}")
+                    
+                    # 2. Function signature unchanged
+                    if not validation_errors and target_symbol and target_symbol != "目标代码":
+                        if not _verify_signature_unchanged(display_code, new_string, target_symbol):
+                            validation_errors.append(f"LLM fallback function signature changed or target symbol deleted: {target_symbol}")
+                    
+                    # 3. Target symbol body changed and contains target_view
+                    if not validation_errors:
+                        body_changed, contains_view = _verify_body_changed_and_contains_view(
+                            display_code, new_string, target_symbol, target_view
+                        )
+                        if not body_changed:
+                            validation_errors.append("LLM fallback function body has no change")
+                        if not contains_view:
+                            validation_errors.append(f"LLM fallback does not reference target_view '{target_view}' inside target function body")
+                    
+                    # 4. Legacy SQL aliases/tables removed from SQL clauses
+                    if not validation_errors:
+                        legacy_refs = _contains_legacy_sql_references(new_string, replaces, table_aliases)
+                        if legacy_refs:
+                            validation_errors.append(f"LLM fallback still references removed tables or aliases: {legacy_refs}")
+                    
+                    if validation_errors:
+                        missing_cols = []
+                        exc_str = str(last_projection_error)
+                        if "missing column mapping:" in exc_str:
+                            missing_cols.append(exc_str.split("missing column mapping:")[-1].strip())
+                        elif "SELECT *" in exc_str:
+                            missing_cols.append("*")
+                        
+                        error_json = json.dumps({
+                            "expected_strategy": "sql_view_rewrite",
+                            "actual_strategy": "sql_view_rewrite",
+                            "reason": "projection_mapping_failed",
+                            "missing_columns": missing_cols,
+                            "target_view": target_view,
+                            "fallback": f"llm_replacement_failed: {'; '.join(validation_errors)}"
+                        })
+                        return {
+                            "edits": [],
+                            "confidence": 0.0,
+                            "missing_info": ["diagnose_strategy_mismatch"],
+                        }, f"diagnose_strategy_mismatch {error_json}"
+                else:
+                    # Generic LLM replacement fallback (for non-SQL ops)
+                    replacement_messages = _replacement_messages(
+                        instruction=instruction,
+                        file=file,
+                        target_index=target_index,
+                        current_code=display_code,
+                        edit_plan=(
+                            edit
+                            if strategy == "sql_view_rewrite"
+                            else {key: value for key, value in edit.items() if key != "target_view"}
+                        ),
+                        evidence=evidence,
+                        target_view=target_view if strategy == "sql_view_rewrite" else "",
+                    )
+                    replacement_raw = await self.llm_complete(replacement_messages)
+                    raw_parts.append(replacement_raw)
+                    replacement_payload = _extract_json_payload(replacement_raw)
+                    if replacement_payload is None:
+                        return None, "\n\n".join(raw_parts)
+                    new_string = str(replacement_payload.get("new_string") or "")
+                    if not new_string:
+                        return None, "\n\n".join(raw_parts)
+
             built_edits.append({
                 "target_index": target_index,
                 "new_string": _clean_llm_code(new_string),
@@ -671,6 +821,12 @@ def _clean_llm_code(code: str) -> str:
     return res
 
 
+def _edit_strategy(ctx: dict[str, object] | None) -> str:
+    if not isinstance(ctx, dict):
+        return ""
+    return str(ctx.get("edit_strategy") or "").strip() or "general_edit"
+
+
 
 def _resolve_under_root(project_root: Path, rel: str) -> Path | None:
     try:
@@ -746,6 +902,201 @@ def _editable_targets(ctx: dict[str, object] | None) -> list[dict[str, object]]:
     if not isinstance(targets, list) or not targets:
         targets = ctx.get("snippets")
     return [target for target in targets or [] if isinstance(target, dict)]
+
+
+def _filter_authoritative_targets(
+    hydrated_targets: list[dict[str, object]],
+    edit_context: dict[str, object],
+    project_root: Path,
+) -> list[dict[str, object]] | None:
+    specs = _authoritative_target_specs(edit_context)
+    if not specs:
+        return None
+    filtered = [
+        target
+        for target in hydrated_targets
+        if any(_target_matches_spec(target, spec) for spec in specs)
+    ]
+    if filtered:
+        return filtered
+    return _materialize_authoritative_targets(specs, edit_context, project_root)
+
+
+def _authoritative_target_specs(edit_context: dict[str, object]) -> list[dict[str, object]]:
+    specs: list[dict[str, object]] = []
+    patch_intent = edit_context.get("patch_intent")
+    if isinstance(patch_intent, dict):
+        raw_targets = patch_intent.get("edit_targets")
+        if isinstance(raw_targets, list):
+            specs.extend(t for t in raw_targets if isinstance(t, dict))
+    raw_targets = edit_context.get("edit_targets")
+    if isinstance(raw_targets, list):
+        specs.extend(t for t in raw_targets if isinstance(t, dict))
+    task_intent = edit_context.get("task_intent")
+    if isinstance(task_intent, dict):
+        symbol = str(task_intent.get("target_symbol") or "").strip()
+        if symbol:
+            specs.append({"symbol": symbol})
+    normalized: list[dict[str, object]] = []
+    seen: set[tuple[str, str, int, int]] = set()
+    for spec in specs:
+        file = str(spec.get("file") or "").replace("\\", "/").strip()
+        symbol = str(spec.get("symbol") or spec.get("symbol_or_api") or "").strip()
+        start = spec.get("start_line") or spec.get("line_start") or spec.get("line")
+        end = spec.get("end_line") or spec.get("line_end") or spec.get("line")
+        try:
+            start_i = int(start) if start else 0
+        except (TypeError, ValueError):
+            start_i = 0
+        try:
+            end_i = int(end) if end else 0
+        except (TypeError, ValueError):
+            end_i = 0
+        if not file and not symbol:
+            continue
+        key = (file, symbol, start_i, end_i)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({
+            "file": file,
+            "symbol": symbol,
+            "start_line": start_i,
+            "end_line": end_i,
+        })
+    return normalized
+
+
+def _target_matches_spec(target: dict[str, object], spec: dict[str, object]) -> bool:
+    target_file = str(target.get("file") or "").replace("\\", "/")
+    spec_file = str(spec.get("file") or "").replace("\\", "/")
+    if spec_file and not (
+        target_file == spec_file
+        or target_file.endswith("/" + spec_file)
+        or spec_file.endswith("/" + target_file)
+    ):
+        return False
+
+    spec_symbol = str(spec.get("symbol") or "").strip()
+    target_symbol = str(target.get("symbol") or "").strip()
+    current_code = str(target.get("current_code") or "")
+    if spec_symbol:
+        if target_symbol and target_symbol == spec_symbol:
+            return True
+        if re.search(rf"\b(?:async\s+def|def|class)\s+{re.escape(spec_symbol)}\b", current_code):
+            return True
+        if re.search(rf"(?:\b|_){re.escape(spec_symbol)}(?:\b|_)", current_code):
+            return True
+        return False
+
+    spec_start = spec.get("start_line")
+    spec_end = spec.get("end_line")
+    target_start = target.get("start_line")
+    target_end = target.get("end_line")
+    if (
+        isinstance(spec_start, int)
+        and isinstance(spec_end, int)
+        and spec_start > 0
+        and spec_end >= spec_start
+        and isinstance(target_start, int)
+        and isinstance(target_end, int)
+    ):
+        return spec_start <= target_end and target_start <= spec_end
+    return bool(spec_file)
+
+
+def _materialize_authoritative_targets(
+    specs: list[dict[str, object]],
+    edit_context: dict[str, object],
+    project_root: Path,
+) -> list[dict[str, object]]:
+    materialized: list[dict[str, object]] = []
+    intended_change = str(edit_context.get("intended_change") or "").strip()
+    acceptance = (
+        edit_context.get("acceptance_criteria")
+        or edit_context.get("acceptance")
+        or "Target behavior is changed as requested."
+    )
+    for spec in specs:
+        file = str(spec.get("file") or "").replace("\\", "/").strip()
+        if not file:
+            continue
+        path = _resolve_under_root(project_root, file)
+        if path is None or not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        start = spec.get("start_line")
+        end = spec.get("end_line")
+        symbol = str(spec.get("symbol") or "").strip()
+        if not (
+            isinstance(start, int)
+            and isinstance(end, int)
+            and start > 0
+            and end >= start
+        ):
+            found = _find_symbol_range(lines, symbol) if symbol else None
+            if found is None:
+                continue
+            start, end = found
+        start = max(1, int(start))
+        end = min(len(lines), int(end))
+        if end < start:
+            continue
+        current_code = "\n".join(lines[start - 1 : end])
+        if not current_code.strip():
+            continue
+        materialized.append({
+            "file": file,
+            "symbol": symbol,
+            "start_line": start,
+            "end_line": end,
+            "current_code": current_code,
+            "display_code": current_code,
+            "hydration_simplified": False,
+            "intended_change": intended_change,
+            "acceptance_criteria": acceptance,
+            "materialized_from_patch_intent": True,
+        })
+    return materialized
+
+
+def _find_symbol_range(lines: list[str], symbol: str) -> tuple[int, int] | None:
+    if not symbol:
+        return None
+    for idx, line in enumerate(lines):
+        if not re.search(rf"^\s*(?:async\s+def|def|class)\s+{re.escape(symbol)}\b", line):
+            continue
+        start = idx + 1
+        indent = len(line) - len(line.lstrip(" "))
+        end = idx + 1
+        for j in range(idx + 1, len(lines)):
+            candidate = lines[j]
+            if not candidate.strip():
+                end = j + 1
+                continue
+            next_indent = len(candidate) - len(candidate.lstrip(" "))
+            if next_indent <= indent:
+                break
+            end = j + 1
+        return start, end
+    return None
+
+
+def _replace_marker_json(text: str, marker: str, payload: dict[str, object]) -> str:
+    if marker not in text:
+        return text.rstrip() + f"\n\n{marker}\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    prefix, rest = text.split(marker, 1)
+    block = _extract_marker_json(text, marker)
+    if not isinstance(block, dict):
+        return prefix.rstrip() + f"\n\n{marker}\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    raw = json.dumps(block, ensure_ascii=False, indent=2)
+    replacement = json.dumps(payload, ensure_ascii=False, indent=2)
+    if raw in rest:
+        return prefix + marker + rest.replace(raw, replacement, 1)
+    return prefix.rstrip() + f"\n\n{marker}\n" + replacement
 
 
 def _resolve_edit_item_target(
@@ -841,6 +1192,15 @@ def _replacement_messages(
     target_view: str = "",
 ) -> list[dict[str, object]]:
     t_view = target_view or str(edit_plan.get("target_view") or "").strip()
+    dependency_rule = (
+        "CRITICAL: If replacing a query or dependency, you MUST only "
+        f"use the replacement source '{t_view}'. "
+        "Do NOT use any other name. The name MUST exist in the "
+        "repository's resolved dependencies or available views."
+        if t_view
+        else "Do not invent replacement dependencies or database views. "
+        "For refactor/function-reuse tasks, preserve behavior and modify only the requested target."
+    )
     return [
         {
             "role": "system",
@@ -851,10 +1211,11 @@ def _replacement_messages(
                 "Return only the replacement for the single provided current_code. "
                 "Preserve indentation, imports, surrounding behavior, and style. "
                 "Do not edit files or symbols outside this current_code. "
-                "CRITICAL: If replacing a query or dependency, you MUST only "
-                f"use the replacement source '{t_view}'. "
-                "Do NOT use any other name. The name MUST exist in the "
-                "repository's resolved dependencies or available views."
+                "CRITICAL PATCH SCOPE RULES:\n"
+                "- Edits must be a bounded patch (e.g. replace call, replace block, insert helper, modify statement).\n"
+                "- Avoid rewriting the entire function if a smaller replacement block is possible.\n"
+                "- Never rewrite the entire file or module. Large uncontrolled regeneration is strictly forbidden.\n"
+                f"{dependency_rule}"
             ),
         },
         {
@@ -901,12 +1262,13 @@ def _prepare_edit_plan_evidence(evidence: str) -> str:
     compact_targets: list[dict[str, object]] = []
     for idx, target in enumerate(_editable_targets(ctx)):
         current_code = str(target.get("current_code") or "")
+        display_code = str(target.get("display_code") or current_code)
         compact_targets.append({
             "index": idx,
             "file": target.get("file"),
             "start_line": target.get("start_line"),
             "end_line": target.get("end_line"),
-            "code_preview": _preview(current_code, limit=1200),
+            "code_preview": _preview(display_code, limit=1200),
         })
     compact["editable_targets"] = compact_targets
     compact["snippets"] = compact_targets
@@ -938,13 +1300,21 @@ def _validate_edit_context_ready(
     if not intended_change:
         return "missing intended_change"
 
+    strategy = _edit_strategy(ctx)
     is_replacement_op = False
     if isinstance(task_intent, dict):
         op = task_intent.get("operation")
         if op in ("replace_dependency", "use_existing", "replace_sql_source"):
             is_replacement_op = True
-    if not is_replacement_op and _is_sql_view_change(intended_change):
+    if strategy == "sql_view_rewrite":
         is_replacement_op = True
+    if is_replacement_op and strategy != "sql_view_rewrite":
+        error_json = json.dumps({
+            "expected_strategy": "sql_view_rewrite",
+            "actual_strategy": strategy,
+            "reason": f"Operation '{op if isinstance(task_intent, dict) else 'replacement'}' requires sql_view_rewrite strategy but got '{strategy}'."
+        })
+        return f"diagnose_strategy_mismatch {error_json}"
 
     if is_replacement_op:
         replacement_source_name = ""
@@ -958,17 +1328,6 @@ def _validate_edit_context_ready(
             replacement_source_name = str(ctx.get("target_view") or "").strip()
         if not replacement_source_name:
             return "missing replacement_source/target_view in EDIT_CONTEXT_JSON for replacement operation"
-
-        available_views = ctx.get("available_views")
-        if available_views:
-            normalized_views = []
-            for v in available_views:
-                if isinstance(v, dict):
-                    normalized_views.append(str(v.get("name") or "").lower())
-                elif isinstance(v, str):
-                    normalized_views.append(v.lower())
-            if replacement_source_name.lower() not in normalized_views:
-                return f"target_view '{replacement_source_name}' not found in available_views: {normalized_views}"
 
     acceptance = ctx.get("acceptance_criteria") or ctx.get("acceptance")
     if not _has_acceptance(acceptance):
@@ -1001,15 +1360,13 @@ def _validate_edit_context_ready(
         if not current_code.strip():
             return f"editable_targets[{idx}] missing current_code"
 
-        is_db_view_change = False
+        is_db_view_change = _edit_strategy(ctx) == "sql_view_rewrite"
         resolved_deps = ctx.get("resolved_dependencies")
         if isinstance(resolved_deps, list):
             for dep in resolved_deps:
                 if isinstance(dep, dict) and dep.get("role") == "replacement_source" and dep.get("kind") == "database_view":
                     is_db_view_change = True
                     break
-        if not is_db_view_change and (_is_sql_view_change(target_change) or _is_sql_view_change(intended_change)):
-            is_db_view_change = True
 
         if is_db_view_change and not _target_has_sql_query(current_code):
             return (
@@ -1047,21 +1404,17 @@ def _has_acceptance(value: object) -> bool:
     return False
 
 
-def _is_sql_view_change(text: str) -> bool:
-    lowered = text.lower()
-    has_view = "视图" in text or "view" in lowered
-    has_replace = any(word in lowered for word in ["replace", "use", "change", "替换", "用", "改", "使用"])
-    return has_view and has_replace
-
-
-
 def _target_has_sql_query(current_code: str) -> bool:
-    return bool(
-        re.search(
-            r"(?is)\bSELECT\b.{0,200}\bFROM\b|\b(?:FROM|JOIN)\s+[`\"]?[A-Za-z_][A-Za-z0-9_]*",
-            current_code,
-        )
-    )
+    lowered = current_code.lower()
+    if re.search(r"(?is)\bSELECT\b.*\bFROM\b", current_code):
+        return True
+    if re.search(r"(?is)\b(?:FROM|JOIN)\s+[`\"]?[A-Za-z_][A-Za-z0-9_]*", current_code):
+        return True
+    if any(kw in lowered for kw in ("select", "from", "join", "view")):
+        return True
+    if any(term in lowered for term in ("sql", "query", "database", "table")):
+        return True
+    return False
 
 
 def _scope_key(raw: str, project_root: Path) -> str:
@@ -1332,3 +1685,231 @@ def _extract_target_view_from_contract(contract: dict[str, object] | None) -> st
 def _preview(raw: str, *, limit: int = 500) -> str:
     text = " ".join((raw or "").split())
     return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _extract_sql_aliases_from_python(code: str) -> list[str]:
+    # Find SQL strings in code
+    string_pattern = re.compile(
+        r'(?P<quote>"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\')'
+    )
+    aliases = []
+    for match in string_pattern.finditer(code):
+        inner = match.group("quote")
+        if inner.startswith(('"""', "'''")):
+            inner = inner[3:-3]
+        else:
+            inner = inner[1:-1]
+        if "SELECT" in inner.upper() and "FROM" in inner.upper():
+            # Extract columns
+            sel_match = re.search(r"(?is)\bSELECT\b([\s\S]+?)\bFROM\b", inner)
+            if sel_match:
+                columns_part = sel_match.group(1)
+                # Split by comma (ignoring commas inside parentheses)
+                parts = []
+                depth = 0
+                start = 0
+                quote = ""
+                for idx, ch in enumerate(columns_part):
+                    if quote:
+                        if ch == quote:
+                            quote = ""
+                        continue
+                    if ch in {"'", '"', "`"}:
+                        quote = ch
+                        continue
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")" and depth > 0:
+                        depth -= 1
+                    elif ch == "," and depth == 0:
+                        parts.append(columns_part[start:idx])
+                        start = idx + 1
+                parts.append(columns_part[start:])
+                
+                for col in parts:
+                    col = col.strip()
+                    if not col:
+                        continue
+                    as_match = re.search(r"\bAS\s+([a-zA-Z0-9_\"'`\[\]]+)", col, re.I)
+                    if as_match:
+                        aliases.append(as_match.group(1).replace('`','').replace('"','').replace("'", "").strip())
+                        continue
+                    # Find last identifier
+                    ids = re.findall(r"\b[a-zA-Z0-9_.]+\b", col)
+                    if ids:
+                        aliases.append(ids[-1].split('.')[-1].strip())
+    return [a for a in dict.fromkeys(aliases) if a and not a.startswith("*")]
+
+
+def _contains_legacy_sql_references(code: str, replaces: list[str], old_aliases: list[str]) -> list[str]:
+    string_pattern = re.compile(
+        r'(?P<quote>"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\')'
+    )
+    found = []
+    replaces_lower = {r.lower() for r in replaces if r}
+    aliases_lower = {a.lower() for a in old_aliases if a}
+    
+    for match in string_pattern.finditer(code):
+        inner = match.group("quote")
+        if inner.startswith(('"""', "'''")):
+            inner = inner[3:-3]
+        else:
+            inner = inner[1:-1]
+            
+        if "SELECT" in inner.upper() and "FROM" in inner.upper():
+            # Clean SQL comments
+            inner_clean = re.sub(r"/\*[\s\S]*?\*/", "", inner)
+            inner_clean = re.sub(r"--.*", "", inner_clean)
+            
+            # Check for table references
+            for r in replaces_lower:
+                if re.search(rf"\b{re.escape(r)}\b", inner_clean, re.IGNORECASE):
+                    found.append(r)
+            # Check for alias.column pattern
+            for a in aliases_lower:
+                if re.search(rf"\b{re.escape(a)}\.", inner_clean, re.IGNORECASE):
+                    found.append(f"{a}.")
+    return list(dict.fromkeys(found))
+
+
+def _verify_signature_unchanged(old_code: str, new_code: str, target_symbol: str) -> bool:
+    if not target_symbol or target_symbol == "目标代码":
+        return True
+    # Find line matching def symbol_name(...)
+    pattern = re.compile(rf"def\s+{re.escape(target_symbol)}\s*\(.*?\)\s*:", re.DOTALL)
+    old_match = pattern.search(old_code)
+    if not old_match:
+        # Target symbol might not be a function definition in old_code
+        return True
+    new_match = pattern.search(new_code)
+    if not new_match:
+        # The def signature was deleted or altered
+        return False
+    # Clean whitespace and compare signatures
+    old_sig = " ".join(old_match.group(0).split())
+    new_sig = " ".join(new_match.group(0).split())
+    return old_sig == new_sig
+
+
+def _verify_body_changed_and_contains_view(old_code: str, new_code: str, target_symbol: str, target_view: str) -> tuple[bool, bool]:
+    if not target_symbol or target_symbol == "目标代码":
+        body_changed = old_code.strip() != new_code.strip()
+        contains_view = target_view.lower() in new_code.lower()
+        return body_changed, contains_view
+        
+    pattern = re.compile(rf"def\s+{re.escape(target_symbol)}\s*\(.*?\)\s*:", re.DOTALL)
+    old_match = pattern.search(old_code)
+    new_match = pattern.search(new_code)
+    if old_match and new_match:
+        old_body = old_code[old_match.end():].strip()
+        new_body = new_code[new_match.end():].strip()
+        body_changed = old_body != new_body
+        contains_view = target_view.lower() in new_body.lower()
+        return body_changed, contains_view
+    
+    return old_code.strip() != new_code.strip(), target_view.lower() in new_code.lower()
+
+
+def _sql_bounded_replacement_messages(
+    *,
+    instruction: str,
+    file: str,
+    target_index: int,
+    current_code: str,
+    target_view: str,
+    available_columns: list[str],
+    old_aliases: list[str],
+    constraints: list[str],
+) -> list[dict[str, object]]:
+    constraints_text = "\n".join(f"- {c}" for c in constraints)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are MitKII SQL ReplacementBuilder. Output ONE raw JSON object only. \n"
+                "No markdown, no prose. Required schema:\n"
+                '{"new_string":"complete replacement for current_code"}\n\n'
+                "Return only the replacement for the single provided current_code.\n"
+                "Preserve indentation, surrounding behavior, and python structure.\n"
+                "You must perform a bounded SQL replacement, modifying ONLY the SQL statement/string inside the code.\n"
+                "CRITICAL CONSTRAINTS:\n"
+                f"- You must only use the target view '{target_view}'. Do NOT invent other views or tables.\n"
+                f"- Available columns in target view '{target_view}': {available_columns}\n"
+                f"- Old SELECT output aliases to map: {old_aliases}\n"
+                "- You must preserve all original output field/column names (aliases).\n"
+                "- You must NOT delete or modify the WHERE clause (e.g. keep any placeholders or variables like WHERE passenger_id = :passenger_id).\n"
+                "- You must NOT use SELECT *; explicitly name all columns.\n"
+                "- You must not change the function signature or delete any python logic.\n"
+                f"{constraints_text}"
+            )
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Instruction:\n{instruction}\n\n"
+                f"File: {file}\nTarget index: {target_index}\n\n"
+                "CURRENT_CODE:\n"
+                f"{current_code}\n"
+            )
+        }
+    ]
+
+
+def _extract_table_aliases_from_sql(code: str) -> list[str]:
+    string_pattern = re.compile(
+        r'(?P<quote>"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\')'
+    )
+    aliases = []
+    
+    def walk(tokens, in_from_clause=False):
+        local_aliases = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            val = token.value.upper().strip()
+            
+            if token.ttype is sqlparse.tokens.Keyword or token.ttype is sqlparse.tokens.Keyword.DML:
+                if val in ("FROM", "JOIN") or "JOIN" in val:
+                    in_from_clause = True
+                elif val in ("ON", "USING", "WHERE", "GROUP", "ORDER", "LIMIT", "UNION", "HAVING", ";", "SELECT", "INSERT", "UPDATE", "DELETE"):
+                    in_from_clause = False
+                elif any(val.startswith(kw) for kw in ("GROUP", "ORDER", "LIMIT", "UNION", "HAVING")):
+                    in_from_clause = False
+            elif isinstance(token, sqlparse.sql.Where) or val.startswith("WHERE"):
+                in_from_clause = False
+                
+            if in_from_clause:
+                if isinstance(token, sqlparse.sql.IdentifierList):
+                    for subtok in token.get_identifiers():
+                        if isinstance(subtok, sqlparse.sql.Identifier):
+                            alias = subtok.get_alias()
+                            if alias:
+                                local_aliases.append(alias.strip().replace('"', '').replace("'", "").replace("`", ""))
+                elif isinstance(token, sqlparse.sql.Identifier):
+                    alias = token.get_alias()
+                    if alias:
+                        local_aliases.append(alias.strip().replace('"', '').replace("'", "").replace("`", ""))
+            
+            if hasattr(token, "tokens") and token.tokens:
+                is_paren = isinstance(token, sqlparse.sql.Parenthesis)
+                local_aliases.extend(walk(token.tokens, in_from_clause=False if is_paren else in_from_clause))
+                
+            i += 1
+        return local_aliases
+
+    for match in string_pattern.finditer(code):
+        inner = match.group("quote")
+        if inner.startswith(('"""', "'''")):
+            inner = inner[3:-3]
+        else:
+            inner = inner[1:-1]
+        
+        if "SELECT" in inner.upper() and "FROM" in inner.upper():
+            try:
+                parsed = sqlparse.parse(inner)
+                for stmt in parsed:
+                    aliases.extend(walk(stmt.tokens))
+            except Exception:
+                pass
+                
+    return [a for a in dict.fromkeys(aliases) if a]

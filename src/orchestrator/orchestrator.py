@@ -28,6 +28,7 @@ from src.harness.gates.exit_gate import ExitCheckInput, validate_exit
 from src.harness.gates.plan_gate import ReplanGateContext, validate_plan
 from src.harness.gates.preflight_probe import assess_preflight
 from src.harness.gates.types import GateVerdict, PreflightResult, TruncationPolicy
+from src.harness.task_analysis import HarnessTaskAnalysis, analyze_task
 from src.harness.subtask.handoff import (
     collect_prior_summaries,
     commit_subtask_failure,
@@ -42,6 +43,7 @@ from src.orchestrator.final_summarizer import (
 )
 from src.orchestrator.handoff_contract import (
     build_handoff_contract,
+    extract_handoff_contract,
     format_handoff_contract,
     merge_handoff_contracts,
 )
@@ -60,6 +62,7 @@ from src.planner.task_tree import SubTaskNode, SubTaskStatus, TaskTree
 from src.skills import (
     CodeEditSkill,
     CodeSearchSkill,
+    DesignSkill,
     SkillContext,
     SkillExecutor,
     ValidatorSkill,
@@ -143,6 +146,7 @@ class OrchestratorState:
     subtask_attempts: dict[str, int] = field(default_factory=dict)
     subtask_summaries: dict[str, str] = field(default_factory=dict)
     subtask_exploration_digests: dict[str, str] = field(default_factory=dict)
+    task_analysis: HarnessTaskAnalysis | None = None
 
 
 class OrchestratorLoop:
@@ -197,6 +201,7 @@ class OrchestratorLoop:
                 llm_complete=self._planner.client.complete,
             ),
             CodeSearchSkill(project_root=harness.project_root, tools=tools),
+            DesignSkill(),
             ValidatorSkill(project_root=harness.project_root),
             VerifySkill(project_root=harness.project_root),
         ])
@@ -242,6 +247,8 @@ class OrchestratorLoop:
         manifest = self.state.discovery_manifest
         assert manifest is not None
         context_pack = await self._context_pack_for_planner(user_msg)
+        self.state.task_analysis = analyze_task(user_msg, context_pack)
+        analysis_block = self.state.task_analysis.to_planner_block()
         discovery_block: str | None = None
         if self.settings.scout_enabled:
             discovery_block = manifest.to_planner_block(compact=True)
@@ -312,6 +319,11 @@ class OrchestratorLoop:
             if event.type == EventType.ERROR and event.data and event.data.get("terminal"):
                 yield AgentEvent(type=EventType.STREAM_END)
                 return
+        discovery_block = (
+            f"{discovery_block}\n\n{analysis_block}"
+            if discovery_block
+            else analysis_block
+        )
         yield AgentEvent(
             type=EventType.STREAM_START,
             data={"phase": "planner"},
@@ -451,6 +463,17 @@ class OrchestratorLoop:
 
             if node.kind == SubTaskKind.DIAGNOSE:
                 async for event in self._run_diagnose_skill_executor(
+                    task_tree=task_tree,
+                    node=node,
+                    context_pack=subtask_context_pack,
+                ):
+                    if event.type == EventType.STREAM_END and event.data:
+                        data = event.data
+                        if "success" in data or data.get("failure_code"):
+                            exec_result = data
+                    yield event
+            elif node.kind == SubTaskKind.DESIGN:
+                async for event in self._run_design_skill_executor(
                     task_tree=task_tree,
                     node=node,
                     context_pack=subtask_context_pack,
@@ -627,7 +650,7 @@ class OrchestratorLoop:
                     base_tree,
                     replan_evidence,
                     fresh_structure,
-                    discovery_manifest=self._discovery_block(),
+                    discovery_manifest=self._planner_context_block(),
                 )
                 pm.end(
                     "replan",
@@ -651,6 +674,8 @@ class OrchestratorLoop:
                 fallback_tree = fallback_replan_for_failed_edit(
                     base_tree,
                     failed_subtask_id=node.id,
+                    task_analysis=self.state.task_analysis,
+                    error_trace=replan_errors,
                 )
                 if fallback_tree is not None:
                     fallback_tree, fallback_error = await self._apply_plan_gate(
@@ -810,7 +835,7 @@ class OrchestratorLoop:
             log.debug("PlanGate attempt %d failed: %s", attempt + 1, err)
 
         log.debug("PlanGate exhausted — using diagnose fallback: %s", last_err)
-        fallback = fallback_task_tree(user_msg)
+        fallback = fallback_task_tree(user_msg, task_analysis=self.state.task_analysis)
         tree, err = await self._apply_plan_gate(fallback)
         if err is None:
             self.state.plan_gate_replans = max_attempts
@@ -937,6 +962,11 @@ class OrchestratorLoop:
             "code_search",
             skill_context,
             extra_query=f"{task_tree.root_task} {node.description} {node.acceptance_criteria}",
+            task_analysis=(
+                self.state.task_analysis.to_dict()
+                if self.state.task_analysis is not None
+                else {}
+            ),
         )
         elapsed = time.perf_counter() - started
         search_output = str(search.metadata.get("search_output", ""))
@@ -1027,6 +1057,129 @@ class OrchestratorLoop:
             },
         )
 
+    async def _run_design_skill_executor(
+        self,
+        *,
+        task_tree: TaskTree,
+        node: SubTaskNode,
+        context_pack: Any | None,
+    ) -> AsyncIterator[AgentEvent]:
+        yield AgentEvent(
+            type=EventType.STATUS,
+            content=f"SkillExecutor [{node.id}] · code_search",
+            data=_skill_status_data(
+                subtask_id=node.id,
+                spinner_only=True,
+                skill="code_search",
+            ),
+        )
+        skill_context = SkillContext(
+            user_request=f"{task_tree.root_task}\n\nSubtask: {node.description}",
+            context_pack=context_pack,
+        )
+        started = time.perf_counter()
+        search = await self._skill_executor.run(
+            "code_search",
+            skill_context,
+            extra_query=f"{task_tree.root_task} {node.description} {node.acceptance_criteria}",
+            task_analysis=(
+                self.state.task_analysis.to_dict()
+                if self.state.task_analysis is not None
+                else {}
+            ),
+        )
+        elapsed = time.perf_counter() - started
+        search_output = str(search.metadata.get("search_output", ""))
+        yield AgentEvent(
+            type=EventType.STATUS,
+            content=(
+                f"SkillExecutor [{node.id}] · code_search took {elapsed:.1f}s "
+                f"(success={search.success}, output={len(search_output)} chars)"
+            ),
+            data=_skill_status_data(
+                subtask_id=node.id,
+                skill="code_search",
+                elapsed=elapsed,
+                success=search.success,
+            ),
+        )
+        if not search.success:
+            yield self._skill_failure_stream_end(
+                node,
+                search.summary,
+                exploration_digest=search_output,
+            )
+            return
+
+        prior_ctx = collect_prior_summaries(
+            task_tree,
+            node,
+            self.state.subtask_summaries,
+        )
+        search_output = _append_prior_edit_context(search_output, prior_ctx)
+        contract = merge_handoff_contracts(
+            user_request=f"{task_tree.root_task}\n\nSubtask: {node.description}",
+            prior_summaries=prior_ctx,
+            current_search_output=search_output,
+            global_summaries=self.state.subtask_summaries,
+        )
+        analysis_dict = (
+            self.state.task_analysis.to_dict()
+            if self.state.task_analysis is not None
+            else {}
+        )
+        design = await self._skill_executor.run(
+            "design",
+            SkillContext(
+                user_request=task_tree.root_task,
+                context_pack=context_pack,
+            ),
+            search_output=search_output,
+            handoff_contract=contract,
+            task_analysis=analysis_dict,
+        )
+        final_message = design.metadata.get("final_message", design.summary)
+        yield AgentEvent(
+            type=EventType.STATUS,
+            content=f"SkillExecutor [{node.id}] · design (success={design.success})",
+            data=_skill_status_data(
+                subtask_id=node.id,
+                skill="design",
+                success=design.success,
+                summary=design.summary,
+            ),
+        )
+        if not design.success:
+            yield self._skill_failure_stream_end(
+                node,
+                design.summary,
+                exploration_digest=search_output,
+                final_message=final_message,
+            )
+            return
+
+        yield final_answer_event(
+            final_message,
+            intermediate=True,
+            subtask_id=node.id,
+        )
+        yield AgentEvent(
+            type=EventType.STREAM_END,
+            data={
+                "subtask_id": node.id,
+                "turns_used": 0,
+                "success": True,
+                "changed_files": [],
+                "file_diffs": {},
+                "error_trace": [],
+                "final_message": final_message,
+                "failure_code": "",
+                "quality_gate_failures": 0,
+                "exploration_digest": search_output,
+                "skill_executor": True,
+            },
+        )
+
     async def _run_edit_skill_executor(
         self,
         *,
@@ -1054,6 +1207,11 @@ class OrchestratorLoop:
             "code_search",
             skill_context,
             extra_query=f"{task_tree.root_task} {node.description}",
+            task_analysis=(
+                self.state.task_analysis.to_dict()
+                if self.state.task_analysis is not None
+                else {}
+            ),
         )
         search_elapsed = time.perf_counter() - search_started
         search_output = search.metadata.get("search_output", "")
@@ -1138,7 +1296,34 @@ class OrchestratorLoop:
             user_request=f"{task_tree.root_task}\n\nSubtask: {node.description}",
             prior_summaries=prior_ctx,
             current_search_output=str(search_output),
+            global_summaries=self.state.subtask_summaries,
         )
+        edit_analysis = _analysis_for_edit(
+            self.state.task_analysis,
+            prior_ctx,
+            self.state.subtask_summaries,
+        )
+        if not edit_analysis.get("edit_ready"):
+            failed_checks = [k for k, v in edit_analysis.get("readiness_checks", {}).items() if not v]
+            msg = f"Harness edit_ready=false. The handoff from prior design/diagnose steps is incomplete or missing required fields. Missing readiness checks: {', '.join(failed_checks) if failed_checks else 'all'}."
+            yield AgentEvent(
+                type=EventType.STATUS,
+                content=f"SkillExecutor [{node.id}] · code_edit blocked: {msg}",
+                data=_skill_status_data(subtask_id=node.id, skill_error=True),
+            )
+            yield self._skill_failure_stream_end(
+                node,
+                msg,
+                exploration_digest=str(search_output),
+            )
+            return
+
+        search_output = _append_effective_edit_context(
+            str(search_output),
+            handoff_contract=contract,
+            edit_analysis=edit_analysis,
+        )
+
         edit = await self._skill_executor.run(
             "code_edit",
             SkillContext(
@@ -1148,6 +1333,7 @@ class OrchestratorLoop:
             instruction=f"{task_tree.root_task}\n\nSubtask: {node.description}",
             search_output=search_output,
             handoff_contract=contract,
+            task_analysis=edit_analysis,
         )
         edit_elapsed = time.perf_counter() - edit_started
         yield AgentEvent(
@@ -1195,6 +1381,12 @@ class OrchestratorLoop:
             ),
             changed_files=edit.changed_files,
             handoff_contract=contract,
+            task_analysis=_analysis_for_edit(
+                self.state.task_analysis,
+                prior_ctx,
+                self.state.subtask_summaries,
+            ),
+            search_output=search_output,
         )
         validation_elapsed = time.perf_counter() - validation_started
         content = (
@@ -1234,7 +1426,7 @@ class OrchestratorLoop:
             yield self._skill_failure_stream_end(
                 node,
                 validation.summary + rollback_suffix,
-                requires_executor_fallback=False,
+                requires_executor_fallback=validation.requires_fallback,
             )
             return
 
@@ -1396,6 +1588,7 @@ class OrchestratorLoop:
             self.harness.project_root,
             max_nodes=self.settings.plan_gate_max_nodes,
             replan_context=replan_context,
+            task_analysis=self.state.task_analysis,
         )
         pm.end("plan_gate", verdict=result.verdict.value, metadata=result.metadata)
 
@@ -1438,7 +1631,7 @@ class OrchestratorLoop:
                 task_tree,
                 replan_evidence,
                 fresh_structure,
-                discovery_manifest=self._discovery_block(),
+                discovery_manifest=self._planner_context_block(),
             )
             pm.end(
                 "replan",
@@ -1557,6 +1750,15 @@ class OrchestratorLoop:
         if self.state.discovery_manifest is None:
             return None
         return self.state.discovery_manifest.to_planner_block()
+
+    def _planner_context_block(self) -> str | None:
+        blocks: list[str] = []
+        discovery = self._discovery_block()
+        if discovery:
+            blocks.append(discovery)
+        if self.state.task_analysis is not None:
+            blocks.append(self.state.task_analysis.to_planner_block())
+        return "\n\n".join(blocks) if blocks else None
 
     async def _discovery_phase(
         self,
@@ -1798,6 +2000,155 @@ def _append_prior_edit_context(search_output: str, prior_summaries: dict[str, st
     return search_output
 
 
+def _append_effective_edit_context(
+    search_output: str,
+    *,
+    handoff_contract: dict[str, Any],
+    edit_analysis: dict[str, Any],
+) -> str:
+    current_block = _extract_marker_json_block(search_output, "EDIT_CONTEXT_JSON")
+    if not current_block:
+        return search_output
+    try:
+        current_ctx = json.loads(current_block)
+    except Exception:
+        return search_output
+    if not isinstance(current_ctx, dict):
+        return search_output
+
+    patch_intent = edit_analysis.get("patch_intent")
+    patch = patch_intent if isinstance(patch_intent, dict) else {}
+    contract = handoff_contract if isinstance(handoff_contract, dict) else {}
+    effective = dict(current_ctx)
+
+    def first_non_empty(*values: object) -> object:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value
+            if isinstance(value, list) and value:
+                return value
+            if isinstance(value, dict) and value:
+                return value
+            if value not in (None, "", [], {}):
+                return value
+        return ""
+
+    target_view = first_non_empty(
+        patch.get("target_view"),
+        contract.get("target_view"),
+        edit_analysis.get("target_view"),
+        effective.get("target_view"),
+    )
+    if isinstance(target_view, str):
+        effective["target_view"] = target_view.strip()
+
+    strategy = first_non_empty(
+        patch.get("edit_strategy"),
+        edit_analysis.get("edit_strategy"),
+        effective.get("edit_strategy"),
+    )
+    if isinstance(strategy, str) and strategy.strip():
+        effective["edit_strategy"] = strategy.strip()
+
+    dependencies = first_non_empty(
+        patch.get("dependencies"),
+        patch.get("dependencies_to_use"),
+        patch.get("resolved_dependencies"),
+        contract.get("dependencies"),
+        contract.get("dependencies_to_use"),
+        contract.get("resolved_dependencies"),
+        effective.get("resolved_dependencies"),
+    )
+    if isinstance(dependencies, list):
+        effective["resolved_dependencies"] = dependencies
+        effective["dependencies"] = dependencies
+        effective["dependencies_resolved"] = bool(dependencies)
+
+    available_views = first_non_empty(
+        patch.get("available_views"),
+        contract.get("available_views"),
+        effective.get("available_views"),
+    )
+    if isinstance(available_views, list):
+        effective["available_views"] = available_views
+
+    edit_targets = first_non_empty(
+        patch.get("edit_targets"),
+        contract.get("edit_targets"),
+        edit_analysis.get("edit_targets"),
+        effective.get("edit_targets"),
+    )
+    if isinstance(edit_targets, list):
+        effective["edit_targets"] = edit_targets
+        _merge_edit_target_metadata(effective, edit_targets)
+
+    acceptance = first_non_empty(
+        patch.get("acceptance_criteria"),
+        patch.get("acceptance"),
+        edit_analysis.get("acceptance_criteria"),
+        edit_analysis.get("acceptance"),
+        edit_analysis.get("acceptance_contract"),
+        contract.get("acceptance_criteria"),
+        contract.get("acceptance"),
+        contract.get("acceptance_contract"),
+        effective.get("acceptance_criteria"),
+        effective.get("acceptance"),
+    )
+    if acceptance:
+        effective["acceptance_criteria"] = acceptance
+        effective["acceptance"] = acceptance
+
+    if edit_analysis.get("edit_ready") is not None:
+        effective["harness_edit_ready"] = bool(edit_analysis.get("edit_ready"))
+    if patch:
+        effective["patch_intent"] = patch
+
+    new_block = json.dumps(effective, ensure_ascii=False, indent=2)
+    prefix = search_output.split("EDIT_CONTEXT_JSON", 1)[0]
+    return prefix.rstrip() + "\n\nEDIT_CONTEXT_JSON\n" + new_block
+
+
+def _merge_edit_target_metadata(
+    edit_context: dict[str, Any],
+    edit_targets: list[object],
+) -> None:
+    targets = edit_context.get("editable_targets")
+    if not isinstance(targets, list):
+        targets = edit_context.get("snippets")
+    if not isinstance(targets, list):
+        return
+
+    for hydrated in targets:
+        if not isinstance(hydrated, dict):
+            continue
+        hydrated_file = str(hydrated.get("file") or "")
+        hydrated_start = hydrated.get("start_line")
+        hydrated_end = hydrated.get("end_line")
+        for target in edit_targets:
+            if not isinstance(target, dict):
+                continue
+            target_file = str(target.get("file") or "")
+            target_start = target.get("line_start") or target.get("start_line")
+            target_end = target.get("line_end") or target.get("end_line")
+            same_file = target_file and target_file == hydrated_file
+            overlaps = (
+                isinstance(hydrated_start, int)
+                and isinstance(hydrated_end, int)
+                and isinstance(target_start, int)
+                and isinstance(target_end, int)
+                and target_start <= hydrated_end
+                and hydrated_start <= target_end
+            )
+            if same_file and (overlaps or not target_start or not target_end):
+                if target.get("symbol") and not hydrated.get("symbol"):
+                    hydrated["symbol"] = target.get("symbol")
+                if target.get("decision") and not hydrated.get("intended_change"):
+                    hydrated["intended_change"] = target.get("decision")
+                if target.get("acceptance_criteria") and not hydrated.get("acceptance_criteria"):
+                    hydrated["acceptance_criteria"] = target.get("acceptance_criteria")
+                break
+
+
 def _extract_marker_json_block(text: str, marker: str) -> str:
     if marker not in text:
         return ""
@@ -1832,8 +2183,197 @@ def _apply_context_pack_to_subtask(node: SubTaskNode, context_pack: Any | None) 
         return
     if node.context_files:
         return
-    if node.kind in {SubTaskKind.DIAGNOSE, SubTaskKind.EDIT}:
+    if node.kind in {SubTaskKind.DIAGNOSE, SubTaskKind.DESIGN, SubTaskKind.EDIT}:
         node.context_files = list(files)
+
+
+def _analysis_for_edit(
+    analysis: HarnessTaskAnalysis | None,
+    prior_summaries: dict[str, str],
+    global_summaries: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    data = analysis.to_dict() if analysis is not None else {}
+    patch_intent = _latest_patch_intent(prior_summaries)
+    if patch_intent is None and global_summaries is not None:
+        patch_intent = _latest_patch_intent(global_summaries)
+
+    if _patch_intent_resolves_readiness(data, patch_intent) and patch_intent is not None:
+        targets = patch_intent.get("edit_targets") or []
+        targets_resolved = all(
+            isinstance(t, dict) and bool(t.get("file"))
+            for t in targets
+        )
+            
+        strategy = patch_intent.get("edit_strategy") or data.get("edit_strategy") or ""
+        dependencies_resolved = True
+        if strategy in ("function_refactor", "sql_view_rewrite"):
+            deps = patch_intent.get("dependencies") or patch_intent.get("dependencies_to_use") or []
+            dependencies_resolved = all(
+                isinstance(dep, dict) and bool(dep.get("name"))
+                for dep in deps
+            )
+                
+        acceptance_contract = patch_intent.get("acceptance_contract")
+        acceptance_resolved = bool(
+            patch_intent.get("acceptance_contract")
+            or patch_intent.get("acceptance_criteria")
+            or patch_intent.get("acceptance")
+        )
+        
+        intent_resolved = strategy != "unknown" and strategy != ""
+        
+        unique_files = {
+            t.get("file") for t in targets
+            if isinstance(t, dict) and t.get("file")
+        }
+        edit_scope_bounded = len(unique_files) > 0 and len(unique_files) <= 2
+        
+        checks = {
+            "intent_resolved": intent_resolved,
+            "targets_resolved": targets_resolved,
+            "dependencies_resolved": dependencies_resolved,
+            "acceptance_resolved": acceptance_resolved,
+            "edit_scope_bounded": edit_scope_bounded,
+        }
+        data["readiness_checks"] = checks
+        data["edit_ready"] = all(checks.values())
+        data["patch_intent_resolved"] = True
+        data["patch_intent"] = patch_intent
+        data["target_view"] = patch_intent.get("target_view") or data.get("target_view") or ""
+        
+        if strategy:
+            data["edit_strategy"] = strategy
+        if targets_resolved:
+            data["editable_targets"] = targets
+            data["edit_targets"] = targets
+        if dependencies_resolved:
+            dependencies = patch_intent.get("dependencies") or patch_intent.get("dependencies_to_use") or []
+            data["resolved_dependencies"] = dependencies
+            data["dependencies"] = dependencies
+            data["dependencies_to_use"] = dependencies
+        if acceptance_resolved:
+            if isinstance(acceptance_contract, dict) and acceptance_contract:
+                data["acceptance_contract"] = acceptance_contract
+            elif patch_intent.get("acceptance_criteria") is not None:
+                criteria = patch_intent.get("acceptance_criteria")
+                if isinstance(criteria, list):
+                    data["acceptance_contract"] = {"criteria": criteria}
+                else:
+                    data["acceptance_contract"] = {"criteria": [str(criteria)]}
+            elif patch_intent.get("acceptance") is not None:
+                acc = patch_intent.get("acceptance")
+                if isinstance(acc, list):
+                    data["acceptance_contract"] = {"criteria": acc}
+                else:
+                    data["acceptance_contract"] = {"criteria": [str(acc)]}
+    else:
+        intent_resolved = False
+        targets_resolved = False
+        dependencies_resolved = False
+        acceptance_resolved = False
+        edit_scope_bounded = False
+        
+        if patch_intent is not None:
+            strategy = patch_intent.get("edit_strategy") or data.get("edit_strategy") or ""
+            intent_resolved = strategy != "unknown" and strategy != ""
+            targets = patch_intent.get("edit_targets") or []
+            targets_resolved = bool(targets) and all(
+                isinstance(t, dict) and bool(t.get("file"))
+                for t in targets
+            )
+            dependencies_resolved = True
+            if strategy in ("function_refactor", "sql_view_rewrite"):
+                deps = patch_intent.get("dependencies") or patch_intent.get("dependencies_to_use") or []
+                dependencies_resolved = all(
+                    isinstance(dep, dict) and bool(dep.get("name"))
+                    for dep in deps
+                )
+            acceptance_contract = patch_intent.get("acceptance_contract")
+            acceptance_resolved = bool(
+                patch_intent.get("acceptance_contract")
+                or patch_intent.get("acceptance_criteria")
+                or patch_intent.get("acceptance")
+            )
+            unique_files = {
+                t.get("file") for t in targets
+                if isinstance(t, dict) and t.get("file")
+            }
+            edit_scope_bounded = len(unique_files) > 0 and len(unique_files) <= 2
+            
+        data["readiness_checks"] = {
+            "intent_resolved": intent_resolved,
+            "targets_resolved": targets_resolved,
+            "dependencies_resolved": dependencies_resolved,
+            "acceptance_resolved": acceptance_resolved,
+            "edit_scope_bounded": edit_scope_bounded,
+        }
+        data["edit_ready"] = False
+        data["patch_intent_resolved"] = patch_intent is not None
+        if patch_intent is not None:
+            data["patch_intent"] = patch_intent
+            data["target_view"] = patch_intent.get("target_view") or data.get("target_view") or ""
+            strategy = patch_intent.get("edit_strategy") or data.get("edit_strategy") or ""
+            if strategy:
+                data["edit_strategy"] = strategy
+            targets = patch_intent.get("edit_targets") or []
+            if targets_resolved:
+                data["editable_targets"] = targets
+                data["edit_targets"] = targets
+            dependencies = patch_intent.get("dependencies") or patch_intent.get("dependencies_to_use") or []
+            if dependencies_resolved:
+                data["resolved_dependencies"] = dependencies
+                data["dependencies"] = dependencies
+                data["dependencies_to_use"] = dependencies
+        if patch_intent is not None and acceptance_resolved:
+            if isinstance(acceptance_contract, dict) and acceptance_contract:
+                data["acceptance_contract"] = acceptance_contract
+            elif patch_intent.get("acceptance_criteria") is not None:
+                criteria = patch_intent.get("acceptance_criteria")
+                if isinstance(criteria, list):
+                    data["acceptance_contract"] = {"criteria": criteria}
+                else:
+                    data["acceptance_contract"] = {"criteria": [str(criteria)]}
+            elif patch_intent.get("acceptance") is not None:
+                acc = patch_intent.get("acceptance")
+                if isinstance(acc, list):
+                    data["acceptance_contract"] = {"criteria": acc}
+                else:
+                    data["acceptance_contract"] = {"criteria": [str(acc)]}
+            
+    return data
+
+
+def _latest_patch_intent(prior_summaries: dict[str, str]) -> dict[str, Any] | None:
+    for summary in reversed(list(prior_summaries.values())):
+        payload = extract_handoff_contract(summary)
+        if payload is not None:
+            return payload
+    return None
+
+
+def _patch_intent_resolves_readiness(
+    analysis: dict[str, Any],
+    patch_intent: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(patch_intent, dict):
+        return False
+    if not patch_intent.get("edit_ready", False):
+        return False
+    strategy = patch_intent.get("edit_strategy") or str(analysis.get("edit_strategy") or analysis.get("intent") or "")
+    if not strategy:
+        return False
+    targets = patch_intent.get("edit_targets")
+    if not isinstance(targets, list) or not targets:
+        return False
+    dependencies_required = strategy in {"function_refactor", "sql_view_rewrite"}
+    dependencies = patch_intent.get("dependencies_to_use") or patch_intent.get("dependencies")
+    if dependencies_required and not (
+        isinstance(dependencies, list) and dependencies
+    ):
+        return False
+    if strategy == "sql_view_rewrite" and not str(patch_intent.get("target_view") or "").strip():
+        return False
+    return True
 
 
 def _diagnose_summary_from_digest(

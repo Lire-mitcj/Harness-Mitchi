@@ -33,6 +33,7 @@ _SKIP_SECTION_HEADERS = frozenset({
 
 _KIND_ZH = {
     "diagnose": "诊断",
+    "design": "设计",
     "edit": "编辑",
     "verify": "验证",
     "shell": "命令",

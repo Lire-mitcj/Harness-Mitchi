@@ -139,6 +139,35 @@ async def test_skill_executor_missing_skill_requires_fallback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_design_skill_outputs_patch_intent() -> None:
+    from src.skills.design import DesignSkill
+
+    executor = SkillExecutor([DesignSkill()])
+    result = await executor.run(
+        "design",
+        SkillContext(user_request="重构订单详情处理，统一脱敏"),
+        handoff_contract={
+            "must_modify": [{
+                "file": "main.py",
+                "line": 10,
+                "symbol_or_api": "build_order_detail_sql",
+                "should_change_to": "apply the requested code change",
+            }]
+        },
+        task_analysis={
+            "intent": "function_refactor",
+            "edit_strategy": "function_refactor",
+            "edit_ready": False,
+            "resolved_dependencies": [],
+            "acceptance_contract": {"intent": "function_refactor"},
+        },
+    )
+    assert result.success
+    assert "PATCH_INTENT_JSON" in result.metadata["final_message"]
+    assert "function_refactor" in result.metadata["final_message"]
+
+
+@pytest.mark.asyncio
 async def test_code_edit_skill_applies_exact_patch(tmp_path) -> None:
     target = tmp_path / "main.py"
     target.write_text("sql = 'SELECT * FROM orders'\n", encoding="utf-8")
@@ -210,10 +239,11 @@ async def test_code_edit_skill_runs_focused_edit_without_patch_plan(tmp_path) ->
         search_output=(
             "main.py:1: sql = 'SELECT * FROM orders'\n\n"
             "EDIT_CONTEXT_JSON\n"
-            + json.dumps({
-                "schema": "mitkii.edit_context.v1",
-                "code_edit_ready": True,
-                "target_view": "view_ticket_report_detail",
+                + json.dumps({
+                    "schema": "mitkii.edit_context.v1",
+                    "code_edit_ready": True,
+                    "edit_strategy": "sql_view_rewrite",
+                    "target_view": "view_ticket_report_detail",
                 "available_views": ["view_ticket_report_detail"],
                 "editable_targets": [{
                     "file": "main.py",
@@ -292,6 +322,7 @@ async def test_code_edit_skill_rejects_absolute_file_outside_project_root(tmp_pa
     edit_context = {
         "schema": "mitkii.edit_context.v1",
         "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
         "target_view": "view_ticket_report_detail",
         "available_views": ["view_ticket_report_detail"],
         "editable_targets": [{
@@ -347,6 +378,7 @@ async def test_code_edit_skill_accepts_snippets_as_editable_targets(tmp_path) ->
         "schema": "mitkii.edit_context.v1",
         "builder": "EditPlanBuilder",
         "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
         "target_view": "view_ticket_report_detail",
         "available_views": ["view_ticket_report_detail"],
         "snippets": [{
@@ -414,6 +446,7 @@ async def test_code_edit_skill_accepts_target_index_without_old_string(tmp_path)
     edit_context = {
         "schema": "mitkii.edit_context.v1",
         "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
         "target_view": "view_ticket_report_detail",
         "available_views": ["view_ticket_report_detail"],
         "editable_targets": [{
@@ -461,6 +494,7 @@ async def test_code_edit_skill_falls_back_from_non_json_to_sql_view_edit(tmp_pat
     edit_context = {
         "schema": "mitkii.edit_context.v1",
         "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
         "target_view": "view_ticket_report_detail",
         "available_views": ["view_ticket_report_detail"],
         "editable_targets": [{
@@ -515,6 +549,7 @@ async def test_code_edit_skill_non_json_without_sql_fallback_reports_preview(tmp
     edit_context = {
         "schema": "mitkii.edit_context.v1",
         "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
         "target_view": "view_ticket_report_detail",
         "available_views": ["view_ticket_report_detail"],
         "editable_targets": [{
@@ -627,6 +662,7 @@ async def test_code_search_skill_batches_map_and_grep(tmp_path) -> None:
     result = await executor.run(
         "code_search",
         SkillContext(user_request="把登机牌查询接口改成用视图查询"),
+        task_analysis={"edit_strategy": "sql_view_rewrite", "intent": "sql_view_rewrite"},
     )
 
     assert result.success
@@ -725,6 +761,23 @@ def test_replacement_messages_focus_single_current_code() -> None:
     assert "CURRENT_CODE" in user_content
     assert "SELECT * FROM boarding_pass" in user_content
     assert "EDIT_CONTEXT_JSON" not in user_content
+    assert "view_ticket_report_detail" in str(messages[0]["content"])
+
+
+def test_replacement_messages_without_target_view_do_not_force_view() -> None:
+    messages = _replacement_messages(
+        instruction="重构订单详情处理并统一脱敏",
+        file="app.py",
+        target_index=0,
+        current_code="def target():\n    return normalize_order_record(row)",
+        edit_plan={"target_index": 0, "operation": "general_edit"},
+        evidence="",
+        target_view="",
+    )
+
+    system_content = str(messages[0]["content"])
+    assert "MUST only use the replacement source" not in system_content
+    assert "Do not invent replacement dependencies" in system_content
 
 
 @pytest.mark.asyncio
@@ -858,6 +911,7 @@ async def test_code_search_skill_hydrates_map_range_as_edit_context(tmp_path) ->
     result = await executor.run(
         "code_search",
         SkillContext(user_request="把登机牌查询接口改成用视图查询"),
+        task_analysis={"edit_strategy": "sql_view_rewrite", "intent": "sql_view_rewrite"},
     )
 
     assert result.success
@@ -936,6 +990,7 @@ async def test_code_search_skill_does_not_make_pdf_renderer_editable_for_query_v
     result = await executor.run(
         "code_search",
         SkillContext(user_request="把登机牌查询接口改成用视图查询"),
+        task_analysis={"edit_strategy": "sql_view_rewrite", "intent": "sql_view_rewrite"},
     )
 
     assert result.success
@@ -1171,6 +1226,7 @@ def test_validate_edit_context_ready_with_target_view(tmp_path) -> None:
     # 1. Successful validation when target_view matches available_views
     ctx_ok = {
         "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
         "intended_change": "use view to replace order query",
         "available_views": ["v_order_detail"],
         "target_view": "v_order_detail",
@@ -1192,11 +1248,89 @@ def test_validate_edit_context_ready_with_target_view(tmp_path) -> None:
     err = _validate_edit_context_ready(tmp_path, ctx_ok)
     assert err == ""
     
-    # 2. Validation fails when target_view is not in available_views
+    # 2. Stale/incomplete available_views should not block the editor; final
+    # validator owns target_view existence checks.
     ctx_bad = dict(ctx_ok)
     ctx_bad["target_view"] = "hallucinated_view"
     err = _validate_edit_context_ready(tmp_path, ctx_bad)
-    assert "not found in available_views" in err
+    assert err == ""
+
+
+@pytest.mark.asyncio
+async def test_code_edit_allows_unresolved_dependencies_and_uses_bounded_sql_fallback(tmp_path) -> None:
+    from src.skills.code_edit import CodeEditSkill
+
+    target = tmp_path / "main.py"
+    current_code = "def query():\n    return \"SELECT o.name AS order_name FROM orders o\"\n"
+    fallback_code = "def query():\n    return \"SELECT v.id AS order_name FROM view_ticket_report_detail v\"\n"
+    target.write_text(current_code, encoding="utf-8")
+
+    calls: list[str] = []
+
+    async def complete(messages: list[dict[str, object]]) -> str:
+        system = str(messages[0].get("content") or "")
+        calls.append(system)
+        if "SQL ReplacementBuilder" in system:
+            user = str(messages[1].get("content") or "")
+            assert "EDIT_CONTEXT_JSON" not in user
+            assert current_code in user
+            return json.dumps({"new_string": fallback_code})
+        return json.dumps({
+            "edits": [{
+                "target_index": 0,
+                "operation": "replace_sql_source",
+                "target_view": "view_ticket_report_detail",
+            }],
+            "confidence": 0.9,
+            "missing_info": [],
+        })
+
+    executor = SkillExecutor([CodeEditSkill(project_root=tmp_path, llm_complete=complete)])
+    edit_context = {
+        "schema": "mitkii.edit_context.v2",
+        "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
+        "dependencies_resolved": False,
+        "target_view": "view_ticket_report_detail",
+        "task_intent": {
+            "operation": "replace_dependency",
+            "target_symbol": "query",
+            "goal": "use target view",
+        },
+        "resolved_dependencies": [{
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": "view_ticket_report_detail",
+            "columns": ["id"],
+            "replaces_objects": ["orders"],
+        }],
+        "editable_targets": [{
+            "file": "main.py",
+            "start_line": 1,
+            "end_line": 2,
+            "current_code": current_code,
+            "intended_change": "use view_ticket_report_detail",
+            "acceptance_criteria": ["query uses view"],
+        }],
+        "intended_change": "use view_ticket_report_detail",
+        "acceptance_criteria": ["query uses view"],
+        "tool_policy": {
+            "allowed_tools": ["edit_file"],
+            "scope": ["main.py"],
+        },
+    }
+
+    result = await executor.run(
+        "code_edit",
+        SkillContext(user_request="replace query with view"),
+        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
+    )
+
+    assert result.success
+    assert any("SQL ReplacementBuilder" in call for call in calls)
+    written = target.read_text(encoding="utf-8")
+    assert "view_ticket_report_detail" in written
+    assert "orders" not in written
 
 
 def test_validate_sql_references_check(tmp_path) -> None:
@@ -1457,6 +1591,15 @@ def test_extract_all_search_terms_mapping() -> None:
     assert "order" in terms2
     assert "ticket" in terms2
     assert "passenger" in terms2
+
+
+def test_code_search_view_replacement_intent_is_explicit() -> None:
+    from src.skills.code_search import _is_sql_view_change
+
+    assert not _is_sql_view_change("重构订单详情查询并统一脱敏")
+    assert not _is_sql_view_change("fix SQL query fields")
+    assert _is_sql_view_change("使用 view_ticket_report_detail 视图替换订单详情查询")
+    assert _is_sql_view_change("replace query with view_ticket_report_detail view")
 
 
 def test_extract_target_view_from_contract() -> None:
@@ -2001,6 +2144,8 @@ def test_build_edit_context_includes_view_dependency_columns(tmp_path) -> None:
         }],
         intended_change="use view_ticket_report_detail view",
         project_root=tmp_path,
+        task_analysis={"edit_strategy": "sql_view_rewrite", "intent": "sql_view_rewrite"},
+        target_view="view_ticket_report_detail",
     )
 
     assert ctx is not None
@@ -2010,6 +2155,118 @@ def test_build_edit_context_includes_view_dependency_columns(tmp_path) -> None:
     assert dep["name"] == "view_ticket_report_detail"
     assert dep["columns"] == ["order_id", "passenger_name", "flight_no"]
     assert dep["replaces_objects"] == ["ticket_order", "passenger_info", "flight_info"]
+
+
+def test_hydrate_snippets_simplifies_long_sql_for_edit_context(tmp_path) -> None:
+    from src.skills.code_search import _hydrate_snippets
+
+    columns = ",\n        ".join(f"o.col_{idx} AS col_{idx}" for idx in range(60))
+    code = (
+        "def build_order_detail_sql(where_clause):\n"
+        "    return f\"\"\"\n"
+        f"    SELECT {columns}\n"
+        "    FROM ticket_order o\n"
+        "    JOIN passenger_info p ON p.p_id = o.p_id\n"
+        "    WHERE {where_clause}\n"
+        "    \"\"\"\n"
+    )
+    (tmp_path / "main.py").write_text(code, encoding="utf-8")
+
+    hydrated = _hydrate_snippets(
+        tmp_path,
+        "main.py:1:def build_order_detail_sql(where_clause):",
+        intended_change="使用 view_ticket_report_detail 视图替换 build_order_detail_sql",
+        task_analysis={"edit_strategy": "sql_view_rewrite", "intent": "sql_view_rewrite"},
+        target_view="view_ticket_report_detail",
+    )
+
+    assert hydrated.edit_context is not None
+    targets = hydrated.edit_context["editable_targets"]
+    assert isinstance(targets, list)
+    current_code = targets[0]["current_code"]
+    display_code = targets[0]["display_code"]
+    assert "COLUMN MAPPING" in display_code
+    assert "COLUMN MAPPING" not in current_code
+    assert "FROM ticket_order o" in display_code
+    assert "JOIN passenger_info p" in display_code
+    assert "col_59 AS col_59" not in display_code
+    assert "col_59 AS col_59" in current_code
+
+
+def test_build_edit_context_does_not_infer_view_for_function_refactor(tmp_path) -> None:
+    from src.skills.code_search import _build_edit_plan_context
+
+    (tmp_path / "schema.sql").write_text(
+        "CREATE VIEW view_ticket_report_detail AS SELECT order_id FROM ticket_order;\n",
+        encoding="utf-8",
+    )
+    ctx = _build_edit_plan_context(
+        [{
+            "file": "main.py",
+            "start_line": 1,
+            "end_line": 3,
+            "current_code": "def query():\n    return 'SELECT order_id FROM ticket_order'",
+        }],
+        intended_change="重构订单详情处理，复用 normalize_order_record 做脱敏",
+        project_root=tmp_path,
+        task_analysis={"edit_strategy": "function_refactor", "intent": "function_refactor"},
+    )
+
+    assert ctx is not None
+    assert ctx["edit_strategy"] == "function_refactor"
+    assert ctx["target_view"] == ""
+    assert ctx["resolved_dependencies"] == []
+
+
+def test_build_edit_context_resolves_target_view_from_task_analysis_and_patch_intent(tmp_path) -> None:
+    from src.skills.code_search import _build_edit_plan_context
+
+    (tmp_path / "schema.sql").write_text(
+        "CREATE VIEW view_ticket_report_detail AS SELECT order_id FROM ticket_order;\n",
+        encoding="utf-8",
+    )
+    # Check 1: task_analysis has target_view directly
+    ctx1 = _build_edit_plan_context(
+        [{
+            "file": "main.py",
+            "start_line": 1,
+            "end_line": 3,
+            "current_code": "def query():\n    return 'SELECT order_id FROM ticket_order'",
+        }],
+        intended_change="use view_ticket_report_detail view",
+        project_root=tmp_path,
+        task_analysis={
+            "edit_strategy": "sql_view_rewrite", 
+            "intent": "sql_view_rewrite",
+            "target_view": "view_ticket_report_detail"
+        },
+    )
+    assert ctx1 is not None
+    assert ctx1["dependencies_resolved"] is True
+    assert ctx1["target_view"] == "view_ticket_report_detail"
+
+    # Check 2: task_analysis has patch_intent with target_view
+    ctx2 = _build_edit_plan_context(
+        [{
+            "file": "main.py",
+            "start_line": 1,
+            "end_line": 3,
+            "current_code": "def query():\n    return 'SELECT order_id FROM ticket_order'",
+        }],
+        intended_change="use view_ticket_report_detail view",
+        project_root=tmp_path,
+        task_analysis={
+            "edit_strategy": "sql_view_rewrite", 
+            "intent": "sql_view_rewrite",
+            "patch_intent": {
+                "target_view": "view_ticket_report_detail"
+            }
+        },
+    )
+    assert ctx2 is not None
+    assert ctx2["dependencies_resolved"] is True
+    assert ctx2["target_view"] == "view_ticket_report_detail"
+
 
 
 def test_validator_sql_replacement_contract_checks_aliases_and_columns() -> None:
@@ -2065,6 +2322,7 @@ async def test_code_edit_skill_new_intent_schema(tmp_path) -> None:
     edit_context = {
         "schema": "mitkii.edit_context.v2",
         "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
         "task_intent": {
             "operation": "replace_dependency",
             "target_symbol": "query",
@@ -2207,6 +2465,7 @@ async def test_code_edit_skill_metadata_driven_join_elimination(tmp_path) -> Non
     edit_context = {
         "schema": "mitkii.edit_context.v2",
         "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
         "task_intent": {"operation": "replace_dependency", "goal": "use view"},
         "edit_targets": targets,
         "editable_targets": targets,
@@ -2324,6 +2583,7 @@ async def test_code_edit_skill_projection_rewrite_success(tmp_path) -> None:
     edit_context = {
         "schema": "mitkii.edit_context.v2",
         "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
         "task_intent": {"operation": "replace_dependency", "goal": "use view"},
         "edit_targets": targets,
         "editable_targets": targets,
@@ -2397,6 +2657,7 @@ async def test_code_edit_skill_projection_rewrite_failure(tmp_path) -> None:
     edit_context = {
         "schema": "mitkii.edit_context.v2",
         "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
         "task_intent": {"operation": "replace_dependency", "goal": "use view"},
         "edit_targets": targets,
         "editable_targets": targets,
@@ -2418,7 +2679,55 @@ async def test_code_edit_skill_projection_rewrite_failure(tmp_path) -> None:
         search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
     )
     assert not result.success
-    assert "column_mapping" in result.missing_info
+    assert "diagnose_strategy_mismatch" in result.missing_info
+
+
+@pytest.mark.asyncio
+async def test_code_edit_rejects_sql_operation_for_function_refactor_strategy(tmp_path) -> None:
+    import json
+    from src.skills.code_edit import CodeEditSkill
+
+    target = tmp_path / "main.py"
+    target.write_text("sql = 'SELECT * FROM orders'\n", encoding="utf-8")
+
+    async def complete(_messages: list[dict[str, object]]) -> str:
+        return json.dumps({
+            "edits": [{"target_index": 0, "operation": "replace_sql_source"}],
+            "confidence": 0.9,
+            "missing_info": [],
+        })
+
+    targets = [{
+        "file": "main.py",
+        "start_line": 1,
+        "end_line": 1,
+        "current_code": "sql = 'SELECT * FROM orders'",
+    }]
+    edit_context = {
+        "schema": "mitkii.edit_context.v2",
+        "code_edit_ready": True,
+        "edit_strategy": "function_refactor",
+        "task_intent": {"operation": "general_edit", "goal": "refactor"},
+        "edit_targets": targets,
+        "editable_targets": targets,
+        "constraints": ["Do not invent dependencies"],
+        "acceptance": [{"type": "compile_or_syntax_check"}],
+        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
+    }
+
+    executor = SkillExecutor([CodeEditSkill(project_root=tmp_path, llm_complete=complete)])
+    result = await executor.run(
+        "code_edit",
+        SkillContext(user_request="重构订单详情处理，统一脱敏"),
+        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
+        task_analysis={
+            "edit_strategy": "function_refactor",
+            "edit_ready": True,
+            "acceptance_contract": {"intent": "function_refactor"},
+        },
+    )
+    assert not result.success
+    assert "diagnose_strategy_mismatch" in result.missing_info
 
 
 @pytest.mark.asyncio
@@ -2467,3 +2776,351 @@ async def test_validator_skill_forbidden_aliases(tmp_path, monkeypatch) -> None:
     
     assert not result.success
     assert any("legacy alias 'p' is still referenced" in err for err in result.missing_info)
+
+
+@pytest.mark.asyncio
+async def test_validator_function_refactor_requires_unified_helper(tmp_path, monkeypatch) -> None:
+    from src.skills.validator import ValidatorSkill
+
+    old_code = (
+        "def query(row, other):\n"
+        "    row['passenger_id_no'] = row['passenger_id_no'][:3] + '***'\n"
+        "    other['passenger_id_no'] = other['passenger_id_no'][:3] + '***'\n"
+    )
+    new_code = (
+        "def query(row, other):\n"
+        "    row['passenger_id_no'] = row['passenger_id_no'][:3] + '***'\n"
+        "    other['passenger_id_no'] = other['passenger_id_no'][:3] + '***'\n"
+    )
+    target_file = tmp_path / "main.py"
+    target_file.write_text(new_code, encoding="utf-8")
+    monkeypatch.setattr("src.skills.validator.get_git_head_content", lambda root, rel: old_code)
+
+    executor = SkillExecutor([ValidatorSkill(project_root=tmp_path)])
+    result = await executor.run(
+        "validator",
+        SkillContext(user_request="重构订单详情处理，统一脱敏"),
+        changed_files=("main.py",),
+        task_analysis={"edit_strategy": "function_refactor", "intent": "function_refactor"},
+    )
+
+    assert not result.success
+    assert "expected unified helper" in result.summary
+
+
+def test_optimize_snippet_body_sql_columns() -> None:
+    from src.skills.code_search import _optimize_snippet_body
+    body = (
+        "10: def get_order_sql():\n"
+        "11:     return '''\n"
+        "12:         SELECT\n"
+        "13:             o.id AS order_id,\n"
+        "14:             o.order_no,\n"
+        "15:             o.passenger_id AS pass_id,\n"
+        "16:             o.status,\n"
+        "17:             o.amount\n"
+        "18:         FROM orders o\n"
+        "19:         WHERE o.id = 1\n"
+        "20:     '''"
+    )
+    optimized = _optimize_snippet_body(body, "main.py")
+    assert "COLUMN MAPPING" in optimized
+    assert "order_id" in optimized
+    assert "order_no" in optimized
+    assert "pass_id" in optimized
+    assert "status" in optimized
+    assert "amount" in optimized
+    assert "FROM orders o" in optimized
+    assert "WHERE o.id = 1" in optimized
+
+
+@pytest.mark.asyncio
+async def test_code_edit_sql_fallback_success(tmp_path) -> None:
+    from src.skills.code_edit import CodeEditSkill
+    import json
+
+    target = tmp_path / "main.py"
+    # Function signature: def query():
+    old_code = (
+        "def query():\n"
+        "    sql = \"\"\"\n"
+        "    SELECT o.id, p.name AS passenger_name\n"
+        "    FROM orders o\n"
+        "    JOIN passenger p ON p.id = o.p_id\n"
+        "    \"\"\"\n"
+        "    return sql\n"
+    )
+    target.write_text(old_code, encoding="utf-8")
+
+    # Mock llm_complete for two calls:
+    # 1. EditPlanBuilder (returns plan payload)
+    # 2. ReplacementBuilder (returns fallback string)
+    call_count = 0
+    async def complete(_messages: list[dict[str, object]]) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return json.dumps({
+                "edits": [{"target_index": 0, "operation": "replace_dependency", "target_view": "my_view"}],
+                "confidence": 0.9,
+                "missing_info": [],
+            })
+        else:
+            # Fallback output that passes compilation, signature unchanged, body changed, references my_view, and removes legacy refs
+            new_code = (
+                "def query():\n"
+                "    sql = \"\"\"\n"
+                "    SELECT v.id, v.passenger_name\n"
+                "    FROM my_view v\n"
+                "    \"\"\"\n"
+                "    return sql\n"
+            )
+            return json.dumps({"new_string": new_code})
+
+    edit_context = {
+        "schema": "mitkii.edit_context.v2",
+        "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
+        "task_intent": {"operation": "replace_dependency", "target_symbol": "query", "goal": "use my_view"},
+        "edit_targets": [{
+            "file": "main.py",
+            "symbol": "query",
+            "current_code": old_code,
+            "start_line": 1,
+            "end_line": 7,
+        }],
+        "editable_targets": [{
+            "file": "main.py",
+            "symbol": "query",
+            "current_code": old_code,
+            "start_line": 1,
+            "end_line": 7,
+        }],
+        "resolved_dependencies": [{
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": "my_view",
+            "replaces_objects": ["orders", "passenger"],
+            "columns": ["id"], # "passenger_name" is missing -> triggers ProjectionMappingError!
+        }],
+        "acceptance": [{"type": "compile_or_syntax_check"}],
+        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
+    }
+
+    executor = SkillExecutor([CodeEditSkill(project_root=tmp_path, llm_complete=complete)])
+    result = await executor.run(
+        "code_edit",
+        SkillContext(user_request="use my_view"),
+        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
+    )
+    assert result.success
+    assert call_count == 2
+    updated = target.read_text(encoding="utf-8")
+    assert "my_view v" in updated
+    assert "orders o" not in updated
+
+
+@pytest.mark.asyncio
+async def test_code_edit_sql_fallback_validation_failure(tmp_path) -> None:
+    from src.skills.code_edit import CodeEditSkill
+    import json
+
+    target = tmp_path / "main.py"
+    old_code = (
+        "def query():\n"
+        "    sql = \"\"\"\n"
+        "    SELECT o.id, p.name AS passenger_name\n"
+        "    FROM orders o\n"
+        "    JOIN passenger p ON p.id = o.p_id\n"
+        "    \"\"\"\n"
+        "    return sql\n"
+    )
+    target.write_text(old_code, encoding="utf-8")
+
+    call_count = 0
+    async def complete(_messages: list[dict[str, object]]) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return json.dumps({
+                "edits": [{"target_index": 0, "operation": "replace_dependency", "target_view": "my_view"}],
+                "confidence": 0.9,
+                "missing_info": [],
+            })
+        else:
+            # Fallback output that fails validation (references old alias p.)
+            new_code = (
+                "def query():\n"
+                "    sql = \"\"\"\n"
+                "    SELECT v.id, p.passenger_name\n"
+                "    FROM my_view v\n"
+                "    \"\"\"\n"
+                "    return sql\n"
+            )
+            return json.dumps({"new_string": new_code})
+
+    edit_context = {
+        "schema": "mitkii.edit_context.v2",
+        "code_edit_ready": True,
+        "edit_strategy": "sql_view_rewrite",
+        "task_intent": {"operation": "replace_dependency", "target_symbol": "query", "goal": "use my_view"},
+        "edit_targets": [{
+            "file": "main.py",
+            "symbol": "query",
+            "current_code": old_code,
+            "start_line": 1,
+            "end_line": 7,
+        }],
+        "editable_targets": [{
+            "file": "main.py",
+            "symbol": "query",
+            "current_code": old_code,
+            "start_line": 1,
+            "end_line": 7,
+        }],
+        "resolved_dependencies": [{
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": "my_view",
+            "replaces_objects": ["orders", "passenger"],
+            "columns": ["id"], # missing passenger_name -> ProjectionMappingError!
+        }],
+        "acceptance": [{"type": "compile_or_syntax_check"}],
+        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
+    }
+
+    executor = SkillExecutor([CodeEditSkill(project_root=tmp_path, llm_complete=complete)])
+    result = await executor.run(
+        "code_edit",
+        SkillContext(user_request="use my_view"),
+        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
+    )
+    assert not result.success
+    assert call_count == 2
+    assert "diagnose_strategy_mismatch" in result.missing_info
+    # Verify structured failure details
+    err_msg = result.metadata["raw_preview"]
+    assert "projection_mapping_failed" in err_msg
+    assert "llm_replacement_failed" in err_msg
+    assert "passenger_name" in err_msg # the missing column name from ProjectionMappingError
+
+
+@pytest.mark.asyncio
+async def test_code_edit_materializes_patch_intent_target_when_hydration_wrong_symbol(tmp_path) -> None:
+    from src.skills.code_edit import CodeEditSkill
+    import json
+
+    target = tmp_path / "main.py"
+    target.write_text(
+        "def admin_update_order():\n"
+        "    return 'wrong'\n\n"
+        "def build_order_detail_sql():\n"
+        "    return 'SELECT * FROM ticket_order'\n",
+        encoding="utf-8",
+    )
+
+    async def complete(messages: list[dict[str, object]]) -> str:
+        system = str(messages[0].get("content") or "")
+        if "ReplacementBuilder" in system:
+            return json.dumps({
+                "new_string": (
+                    "def build_order_detail_sql():\n"
+                    "    return 'SELECT * FROM view_ticket_report_detail'\n"
+                )
+            })
+        return json.dumps({
+            "edits": [{
+                "target_index": 0,
+            }],
+            "confidence": 0.9,
+            "missing_info": [],
+        })
+
+    edit_context = {
+        "schema": "mitkii.edit_context.v2",
+        "code_edit_ready": True,
+        "edit_strategy": "general_edit",
+        "patch_intent": {
+            "edit_ready": True,
+            "edit_strategy": "general_edit",
+            "edit_targets": [{
+                "file": "main.py",
+                "symbol": "build_order_detail_sql",
+            }],
+            "acceptance_criteria": ["build_order_detail_sql changed"],
+        },
+        "editable_targets": [{
+            "file": "main.py",
+            "symbol": "admin_update_order",
+            "start_line": 1,
+            "end_line": 2,
+            "current_code": "def admin_update_order():\n    return 'wrong'",
+            "intended_change": "change order detail SQL",
+            "acceptance_criteria": ["wrong hydration candidate"],
+        }],
+        "intended_change": "change order detail SQL",
+        "acceptance_criteria": ["build_order_detail_sql changed"],
+        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
+    }
+
+    executor = SkillExecutor([CodeEditSkill(project_root=tmp_path, llm_complete=complete)])
+    result = await executor.run(
+        "code_edit",
+        SkillContext(user_request="change build_order_detail_sql"),
+        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
+    )
+
+    assert result.success
+    updated = target.read_text(encoding="utf-8")
+    assert "def admin_update_order():\n    return 'wrong'" in updated
+    assert "view_ticket_report_detail" in updated
+
+
+@pytest.mark.asyncio
+async def test_validator_symbol_mismatch_requires_replan(tmp_path, monkeypatch) -> None:
+    from src.skills.validator import ValidatorSkill
+    import json
+
+    old_code = (
+        "def admin_update_order():\n"
+        "    return 'wrong'\n\n"
+        "def build_order_detail_sql():\n"
+        "    return 'old'\n"
+    )
+    new_code = (
+        "def admin_update_order():\n"
+        "    return 'changed'\n\n"
+        "def build_order_detail_sql():\n"
+        "    return 'old'\n"
+    )
+    (tmp_path / "main.py").write_text(new_code, encoding="utf-8")
+    monkeypatch.setattr("src.skills.validator.get_git_head_content", lambda root, rel: old_code)
+
+    edit_context = {
+        "schema": "mitkii.edit_context.v2",
+        "edit_strategy": "general_edit",
+        "editable_targets": [{
+            "file": "main.py",
+            "symbol": "build_order_detail_sql",
+            "start_line": 4,
+            "end_line": 5,
+            "current_code": "def build_order_detail_sql():\n    return 'old'",
+        }],
+        "patch_intent": {
+            "edit_targets": [{"file": "main.py", "symbol": "build_order_detail_sql"}],
+        },
+    }
+
+    executor = SkillExecutor([ValidatorSkill(project_root=tmp_path)])
+    result = await executor.run(
+        "validator",
+        SkillContext(user_request="change build_order_detail_sql"),
+        changed_files=("main.py",),
+        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
+        task_analysis={"edit_strategy": "general_edit", "intent": "general_edit"},
+    )
+
+    assert not result.success
+    assert result.requires_fallback
+    assert result.metadata["failure_code"] == "validator_context_mismatch"
+    assert "target_symbol_mismatch" in result.metadata["structured_errors"]

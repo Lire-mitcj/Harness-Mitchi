@@ -5,6 +5,7 @@ from enum import StrEnum
 
 class SubTaskKind(StrEnum):
     DIAGNOSE = "diagnose"
+    DESIGN = "design"
     EDIT = "edit"
     VERIFY = "verify"
     SHELL = "shell"

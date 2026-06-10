@@ -301,3 +301,201 @@ def test_exit_gate_blocks_llm_transport_error_summary() -> None:
         )
     )
     assert result.verdict == GateVerdict.BLOCK
+
+
+def test_exit_gate_blocks_diagnose_when_handoff_missing_required_fields() -> None:
+    node = SubTaskNode(
+        id="st-1",
+        description="diagnose query location",
+        kind=SubTaskKind.DIAGNOSE,
+        acceptance_criteria="Output HANDOFF_CONTRACT_JSON with must_modify evidence.",
+    )
+    result = validate_exit(
+        ExitCheckInput(
+            subtask=node,
+            final_message=(
+                "HANDOFF_CONTRACT_JSON\n"
+                "{\n"
+                '  "must_modify": [\n'
+                "    {\n"
+                '      "file": "main.py",\n'
+                '      "line": 10\n'
+                "    }\n"
+                "  ],\n"
+                '  "available_views": [],\n'
+                '  "evidence": []\n'
+                "}"
+            ),
+            error_trace=[],
+            changed_files=[],
+        )
+    )
+    assert result.verdict == GateVerdict.BLOCK
+    assert "HANDOFF_CONTRACT_JSON 'must_modify[0]' is missing required key(s)" in "; ".join(result.messages)
+
+
+def test_exit_gate_blocks_design_when_patch_intent_missing_required_fields() -> None:
+    node = SubTaskNode(
+        id="st-2",
+        description="produce design",
+        kind=SubTaskKind.DESIGN,
+        acceptance_criteria="Output PATCH_INTENT_JSON detailing strategy and targets.",
+    )
+    result = validate_exit(
+        ExitCheckInput(
+            subtask=node,
+            final_message=(
+                "PATCH_INTENT_JSON\n"
+                "{\n"
+                '  "edit_strategy": "sql_view_rewrite",\n'
+                '  "edit_ready": true,\n'
+                '  "edit_targets": [\n'
+                "    {\n"
+                '      "file": "main.py"\n'
+                "    }\n"
+                "  ],\n"
+                '  "dependencies": [],\n'
+                '  "acceptance_criteria": [],\n'
+                '  "target_view": "view_ticket_report_detail"\n'
+                "}"
+            ),
+            error_trace=[],
+            changed_files=[],
+        )
+    )
+    assert result.verdict == GateVerdict.BLOCK
+    assert "PATCH_INTENT_JSON 'edit_targets[0]' is missing required key(s)" in "; ".join(result.messages)
+
+
+def test_exit_gate_passes_diagnose_and_design_with_valid_handoff_and_patch_intent() -> None:
+    node_diag = SubTaskNode(
+        id="st-1",
+        description="diagnose query location",
+        kind=SubTaskKind.DIAGNOSE,
+        acceptance_criteria="Output HANDOFF_CONTRACT_JSON with must_modify evidence.",
+    )
+    res_diag = validate_exit(
+        ExitCheckInput(
+            subtask=node_diag,
+            final_message=(
+                "HANDOFF_CONTRACT_JSON\n"
+                "{\n"
+                '  "must_modify": [\n'
+                "    {\n"
+                '      "file": "main.py",\n'
+                '      "line": 10,\n'
+                '      "symbol_or_api": "query_func",\n'
+                '      "should_change_to": "use view"\n'
+                "    }\n"
+                "  ],\n"
+                '  "available_views": [],\n'
+                '  "evidence": []\n'
+                "}"
+            ),
+            error_trace=[],
+            changed_files=[],
+        )
+    )
+    assert res_diag.verdict == GateVerdict.PASS
+
+    node_design = SubTaskNode(
+        id="st-2",
+        description="produce design",
+        kind=SubTaskKind.DESIGN,
+        acceptance_criteria="Output PATCH_INTENT_JSON detailing strategy and targets.",
+    )
+    res_design = validate_exit(
+        ExitCheckInput(
+            subtask=node_design,
+            final_message=(
+                "PATCH_INTENT_JSON\n"
+                "{\n"
+                '  "edit_strategy": "sql_view_rewrite",\n'
+                '  "edit_targets": [\n'
+                "    {\n"
+                '      "file": "main.py",\n'
+                '      "symbol": "query_func",\n'
+                '      "line_start": 10,\n'
+                '      "line_end": 15,\n'
+                '      "snippet": "SELECT ...",\n'
+                '      "decision": "use view"\n'
+                "    }\n"
+                "  ],\n"
+                '  "edit_ready": true,\n'
+                '  "dependencies": [],\n'
+                '  "acceptance_criteria": ["test passes"],\n'
+                '  "target_view": "view_ticket_report_detail"\n'
+                "}"
+            ),
+            error_trace=[],
+            changed_files=[],
+        )
+    )
+    assert res_design.verdict == GateVerdict.PASS
+
+
+def test_exit_gate_passes_diagnose_with_trailing_content() -> None:
+    from src.harness.gates.exit_gate import validate_exit, ExitCheckInput
+    from src.harness.gates.types import GateVerdict
+    
+    node_diag = SubTaskNode(
+        id="st-1",
+        description="diagnose query location",
+        kind=SubTaskKind.DIAGNOSE,
+        acceptance_criteria="Output HANDOFF_CONTRACT_JSON with must_modify evidence.",
+    )
+    res_diag = validate_exit(
+        ExitCheckInput(
+            subtask=node_diag,
+            final_message=(
+                "HANDOFF_CONTRACT_JSON\n"
+                "{\n"
+                '  "must_modify": [\n'
+                "    {\n"
+                '      "file": "main.py",\n'
+                '      "line": 10,\n'
+                '      "symbol_or_api": "query_func",\n'
+                '      "should_change_to": "use view"\n'
+                "    }\n"
+                "  ],\n"
+                '  "available_views": [],\n'
+                '  "evidence": []\n'
+                "}\n"
+                "\n"
+                "Trailing notes or markdown comments with braces like {}."
+            ),
+            error_trace=[],
+            changed_files=[],
+        )
+    )
+    assert res_diag.verdict == GateVerdict.PASS
+
+
+def test_normalize_contract_keys_bidirectional_exit_gate() -> None:
+    from src.harness.gates.exit_gate import _normalize_contract_keys
+
+    contract_in = {
+        "must_modify": [
+            {
+                "file": "app.py",
+                "symbol_or_api": "query_method",
+                "line_start": 45,
+                "line_end": 55,
+                "snippet": "SELECT 1",
+                "decision": "use view_abc"
+            }
+        ],
+        "available_views": [
+            {
+                "name": "view_abc",
+                "columns": ["col1", "col2"]
+            }
+        ]
+    }
+    normalized = _normalize_contract_keys(contract_in)
+    assert "edit_targets" in normalized
+    assert normalized["edit_targets"][0]["symbol"] == "query_method"
+    assert "dependencies" in normalized
+    assert normalized["dependencies"][0]["name"] == "view_abc"
+    assert normalized["dependencies"][0]["columns"] == ["col1", "col2"]
+

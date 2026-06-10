@@ -165,6 +165,8 @@ def validate_exit(data: ExitCheckInput) -> GateResult:
             "revise the plan or search strategy before edit."
         )
     if kind == SubTaskKind.DIAGNOSE and message:
+        contract_errors = _validate_handoff_contract(message, data.subtask.acceptance_criteria)
+        blocks.extend(contract_errors)
         missing = diagnose_missing_required_outputs(
             data.subtask.acceptance_criteria,
             message,
@@ -176,6 +178,10 @@ def validate_exit(data: ExitCheckInput) -> GateResult:
                 + ", ".join(missing)
                 + "."
             )
+
+    if kind == SubTaskKind.DESIGN and message:
+        design_errors = _validate_patch_intent_json(message, data.subtask.acceptance_criteria)
+        blocks.extend(design_errors)
 
     if blocks:
         return GateResult.block("exit_gate", blocks, actions=["re_plan"])
@@ -243,3 +249,283 @@ def _message_acknowledges_failure(message: str) -> bool:
     lower = message.lower()
     hints = ("fail", "error", "block", "unable", "could not", "cannot", "issue")
     return any(h in lower for h in hints)
+
+
+def _validate_handoff_contract(message: str, criteria: str) -> list[str]:
+    import json
+    errors: list[str] = []
+    marker = "HANDOFF_CONTRACT_JSON"
+    
+    is_requested = "HANDOFF_CONTRACT" in criteria or "handoff" in criteria.lower()
+    is_present = marker in message
+    
+    if not is_present:
+        if is_requested:
+            errors.append("Diagnose step must output HANDOFF_CONTRACT_JSON block.")
+        return errors
+
+    payload = message.split(marker, 1)[1].strip()
+    start = payload.find("{")
+    if start < 0:
+        errors.append("Diagnose step output has an invalid HANDOFF_CONTRACT_JSON structure.")
+        return errors
+
+    depth = 0
+    end_idx = -1
+    for idx, ch in enumerate(payload[start:], start=start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end_idx = idx
+                break
+
+    if end_idx < start:
+        errors.append("Diagnose step output has an invalid/unclosed HANDOFF_CONTRACT_JSON structure.")
+        return errors
+
+    try:
+        contract = json.loads(payload[start : end_idx + 1])
+    except Exception as e:
+        errors.append(f"Failed to parse HANDOFF_CONTRACT_JSON: {e}")
+        return errors
+
+    if not isinstance(contract, dict):
+        errors.append("HANDOFF_CONTRACT_JSON must be a JSON object.")
+        return errors
+
+    contract = _normalize_contract_keys(contract)
+
+    required_contract_keys = ["must_modify", "available_views", "evidence"]
+    missing_contract_keys = [k for k in required_contract_keys if k not in contract]
+    if missing_contract_keys:
+        errors.append(
+            f"HANDOFF_CONTRACT_JSON is missing required key(s): {', '.join(missing_contract_keys)}."
+        )
+    else:
+        must_modify = contract.get("must_modify")
+        if not isinstance(must_modify, list):
+            errors.append("HANDOFF_CONTRACT_JSON 'must_modify' must be a list.")
+        else:
+            for idx, item in enumerate(must_modify):
+                if not isinstance(item, dict):
+                    errors.append(f"HANDOFF_CONTRACT_JSON 'must_modify[{idx}]' must be a dictionary.")
+                    continue
+                req_target_keys = ["file", "line", "symbol_or_api", "should_change_to"]
+                missing_tgt_keys = [k for k in req_target_keys if k not in item]
+                if missing_tgt_keys:
+                    errors.append(
+                        f"HANDOFF_CONTRACT_JSON 'must_modify[{idx}]' is missing required key(s): {', '.join(missing_tgt_keys)}."
+                    )
+    return errors
+
+
+def _validate_patch_intent_json(message: str, criteria: str) -> list[str]:
+    import json
+    errors: list[str] = []
+    marker = "PATCH_INTENT_JSON"
+    
+    is_requested = "PATCH_INTENT" in criteria or "design" in criteria.lower() or "patch" in criteria.lower()
+    is_present = marker in message
+    
+    if not is_present:
+        if is_requested:
+            errors.append("Design step must output PATCH_INTENT_JSON block.")
+        return errors
+
+    payload = message.split(marker, 1)[1].strip()
+    start = payload.find("{")
+    if start < 0:
+        errors.append("Design step output has an invalid PATCH_INTENT_JSON structure.")
+        return errors
+
+    depth = 0
+    end_idx = -1
+    for idx, ch in enumerate(payload[start:], start=start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end_idx = idx
+                break
+    
+    if end_idx < start:
+        errors.append("Design step output has an invalid/unclosed PATCH_INTENT_JSON structure.")
+        return errors
+
+    block = payload[start : end_idx + 1]
+    try:
+        patch_intent = json.loads(block)
+    except Exception as e:
+        errors.append(f"Failed to parse PATCH_INTENT_JSON: {e}")
+        return errors
+
+    if not isinstance(patch_intent, dict):
+        errors.append("PATCH_INTENT_JSON must be a JSON object.")
+        return errors
+
+    required_design_keys = [
+        "edit_ready",
+        "edit_strategy",
+        "edit_targets",
+        "dependencies",
+        "acceptance_criteria",
+        "target_view",
+    ]
+    missing_design_keys = [k for k in required_design_keys if k not in patch_intent]
+    if missing_design_keys:
+        errors.append(
+            f"PATCH_INTENT_JSON is missing required key(s): {', '.join(missing_design_keys)}."
+        )
+    else:
+        if patch_intent.get("edit_ready") is not True:
+            errors.append("PATCH_INTENT_JSON 'edit_ready' must be true.")
+        if not str(patch_intent.get("edit_strategy") or "").strip():
+            errors.append("PATCH_INTENT_JSON 'edit_strategy' must be a non-empty string.")
+        if (
+            str(patch_intent.get("edit_strategy") or "").strip() == "sql_view_rewrite"
+            and not str(patch_intent.get("target_view") or "").strip()
+        ):
+            errors.append("PATCH_INTENT_JSON 'target_view' must be a non-empty string.")
+        edit_targets = patch_intent.get("edit_targets")
+        if not isinstance(edit_targets, list):
+            errors.append("PATCH_INTENT_JSON 'edit_targets' must be a list.")
+        else:
+            for idx, item in enumerate(edit_targets):
+                if not isinstance(item, dict):
+                    errors.append(f"PATCH_INTENT_JSON 'edit_targets[{idx}]' must be a dictionary.")
+                    continue
+                req_target_keys = ["file", "symbol", "line_start", "line_end", "snippet", "decision"]
+                missing_tgt_keys = [k for k in req_target_keys if k not in item]
+                if missing_tgt_keys:
+                    errors.append(
+                        f"PATCH_INTENT_JSON 'edit_targets[{idx}]' is missing required key(s): {', '.join(missing_tgt_keys)}."
+                    )
+        
+        dependencies = patch_intent.get("dependencies")
+        if not isinstance(dependencies, list):
+            errors.append("PATCH_INTENT_JSON 'dependencies' must be a list.")
+        
+        acceptance_criteria = patch_intent.get("acceptance_criteria")
+        if not isinstance(acceptance_criteria, list):
+            errors.append("PATCH_INTENT_JSON 'acceptance_criteria' must be a list.")
+    return errors
+
+
+def _normalize_contract_keys(contract: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+    
+    # Map must_modify
+    if "edit_targets" in contract and "must_modify" not in contract:
+        contract["must_modify"] = contract["edit_targets"]
+    elif "targets" in contract and "must_modify" not in contract:
+        contract["must_modify"] = contract["targets"]
+        
+    # Map available_views
+    if "resolved_dependencies" in contract and "available_views" not in contract:
+        deps = contract["resolved_dependencies"]
+        if isinstance(deps, list):
+            views = []
+            for dep in deps:
+                if isinstance(dep, dict) and dep.get("kind") == "database_view":
+                    views.append({
+                        "name": dep.get("name") or "",
+                        "fields": dep.get("fields") or []
+                    })
+            contract["available_views"] = views
+    elif "dependencies" in contract and "available_views" not in contract:
+        deps = contract["dependencies"]
+        if isinstance(deps, list):
+            views = []
+            for dep in deps:
+                if isinstance(dep, dict) and dep.get("kind") == "database_view":
+                    views.append({
+                        "name": dep.get("name") or "",
+                        "fields": dep.get("fields") or []
+                    })
+            contract["available_views"] = views
+            
+    # Map evidence
+    if "facts" in contract and "evidence" not in contract:
+        contract["evidence"] = contract["facts"]
+        
+    # Map back must_modify to edit_targets / targets if missing
+    if "must_modify" in contract and ("edit_targets" not in contract or not contract["edit_targets"]):
+        mm = contract["must_modify"]
+        if isinstance(mm, list):
+            targets = []
+            for item in mm:
+                if isinstance(item, dict):
+                    line_val = item.get("line") or 0
+                    line_start = item.get("line_start") or line_val
+                    line_end = item.get("line_end") or line_val
+                    targets.append({
+                        "file": str(item.get("file") or "").strip() or "unknown",
+                        "symbol": str(item.get("symbol_or_api") or item.get("symbol") or "unknown").strip(),
+                        "line_start": int(line_start) if line_start is not None else 0,
+                        "line_end": int(line_end) if line_end is not None else 0,
+                        "snippet": str(item.get("snippet") or item.get("current_code") or "").strip(),
+                        "decision": str(item.get("decision") or item.get("should_change_to") or "").strip(),
+                    })
+            contract["edit_targets"] = targets
+            if "targets" not in contract or not contract["targets"]:
+                contract["targets"] = targets
+
+    # Map back available_views to dependencies / resolved_dependencies if missing
+    if "available_views" in contract and ("dependencies" not in contract or not contract["dependencies"]):
+        views = contract["available_views"]
+        if isinstance(views, list):
+            deps = []
+            for v in views:
+                if isinstance(v, dict):
+                    deps.append({
+                        "role": "replacement_source",
+                        "kind": "database_view",
+                        "name": v.get("name") or "",
+                        "file": v.get("file") or "",
+                        "line_start": v.get("line_start") or 0,
+                        "line_end": v.get("line_end") or 0,
+                        "columns": v.get("columns") or v.get("fields") or [],
+                        "fields": v.get("fields") or v.get("columns") or [],
+                        "replaces_objects": v.get("replaces_objects") or []
+                    })
+            contract["dependencies"] = deps
+            if "resolved_dependencies" not in contract or not contract["resolved_dependencies"]:
+                contract["resolved_dependencies"] = deps
+
+    for key in ("dependencies", "dependencies_to_use", "resolved_dependencies"):
+        deps = contract.get(key)
+        if isinstance(deps, list):
+            for dep in deps:
+                if isinstance(dep, dict) and dep.get("kind") == "database_view":
+                    if not dep.get("role"):
+                        dep["role"] = "replacement_source"
+
+    # Ensure all required keys exist
+    if "must_modify" not in contract:
+        contract["must_modify"] = []
+    if "available_views" not in contract:
+        contract["available_views"] = []
+    if "evidence" not in contract:
+        contract["evidence"] = []
+        
+    # Normalize must_modify items
+    must_modify = contract.get("must_modify")
+    if isinstance(must_modify, list):
+        for item in must_modify:
+            if isinstance(item, dict):
+                if "symbol" in item and "symbol_or_api" not in item:
+                    item["symbol_or_api"] = item["symbol"]
+                if "line_start" in item and "line" not in item:
+                    item["line"] = item["line_start"]
+                elif "line" not in item:
+                    item["line"] = 0
+                if "decision" in item and "should_change_to" not in item:
+                    item["should_change_to"] = item["decision"]
+                elif "should_change_to" not in item:
+                    item["should_change_to"] = "apply change"
+                    
+    return contract

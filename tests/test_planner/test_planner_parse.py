@@ -37,6 +37,73 @@ def test_normalize_fills_missing_depends_on() -> None:
     assert not errors
 
 
+def test_normalize_repairs_sequential_design_edit_verify_dependencies() -> None:
+    payload = {
+        "root_task": "x",
+        "nodes": [
+            {
+                "id": "st-1",
+                "kind": "diagnose",
+                "description": "locate target",
+                "acceptance_criteria": "handoff",
+                "allowed_tools": ["context_search"],
+                "context_files": [],
+            },
+            {
+                "id": "st-2",
+                "kind": "design",
+                "description": "design patch",
+                "acceptance_criteria": "PATCH_INTENT_JSON",
+                "allowed_tools": ["context_search"],
+                "context_files": [],
+            },
+            {
+                "id": "st-3",
+                "kind": "edit",
+                "description": "apply patch",
+                "acceptance_criteria": "patched",
+                "allowed_tools": ["edit_file"],
+                "context_files": ["main.py"],
+                "depends_on": ["st-1"],
+                "requires_handoff": ["PATCH_INTENT_JSON"],
+            },
+            {
+                "id": "st-4",
+                "kind": "verify",
+                "description": "verify",
+                "acceptance_criteria": "tests pass",
+                "allowed_tools": ["shell_exec"],
+                "context_files": [],
+                "depends_on": ["st-1"],
+            },
+        ],
+    }
+    normalized = normalize_planner_payload(payload)
+    assert normalized["nodes"][1]["depends_on"] == ["st-1"]
+    assert normalized["nodes"][2]["depends_on"] == ["st-1", "st-2"]
+    assert normalized["nodes"][3]["depends_on"] == ["st-1", "st-3"]
+
+
+def test_normalize_truncates_overlong_planner_fields_before_schema_validation() -> None:
+    payload = {
+        "root_task": "x",
+        "nodes": [{
+            "id": "st-1",
+            "kind": "diagnose",
+            "description": "d" * 200,
+            "acceptance_criteria": "a" * 200,
+            "allowed_tools": [],
+            "context_files": [],
+            "depends_on": [],
+        }],
+    }
+    normalized = normalize_planner_payload(payload)
+    assert len(normalized["nodes"][0]["description"]) <= 120
+    assert len(normalized["nodes"][0]["acceptance_criteria"]) <= 120
+    assert "context_search" in normalized["nodes"][0]["allowed_tools"]
+    assert not validate_planner_payload(normalized)
+
+
 def test_validate_payload_allows_edit_first() -> None:
     payload = {
         "root_task": "Add health endpoint",
@@ -47,6 +114,23 @@ def test_validate_payload_allows_edit_first() -> None:
             "acceptance_criteria": "GET /health returns 200",
             "allowed_tools": ["write_file", "edit_file"],
             "context_files": ["app/health.py"],
+            "depends_on": [],
+        }],
+    }
+    errors = validate_planner_payload(payload)
+    assert not errors
+
+
+def test_validate_payload_allows_design_kind() -> None:
+    payload = {
+        "root_task": "Refactor order detail",
+        "nodes": [{
+            "id": "st-1",
+            "kind": "design",
+            "description": "Design patch intent",
+            "acceptance_criteria": "PATCH_INTENT_JSON",
+            "allowed_tools": ["context_search"],
+            "context_files": [],
             "depends_on": [],
         }],
     }

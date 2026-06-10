@@ -8,7 +8,7 @@ from src.context.retriever import build_context_queries
 from src.skills.base import SkillContext, SkillResult
 from src.tools.registry import ToolRegistry
 
-_HYDRATION_VERSION = "edit_context_hydration_v4_view_dependency_columns"
+_HYDRATION_VERSION = "edit_context_hydration_v5_sql_simplified_edit_context"
 
 
 class CodeSearchSkill:
@@ -62,6 +62,7 @@ class CodeSearchSkill:
             search_output,
             intended_change=query,
             context=context,
+            **kwargs,
         )
         if hydrated.snippets:
             search_output = (
@@ -404,6 +405,132 @@ def _merge_ranges(ranges: list[tuple[int, int]], gap: int = 20, max_lines: int =
     return merged
 
 
+def _optimize_snippet_body(body: str, file_path: str) -> str:
+    try:
+        # If the file is not python or sql, do not optimize
+        ext = file_path.split(".")[-1].lower() if "." in file_path else ""
+        if ext not in ("py", "sql"):
+            return body
+
+        # Extract the raw lines
+        raw_lines = []
+        line_prefixes = []
+        for line in body.splitlines():
+            parts = line.split(": ", 1)
+            if len(parts) == 2 and parts[0].strip().isdigit():
+                line_prefixes.append(parts[0] + ": ")
+                raw_lines.append(parts[1])
+            else:
+                line_prefixes.append("")
+                raw_lines.append(line)
+                
+        raw_content = "\n".join(raw_lines)
+        
+        optimized_raw = _simplify_long_sql(raw_content)
+        if optimized_raw == raw_content:
+            return body
+        
+        optimized_lines = optimized_raw.splitlines()
+        new_lines = []
+        start_line = 1
+        for prefix in line_prefixes:
+            if prefix:
+                m = re.match(r"^(\d+): ", prefix)
+                if m:
+                    start_line = int(m.group(1))
+                    break
+                    
+        for i, line in enumerate(optimized_lines):
+            new_lines.append(f"{start_line + i}: {line}")
+            
+        return "\n".join(new_lines)
+    except Exception:
+        return body
+
+
+def _simplify_long_sql(text: str, *, min_projection_chars: int = 120) -> str:
+    """Compress large SQL projections while preserving FROM/JOIN and column mapping."""
+    match = re.search(r"(?is)\bSELECT\b(?P<columns>[\s\S]+?)\bFROM\b", text)
+    if not match:
+        return text
+
+    columns_part = match.group("columns")
+    if len(columns_part.strip()) < min_projection_chars and "\n" not in columns_part:
+        return text
+
+    columns = _extract_projection_column_names(columns_part)
+    if not columns:
+        return text
+
+    indent_match = re.search(r"(?m)^(?P<indent>\s*)SELECT\b", text[match.start():])
+    indent = indent_match.group("indent") if indent_match else "    "
+    comment_indent = indent + "  "
+    mapping = (
+        f"\n{comment_indent}/* COLUMN MAPPING (Total {len(columns)} columns):\n"
+        f"{comment_indent}   "
+        + ", ".join(columns[:30])
+    )
+    if len(columns) > 30:
+        mapping += f" ... (+{len(columns) - 30} more)"
+    mapping += f"\n{comment_indent}*/\n{indent}"
+
+    from_index = match.end() - len("FROM")
+    return text[:match.start()] + "SELECT" + mapping + text[from_index:]
+
+
+def _extract_projection_column_names(columns_part: str) -> list[str]:
+    columns: list[str] = []
+    for col in _split_sql_projection(columns_part):
+        col = col.strip()
+        if not col:
+            continue
+        as_match = re.search(r"\bAS\s+([a-zA-Z0-9_\"'`\[\]]+)", col, re.I)
+        if as_match:
+            columns.append(_clean_sql_identifier(as_match.group(1)))
+            continue
+        parts = re.findall(r"\b[a-zA-Z0-9_.]+\b", col)
+        if parts:
+            columns.append(_clean_sql_identifier(parts[-1]))
+    return [col for col in dict.fromkeys(columns) if col]
+
+
+def _split_sql_projection(columns_part: str) -> list[str]:
+    out: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    for idx, ch in enumerate(columns_part):
+        if quote:
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in {"'", '"', "`"}:
+            quote = ch
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")" and depth > 0:
+            depth -= 1
+            continue
+        if ch == "," and depth == 0:
+            out.append(columns_part[start:idx])
+            start = idx + 1
+    out.append(columns_part[start:])
+    return out
+
+
+def _edit_context_code_for_target(current_code: str, display: str, edit_strategy: str) -> str:
+    if edit_strategy != "sql_view_rewrite":
+        return current_code
+    simplified = _simplify_long_sql(current_code)
+    if simplified != current_code:
+        return simplified
+    if len(current_code) <= 6_000:
+        return current_code
+    return current_code[:6_000] + "\n# ... omitted after SQL context budget\n"
+
+
 def _hydrate_snippets(
     project_root: Path,
     search_output: str,
@@ -416,6 +543,12 @@ def _hydrate_snippets(
     **kwargs: object,
 ) -> _HydratedSearch:
     """Read bounded snippets around repo_map/grep hits; never expose raw full-file IO."""
+    task_analysis = kwargs.get("task_analysis")
+    analysis_strategy = ""
+    if isinstance(task_analysis, dict):
+        analysis_strategy = str(
+            task_analysis.get("edit_strategy") or task_analysis.get("intent") or ""
+        ).strip()
     if context is not None and context.context_pack is not None:
         budget_chars = context.context_pack.budget.get("snippet_chars")
         if budget_chars:
@@ -513,16 +646,31 @@ def _hydrate_snippets(
             failures.append(f"{display}:{target_start}-{target_end}: empty target code")
             continue
         if path.suffix in {".py", ".ts", ".tsx", ".js", ".jsx", ".sql"}:
-            if _is_editable_target(target_code, display, intended_change, context):
+            if _is_editable_target(
+                target_code,
+                display,
+                intended_change,
+                context,
+                edit_strategy=analysis_strategy,
+                task_analysis=task_analysis,
+            ):
+                edit_context_code = _edit_context_code_for_target(
+                    target_code,
+                    display,
+                    analysis_strategy,
+                )
                 editable_targets.append({
                     "file": display,
                     "start_line": target_start,
                     "end_line": target_end,
                     "current_code": target_code,
+                    "display_code": edit_context_code,
+                    "full_range_line_count": target_end - target_start + 1,
+                    "hydration_simplified": edit_context_code != target_code,
                     "intended_change": intended_change,
                     "acceptance_criteria": ["Target behavior is changed as requested."],
                 })
-            elif _is_sql_view_change(intended_change):
+            elif analysis_strategy == "sql_view_rewrite":
                 failures.append(
                     f"{display}:{target_start}-{target_end}: not editable for "
                     "SQL/view query change; no SELECT/FROM/JOIN table reference"
@@ -537,6 +685,7 @@ def _hydrate_snippets(
             f"{line_no}: {lines[line_no - 1]}"
             for line_no in range(s, e + 1)
         )
+        body = _optimize_snippet_body(body, display)
         chunk = f'<snippet path="{display}" lines="{s}-{e}">\n{body}\n</snippet>'
         if used_chars + len(chunk) <= max_chars:
             snippets.append(chunk)
@@ -546,6 +695,7 @@ def _hydrate_snippets(
                 f"{line_no}: {lines[line_no - 1]}"
                 for line_no in range(start, end + 1)
             )
+            core_body = _optimize_snippet_body(core_body, display)
             core_chunk = (
                 f'<snippet path="{display}" lines="{start}-{end}" status="truncated_to_core">\n'
                 f"# Padding lines omitted due to token budget limits. Use read_file/view_file to view context.\n"
@@ -750,6 +900,7 @@ def _infer_target_view(
     
     best_view = ""
     best_score = -1
+    intended_lower = intended_change.lower()
     for view in views:
         view_tokens = set(tokenize(view))
         score = 0
@@ -763,22 +914,29 @@ def _infer_target_view(
                     score += 2
         
         view_lower = view.lower()
-        if "登机牌" in intended_change or "boarding" in intended_change.lower():
-            if "boarding" in view_lower or "ticket" in view_lower:
-                score += 20
-        if "订单" in intended_change or "order" in intended_change.lower():
-            if "order" in view_lower:
-                score += 20
-        if "机票" in intended_change or "ticket" in intended_change.lower():
-            if "ticket" in view_lower or "passenger" in view_lower:
-                score += 20
+        if view_lower in intended_lower:
+            score += 100
+            
+        # Enhanced matching with Chinese/pinyin/English combinations
+        groups = [
+            ({"登机牌", "boarding", "dengjipai", "dengji", "pass"}, {"boarding", "pass", "ticket", "dengji", "dengjipai"}),
+            ({"订单", "order", "dingdan"}, {"order", "report", "detail", "dingdan"}),
+            ({"机票", "ticket", "jipiao"}, {"ticket", "report", "detail", "jipiao", "passenger"}),
+            ({"监控", "monitor", "flight", "jiankong"}, {"monitor", "flight", "jiankong", "load"}),
+            ({"详情", "detail", "xiangqing"}, {"detail", "xiangqing"}),
+            ({"报告", "report", "baogao"}, {"report", "baogao"}),
+        ]
+        for query_set, view_set in groups:
+            if any(q_term in intended_lower for q_term in query_set):
+                if any(v_term in view_lower for v_term in view_set):
+                    score += 20
 
         if score > best_score:
             best_score = score
             best_view = view
             
-    if best_score <= 0:
-        if len(views) == 1:
+    if best_score <= 0 or not best_view:
+        if views:
             return views[0]
         return ""
     return best_view
@@ -804,21 +962,44 @@ def _build_edit_plan_context(
     if not views:
         views = _extract_views_from_text(intended_change)
     
+    task_analysis = kwargs.get("task_analysis")
+    analysis_strategy = ""
+    if isinstance(task_analysis, dict):
+        analysis_strategy = str(
+            task_analysis.get("edit_strategy") or task_analysis.get("intent") or ""
+        ).strip()
+
     target_view = ""
-    if context is not None:
-        if context.context_pack is not None:
-            target_view = context.context_pack.metadata.get("target_view") or ""
+    is_view = analysis_strategy == "sql_view_rewrite"
+    if is_view:
+        if context is not None:
+            if context.context_pack is not None:
+                target_view = context.context_pack.metadata.get("target_view") or ""
+            if not target_view:
+                target_view = context.metadata.get("target_view") or ""
         if not target_view:
-            target_view = context.metadata.get("target_view") or ""
-    if not target_view:
-        target_view = str(kwargs.get("target_view") or "").strip()
-    if not target_view:
-        target_view = _infer_target_view(intended_change, views, editable_targets)
+            target_view = str(kwargs.get("target_view") or "").strip()
+        if not target_view and isinstance(task_analysis, dict):
+            target_view = str(task_analysis.get("target_view") or "").strip()
+            if not target_view:
+                patch_intent = task_analysis.get("patch_intent")
+                if isinstance(patch_intent, dict):
+                    target_view = str(patch_intent.get("target_view") or "").strip()
+        if not target_view:
+            patch_intent_json = _extract_patch_intent_json(context, **kwargs)
+            if isinstance(patch_intent_json, dict):
+                target_view = str(patch_intent_json.get("target_view") or "").strip()
+        if not target_view and isinstance(task_analysis, dict):
+            resolved_deps = task_analysis.get("resolved_dependencies") or []
+            for dep in resolved_deps:
+                if isinstance(dep, dict) and dep.get("role") == "replacement_source":
+                    target_view = str(dep.get("name") or "").strip()
+                    break
         
     target_symbols = _extract_symbols(intended_change)
     target_symbol = target_symbols[0] if target_symbols else "目标代码"
     
-    is_view = "视图" in intended_change or "view" in intended_change.lower() or "sql" in intended_change.lower()
+    edit_strategy = analysis_strategy or "general_edit"
     operation = "replace_dependency" if is_view else "general_edit"
     
     replaces = []
@@ -828,7 +1009,7 @@ def _build_edit_plan_context(
     replaces = list(dict.fromkeys(replaces))
     
     resolved_deps = []
-    if target_view:
+    if is_view and target_view:
         detail = view_details.get(target_view.lower()) or view_details.get(target_view.split(".")[-1].lower())
         dep_replaces = replaces
         columns: list[str] = []
@@ -856,6 +1037,8 @@ def _build_edit_plan_context(
             "file": str(target.get("file") or ""),
             "symbol": str(target.get("symbol") or target.get("name") or target_symbol),
             "current_code": str(target.get("current_code") or ""),
+            "display_code": str(target.get("display_code") or target.get("current_code") or ""),
+            "hydration_simplified": bool(target.get("hydration_simplified")),
             "start_line": target.get("start_line"),
             "end_line": target.get("end_line")
         })
@@ -864,6 +1047,9 @@ def _build_edit_plan_context(
         "schema": "mitkii.edit_context.v2",
         "builder": "EditPlanBuilder",
         "code_edit_ready": True,
+        "edit_strategy": edit_strategy,
+        "dependencies_resolved": bool(resolved_deps) if is_view else True,
+        "dependencies_resolution_source": "search_hydration_advisory",
         "task_intent": {
             "operation": operation,
             "target_symbol": target_symbol,
@@ -873,7 +1059,7 @@ def _build_edit_plan_context(
         "resolved_dependencies": resolved_deps,
         "constraints": [
             "Do not invent dependencies",
-            "Only use resolved_dependencies",
+            "Prefer resolved_dependencies when present; fallback may use target_view and available columns",
             "Preserve public function signature",
             "Preserve returned field names used by callers",
             "For SQL replacement, rebuild SELECT from replacement_source.columns and remove only replaces_objects JOINs"
@@ -1045,80 +1231,198 @@ def _extract_all_search_terms(query: str) -> list[str]:
     return list(dict.fromkeys(terms))
 
 
+def _extract_patch_intent_json(context: SkillContext | None, **kwargs: object) -> dict[str, Any] | None:
+    # 1. Check kwargs evidence / search_output
+    for key in ("evidence", "search_output"):
+        val = kwargs.get(key)
+        if isinstance(val, str) and "PATCH_INTENT_JSON" in val:
+            parsed = _parse_intent_from_str(val)
+            if parsed:
+                return parsed
+        elif isinstance(val, dict) and "edit_targets" in val:
+            return val
+
+    # 2. Check context properties
+    if context is not None:
+        if context.context_pack is not None:
+            for item in context.context_pack.evidence or []:
+                if isinstance(item, dict):
+                    p_json = item.get("patch_intent_json")
+                    if isinstance(p_json, str):
+                        try:
+                            return json.loads(p_json)
+                        except Exception:
+                            pass
+                    for k, v in item.items():
+                        if isinstance(v, str) and "PATCH_INTENT_JSON" in v:
+                            parsed = _parse_intent_from_str(v)
+                            if parsed:
+                                return parsed
+                                
+        metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict):
+            p_json = metadata.get("patch_intent_json")
+            if isinstance(p_json, str):
+                try:
+                    return json.loads(p_json)
+                except Exception:
+                    pass
+            for k, v in metadata.items():
+                if isinstance(v, str) and "PATCH_INTENT_JSON" in v:
+                    parsed = _parse_intent_from_str(v)
+                    if parsed:
+                        return parsed
+                    
+    return None
+
+
+def _parse_intent_from_str(text: str) -> dict[str, Any] | None:
+    idx = text.find("PATCH_INTENT_JSON")
+    if idx == -1:
+        return None
+    sub = text[idx + len("PATCH_INTENT_JSON") :].strip()
+    start = sub.find("{")
+    end = sub.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(sub[start : end + 1])
+        except Exception:
+            pass
+    return None
+
+
 def _is_editable_target(
     current_code: str,
     display_file: str,
     intended_change: str,
     context: SkillContext | None,
+    *,
+    edit_strategy: str = "",
+    task_analysis: dict[str, object] | None = None,
 ) -> bool:
-    user_symbols = _extract_all_search_terms(intended_change)
+    target_symbols = set()
+    patch_intent = _extract_patch_intent_json(context)
+    if isinstance(patch_intent, dict):
+        edit_targets = patch_intent.get("edit_targets") or []
+        for t in edit_targets:
+            if isinstance(t, dict) and t.get("symbol"):
+                target_symbols.add(str(t["symbol"]))
+
+    if isinstance(task_analysis, dict):
+        for t in task_analysis.get("editable_targets") or []:
+            if isinstance(t, dict) and t.get("symbol"):
+                target_symbols.add(str(t["symbol"]))
+    if context is not None:
+        if context.patch_plan is not None:
+            for sym in context.patch_plan.target_symbols:
+                target_symbols.add(sym)
+            for edit in context.patch_plan.edits:
+                if edit.symbol:
+                    target_symbols.add(edit.symbol)
+        if context.context_pack is not None:
+            for s_info in context.context_pack.candidate_symbols:
+                s_name = str(s_info.get("name") or "")
+                if s_name:
+                    target_symbols.add(s_name)
+
+    if not target_symbols:
+        for sym in _extract_all_search_terms(intended_change):
+            target_symbols.add(sym)
+
     symbol_matched = False
-    for sym in user_symbols:
+    for sym in target_symbols:
         if re.search(rf"(?:\b|_){re.escape(sym)}(?:\b|_)", current_code, re.IGNORECASE):
             symbol_matched = True
             break
-            
-    handoff_matched = False
+
+    if not symbol_matched:
+        try:
+            root_path = Path.cwd()
+            if context and getattr(context, "project_root", None):
+                root_path = Path(context.project_root)
+            file_path = root_path / display_file
+            if file_path.is_file():
+                file_content = file_path.read_text(encoding="utf-8", errors="replace")
+                for sym in target_symbols:
+                    if re.search(rf"(?:\b|_){re.escape(sym)}(?:\b|_)", file_content, re.IGNORECASE):
+                        symbol_matched = True
+                        break
+        except Exception:
+            pass
+
+    if not symbol_matched:
+        return False
+
+    target_files = set()
+    if isinstance(patch_intent, dict):
+        edit_targets = patch_intent.get("edit_targets") or []
+        for t in edit_targets:
+            if isinstance(t, dict) and t.get("file"):
+                target_files.add(str(t["file"]).replace("\\", "/"))
+
+    if isinstance(task_analysis, dict):
+        for t in task_analysis.get("editable_targets") or []:
+            if isinstance(t, dict) and t.get("file"):
+                target_files.add(str(t["file"]).replace("\\", "/"))
     if context is not None:
         if context.patch_plan is not None:
-            plan = context.patch_plan
-            for plan_file in plan.files_to_edit:
-                if display_file == plan_file or display_file.endswith("/" + plan_file) or plan_file.endswith("/" + display_file):
-                    handoff_matched = True
-                    break
-            if not handoff_matched:
-                for plan_sym in plan.target_symbols:
-                    if re.search(rf"(?:\b|_){re.escape(plan_sym)}(?:\b|_)", current_code, re.IGNORECASE):
-                        handoff_matched = True
-                        break
-            if not handoff_matched:
-                for edit in plan.edits:
-                    if edit.path and (display_file == edit.path or display_file.endswith("/" + edit.path) or edit.path.endswith("/" + display_file)):
-                        handoff_matched = True
-                        break
-                    if edit.symbol and re.search(rf"(?:\b|_){re.escape(edit.symbol)}(?:\b|_)", current_code, re.IGNORECASE):
-                        handoff_matched = True
-                        break
-                        
+            for plan_file in context.patch_plan.files_to_edit:
+                target_files.add(plan_file.replace("\\", "/"))
         if context.context_pack is not None:
             for f_info in context.context_pack.candidate_files:
                 f_path = str(f_info.get("file") or "")
-                if display_file == f_path or display_file.endswith("/" + f_path) or f_path.endswith("/" + display_file):
-                    handoff_matched = True
-                    break
-            if not handoff_matched:
-                for s_info in context.context_pack.candidate_symbols:
-                    s_name = str(s_info.get("name") or "")
-                    if re.search(rf"(?:\b|_){re.escape(s_name)}(?:\b|_)", current_code, re.IGNORECASE):
-                        handoff_matched = True
-                        break
-            if not handoff_matched:
-                for r_path in context.context_pack.relevant_files:
-                    if display_file == r_path or display_file.endswith("/" + r_path) or r_path.endswith("/" + display_file):
-                        handoff_matched = True
-                        break
-                        
-    has_sql = bool(re.search(r"(?is)\bSELECT\b.{0,200}\bFROM\b|\b(?:FROM|JOIN)\s+[`\"]?[A-Za-z_][A-Za-z0-9_]*", current_code))
-    is_sql_change = _is_sql_view_change(intended_change)
-    
+                if f_path:
+                    target_files.add(f_path.replace("\\", "/"))
+            for r_path in context.context_pack.relevant_files:
+                target_files.add(r_path.replace("\\", "/"))
+
+    file_matched = False
+    if target_files:
+        clean_display = display_file.replace("\\", "/")
+        for tf in target_files:
+            if clean_display == tf or clean_display.endswith("/" + tf) or tf.endswith("/" + clean_display):
+                file_matched = True
+                break
+    else:
+        file_matched = True
+
+    if not file_matched:
+        return False
+
+    has_sql = False
+    lowered_code = current_code.lower()
+    if re.search(r"(?is)\bSELECT\b.*\bFROM\b", current_code):
+        has_sql = True
+    elif re.search(r"(?is)\b(?:FROM|JOIN)\s+[`\"]?[A-Za-z_][A-Za-z0-9_]*", current_code):
+        has_sql = True
+    elif any(kw in lowered_code for kw in ("select", "from", "join", "view")):
+        has_sql = True
+    elif any(term in lowered_code for term in ("sql", "query", "database", "table")):
+        has_sql = True
+    is_sql_change = edit_strategy == "sql_view_rewrite"
+
     if display_file.endswith(".sql"):
-        return has_sql and (symbol_matched or handoff_matched or is_sql_change)
-        
+        return has_sql or bool(re.search(r"(?is)\b(SELECT|FROM|JOIN|VIEW)\b", current_code))
+
     if is_sql_change:
-        return (symbol_matched or handoff_matched) and has_sql
-        
-    return symbol_matched or handoff_matched
+        has_sql_terms = bool(re.search(
+            r"(?is)\b(SELECT|FROM|JOIN|VIEW|SQL|QUERY|DB|schema|database|table)\b",
+            current_code + " " + display_file
+        ))
+        symbol_has_sql = any("sql" in sym.lower() or "query" in sym.lower() or "db" in sym.lower() or "view" in sym.lower() for sym in target_symbols)
+        return has_sql or has_sql_terms or symbol_has_sql
+
+    return True
 
 
 def _is_sql_view_change(text: str) -> bool:
     lowered = text.lower()
-    return (
-        "视图" in text
-        or "查询" in text
-        or "sql" in lowered
-        or "query" in lowered
-        or "view" in lowered
-    )
+    has_view = "视图" in text or "view" in lowered
+    has_replace = any(
+        marker in lowered
+        for marker in ("replace", "use", "switch", "using")
+    ) or any(marker in text for marker in ("替换", "使用", "改成", "改为", "用已有视图", "用现有视图"))
+    return has_view and has_replace
 
 
 def _resolve_hit_path(

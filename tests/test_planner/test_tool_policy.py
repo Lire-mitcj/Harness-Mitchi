@@ -22,6 +22,8 @@ def test_default_tools_by_kind() -> None:
     shell = default_allowed_tools(SubTaskKind.SHELL)
     assert "shell_exec" in shell
     assert "write_file" not in shell
+    design = default_allowed_tools(SubTaskKind.DESIGN)
+    assert design == ["context_search"]
 
 
 def test_normalize_rejects_out_of_kind_tools() -> None:
