@@ -56,6 +56,7 @@ from src.planner.planner_node import (
     parse_planner_output,
 )
 from src.planner.scout_skip import apply_scout_discovery_to_plan
+from src.planner.strategy import batch_parallelizable, ready_execution_batches
 from src.planner.task_tree import SubTaskNode, SubTaskStatus, TaskTree
 from src.skills import (
     CodeEditSkill,
@@ -354,7 +355,54 @@ class OrchestratorLoop:
         yield plan_update_event(task_tree)
 
         while task_tree.has_pending():
-            node = task_tree.first_pending()
+            ready_batches = ready_execution_batches(task_tree)
+            if not ready_batches:
+                yield error_event(
+                    "No ready subtask in TaskTree; dependencies may be blocked.",
+                    {"phase": "orchestrator"},
+                )
+                break
+            if len(ready_batches[0]) > 1:
+                parallelizable = batch_parallelizable(ready_batches[0])
+                yield AgentEvent(
+                    type=EventType.STATUS,
+                    content=(
+                        "DAG frontier ready: "
+                        + ", ".join(node.id for node in ready_batches[0])
+                    ),
+                    data={
+                        "phase": "dag_frontier",
+                        "ready": [node.id for node in ready_batches[0]],
+                        "batch_count": len(ready_batches),
+                        "parallelizable": parallelizable,
+                    },
+                )
+                if parallelizable and all(
+                    node.kind == SubTaskKind.DIAGNOSE for node in ready_batches[0]
+                ):
+                    handled, parallel_events = await self._run_parallel_diagnose_batch(
+                        task_tree=task_tree,
+                        nodes=ready_batches[0],
+                        repo_map=repo_map,
+                    )
+                    for event in parallel_events:
+                        yield event
+                    if handled:
+                        continue
+                if parallelizable and all(
+                    node.kind == SubTaskKind.VERIFY for node in ready_batches[0]
+                ):
+                    handled, parallel_events = await self._run_parallel_verify_batch(
+                        user_msg=user_msg,
+                        task_tree=task_tree,
+                        nodes=ready_batches[0],
+                        repo_map=repo_map,
+                    )
+                    for event in parallel_events:
+                        yield event
+                    if handled:
+                        continue
+            node = ready_batches[0][0]
             assert node is not None
             subtask_context_pack = await self._context_pack_for_subtask(
                 task_tree=task_tree,
@@ -1026,6 +1074,411 @@ class OrchestratorLoop:
                 "skill_executor": True,
             },
         )
+
+    async def _run_parallel_diagnose_batch(
+        self,
+        *,
+        task_tree: TaskTree,
+        nodes: list[SubTaskNode],
+        repo_map: Any | None,
+    ) -> tuple[bool, list[AgentEvent]]:
+        """Run a ready diagnose frontier concurrently when all preflight checks pass."""
+        events: list[AgentEvent] = [
+            AgentEvent(
+                type=EventType.STATUS,
+                content=(
+                    "DAG parallel diagnose: "
+                    + ", ".join(node.id for node in nodes)
+                ),
+                data={
+                    "phase": "dag_parallel",
+                    "kind": "diagnose",
+                    "subtask_ids": [node.id for node in nodes],
+                },
+            )
+        ]
+        prepared: list[tuple[SubTaskNode, Any | None]] = []
+        pm = self.harness.phase_metrics
+        for node in nodes:
+            context_pack = await self._context_pack_for_subtask(
+                task_tree=task_tree,
+                node=node,
+            )
+            _apply_context_pack_to_subtask(node, context_pack)
+            if context_pack is not None:
+                events.append(
+                    AgentEvent(
+                        type=EventType.STATUS,
+                        content=(
+                            f"ContextBuilder [{node.id}]: "
+                            f"confidence={context_pack.confidence:.2f}, "
+                            f"files={len(context_pack.relevant_files)}, "
+                            f"snippets={len(context_pack.focused_snippets or context_pack.snippets)}"
+                        ),
+                        data={
+                            "phase": "context_builder",
+                            "subtask_id": node.id,
+                            "confidence": context_pack.confidence,
+                            "files": list(context_pack.relevant_files),
+                            "missing_info": list(context_pack.missing_info),
+                        },
+                    )
+                )
+            preflight = assess_preflight(
+                subtask=node,
+                task_tree=task_tree,
+                project_root=self.harness.project_root,
+                settings=self.settings,
+                repo_map=repo_map,
+            )
+            pm.start("preflight", subtask_id=node.id)
+            pm.end(
+                "preflight",
+                subtask_id=node.id,
+                verdict=preflight.verdict.value,
+                metadata={
+                    "estimated_tokens": preflight.estimated_tokens,
+                    "budget_tokens": preflight.budget_tokens,
+                    "tier": preflight.policy.tier,
+                    "parallel_batch": True,
+                },
+            )
+            if preflight.verdict == GateVerdict.WARN and preflight.messages:
+                events.append(
+                    AgentEvent(
+                        type=EventType.STATUS,
+                        content="Preflight: " + "; ".join(preflight.messages),
+                        data={"subtask_id": node.id, "preflight": preflight.verdict.value},
+                    )
+                )
+            if not preflight.passed:
+                events.append(
+                    AgentEvent(
+                        type=EventType.STATUS,
+                        content=(
+                            f"DAG parallel diagnose skipped: preflight block for [{node.id}]"
+                        ),
+                        data={
+                            "phase": "dag_parallel",
+                            "subtask_id": node.id,
+                            "fallback": "serial",
+                        },
+                    )
+                )
+                return False, events
+            prepared.append((node, context_pack))
+
+        for node, _ in prepared:
+            task_tree.mark_running(node.id)
+            events.append(
+                AgentEvent(
+                    type=EventType.STATUS,
+                    content=node.description,
+                    data={
+                        "milestone": "subtask_start",
+                        "subtask_id": node.id,
+                        "kind": node.kind.value,
+                        "description": node.description,
+                        "parallel_batch": True,
+                    },
+                )
+            )
+            pm.start("executor", subtask_id=node.id)
+
+        results = await asyncio.gather(
+            *[
+                self._collect_diagnose_events(task_tree, node, context_pack)
+                for node, context_pack in prepared
+            ]
+        )
+        if any(not result[1].get("success") for result in results):
+            for node, _ in prepared:
+                if node.status == SubTaskStatus.RUNNING:
+                    node.status = SubTaskStatus.PENDING
+            for collected, result in results:
+                events.extend(collected)
+                if result:
+                    pm.end(
+                        "executor",
+                        subtask_id=str(result.get("subtask_id") or ""),
+                        verdict="SUCCESS" if result.get("success") else "FAIL",
+                        metadata={"turns_used": result.get("turns_used"), "parallel_batch": True},
+                    )
+            events.append(
+                AgentEvent(
+                    type=EventType.STATUS,
+                    content="DAG parallel diagnose failed; falling back to serial handling.",
+                    data={"phase": "dag_parallel", "fallback": "serial"},
+                )
+            )
+            return False, events
+
+        for collected, result in results:
+            events.extend(collected)
+            node = task_tree.get(str(result.get("subtask_id")))
+            if node is None:
+                continue
+            pm.end(
+                "executor",
+                subtask_id=node.id,
+                verdict="SUCCESS",
+                metadata={"turns_used": result.get("turns_used"), "parallel_batch": True},
+            )
+            self._sync_repo_map_after_exec(node, result)
+            commit_subtask_success(
+                task_tree=task_tree,
+                node=node,
+                exec_result=result,
+                project_root=self.harness.project_root,
+                subtask_summaries=self.state.subtask_summaries,
+                subtask_attempts=self.state.subtask_attempts,
+                subtask_exploration_digests=self.state.subtask_exploration_digests,
+            )
+            cp_id = await self._save_subtask_checkpoint(node.id, task_tree)
+            node.checkpoint_id = cp_id
+            task_tree.mark_success(node.id, checkpoint_id=cp_id)
+            events.append(
+                AgentEvent(
+                    type=EventType.STATUS,
+                    content=f"Subtask [{node.id}] SUCCESS",
+                    data={
+                        "milestone": "subtask_done",
+                        "subtask_id": node.id,
+                        "kind": node.kind.value,
+                        "checkpoint_id": cp_id,
+                        "parallel_batch": True,
+                    },
+                )
+            )
+        return True, events
+
+    async def _collect_diagnose_events(
+        self,
+        task_tree: TaskTree,
+        node: SubTaskNode,
+        context_pack: Any | None,
+    ) -> tuple[list[AgentEvent], dict[str, Any]]:
+        events: list[AgentEvent] = []
+        exec_result: dict[str, Any] = {
+            "subtask_id": node.id,
+            "success": False,
+            "error_trace": ["diagnose finished without stream result"],
+        }
+        async for event in self._run_diagnose_skill_executor(
+            task_tree=task_tree,
+            node=node,
+            context_pack=context_pack,
+        ):
+            if event.type == EventType.STREAM_END and event.data:
+                data = event.data
+                if "success" in data or data.get("failure_code"):
+                    exec_result = dict(data)
+            events.append(event)
+        return events, exec_result
+
+    async def _run_parallel_verify_batch(
+        self,
+        *,
+        user_msg: str,
+        task_tree: TaskTree,
+        nodes: list[SubTaskNode],
+        repo_map: Any | None,
+    ) -> tuple[bool, list[AgentEvent]]:
+        """Run a ready verify frontier concurrently when all preflight checks pass."""
+        events: list[AgentEvent] = [
+            AgentEvent(
+                type=EventType.STATUS,
+                content=(
+                    "DAG parallel verify: "
+                    + ", ".join(node.id for node in nodes)
+                ),
+                data={
+                    "phase": "dag_parallel",
+                    "kind": "verify",
+                    "subtask_ids": [node.id for node in nodes],
+                },
+            )
+        ]
+        prepared: list[tuple[SubTaskNode, Any | None]] = []
+        pm = self.harness.phase_metrics
+        for node in nodes:
+            context_pack = await self._context_pack_for_subtask(
+                task_tree=task_tree,
+                node=node,
+            )
+            _apply_context_pack_to_subtask(node, context_pack)
+            if context_pack is not None:
+                events.append(
+                    AgentEvent(
+                        type=EventType.STATUS,
+                        content=(
+                            f"ContextBuilder [{node.id}]: "
+                            f"confidence={context_pack.confidence:.2f}, "
+                            f"files={len(context_pack.relevant_files)}, "
+                            f"snippets={len(context_pack.focused_snippets or context_pack.snippets)}"
+                        ),
+                        data={
+                            "phase": "context_builder",
+                            "subtask_id": node.id,
+                            "confidence": context_pack.confidence,
+                            "files": list(context_pack.relevant_files),
+                            "missing_info": list(context_pack.missing_info),
+                        },
+                    )
+                )
+            preflight = assess_preflight(
+                subtask=node,
+                task_tree=task_tree,
+                project_root=self.harness.project_root,
+                settings=self.settings,
+                repo_map=repo_map,
+            )
+            pm.start("preflight", subtask_id=node.id)
+            pm.end(
+                "preflight",
+                subtask_id=node.id,
+                verdict=preflight.verdict.value,
+                metadata={
+                    "estimated_tokens": preflight.estimated_tokens,
+                    "budget_tokens": preflight.budget_tokens,
+                    "tier": preflight.policy.tier,
+                    "parallel_batch": True,
+                },
+            )
+            if preflight.verdict == GateVerdict.WARN and preflight.messages:
+                events.append(
+                    AgentEvent(
+                        type=EventType.STATUS,
+                        content="Preflight: " + "; ".join(preflight.messages),
+                        data={"subtask_id": node.id, "preflight": preflight.verdict.value},
+                    )
+                )
+            if not preflight.passed:
+                events.append(
+                    AgentEvent(
+                        type=EventType.STATUS,
+                        content=(
+                            f"DAG parallel verify skipped: preflight block for [{node.id}]"
+                        ),
+                        data={
+                            "phase": "dag_parallel",
+                            "subtask_id": node.id,
+                            "fallback": "serial",
+                        },
+                    )
+                )
+                return False, events
+            prepared.append((node, context_pack))
+
+        for node, _ in prepared:
+            task_tree.mark_running(node.id)
+            events.append(
+                AgentEvent(
+                    type=EventType.STATUS,
+                    content=node.description,
+                    data={
+                        "milestone": "subtask_start",
+                        "subtask_id": node.id,
+                        "kind": node.kind.value,
+                        "description": node.description,
+                        "parallel_batch": True,
+                    },
+                )
+            )
+            pm.start("executor", subtask_id=node.id)
+
+        results = await asyncio.gather(
+            *[
+                self._collect_verify_events(user_msg, task_tree, node, context_pack)
+                for node, context_pack in prepared
+            ]
+        )
+        if any(not result[1].get("success") for result in results):
+            for node, _ in prepared:
+                if node.status == SubTaskStatus.RUNNING:
+                    node.status = SubTaskStatus.PENDING
+            for collected, result in results:
+                events.extend(collected)
+                if result:
+                    pm.end(
+                        "executor",
+                        subtask_id=str(result.get("subtask_id") or ""),
+                        verdict="SUCCESS" if result.get("success") else "FAIL",
+                        metadata={"turns_used": result.get("turns_used"), "parallel_batch": True},
+                    )
+            events.append(
+                AgentEvent(
+                    type=EventType.STATUS,
+                    content="DAG parallel verify failed; falling back to serial handling.",
+                    data={"phase": "dag_parallel", "fallback": "serial"},
+                )
+            )
+            return False, events
+
+        for collected, result in results:
+            events.extend(collected)
+            node = task_tree.get(str(result.get("subtask_id")))
+            if node is None:
+                continue
+            pm.end(
+                "executor",
+                subtask_id=node.id,
+                verdict="SUCCESS",
+                metadata={"turns_used": result.get("turns_used"), "parallel_batch": True},
+            )
+            self._sync_repo_map_after_exec(node, result)
+            commit_subtask_success(
+                task_tree=task_tree,
+                node=node,
+                exec_result=result,
+                project_root=self.harness.project_root,
+                subtask_summaries=self.state.subtask_summaries,
+                subtask_attempts=self.state.subtask_attempts,
+                subtask_exploration_digests=self.state.subtask_exploration_digests,
+            )
+            cp_id = await self._save_subtask_checkpoint(node.id, task_tree)
+            node.checkpoint_id = cp_id
+            task_tree.mark_success(node.id, checkpoint_id=cp_id)
+            events.append(
+                AgentEvent(
+                    type=EventType.STATUS,
+                    content=f"Subtask [{node.id}] SUCCESS",
+                    data={
+                        "milestone": "subtask_done",
+                        "subtask_id": node.id,
+                        "kind": node.kind.value,
+                        "checkpoint_id": cp_id,
+                        "parallel_batch": True,
+                    },
+                )
+            )
+        return True, events
+
+    async def _collect_verify_events(
+        self,
+        user_msg: str,
+        task_tree: TaskTree,
+        node: SubTaskNode,
+        context_pack: Any | None,
+    ) -> tuple[list[AgentEvent], dict[str, Any]]:
+        events: list[AgentEvent] = []
+        exec_result: dict[str, Any] = {
+            "subtask_id": node.id,
+            "success": False,
+            "error_trace": ["verify finished without stream result"],
+        }
+        async for event in self._run_verify_skill_executor(
+            user_msg=user_msg,
+            task_tree=task_tree,
+            node=node,
+            context_pack=context_pack,
+        ):
+            if event.type == EventType.STREAM_END and event.data:
+                data = event.data
+                if "success" in data or data.get("failure_code"):
+                    exec_result = dict(data)
+            events.append(event)
+        return events, exec_result
 
     async def _run_edit_skill_executor(
         self,

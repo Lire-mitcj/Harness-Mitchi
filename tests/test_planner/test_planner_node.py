@@ -53,7 +53,7 @@ _BUG_FIX_SAMPLE = (
 def test_planner_output_instruction_no_trace() -> None:
     msg = planner_output_instruction(require_trace=False)
     assert "ONE raw TaskTree JSON" in msg
-    assert "8 fields" in msg
+    assert "base fields" in msg
 
 
 def test_planner_output_instruction_with_trace() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 
+from src.planner.kinds import SubTaskKind
 from src.planner.task_tree import SubTaskNode, SubTaskStatus, TaskTree
 
 
@@ -38,3 +39,51 @@ def ready_pending_nodes(tree: TaskTree) -> list[SubTaskNode]:
         if all(dep in completed for dep in node.depends_on):
             ready.append(node)
     return ready
+
+
+def ready_execution_batches(tree: TaskTree) -> list[list[SubTaskNode]]:
+    """Group ready pending nodes into deterministic batches with no write conflicts.
+
+    The Orchestrator can execute a batch sequentially today or parallelize it later.
+    Edit nodes that share a write scope are split into later batches unless the
+    plan already serialized them through depends_on.
+    """
+    batches: list[list[SubTaskNode]] = []
+    for node in ready_pending_nodes(tree):
+        for batch in batches:
+            if not any(_write_conflict(node, existing) for existing in batch):
+                batch.append(node)
+                break
+        else:
+            batches.append([node])
+    return batches
+
+
+def batch_parallelizable(batch: list[SubTaskNode]) -> bool:
+    """Return True for batches that can run concurrently without write semantics."""
+    if len(batch) <= 1:
+        return False
+    return all(node.kind in {SubTaskKind.DIAGNOSE, SubTaskKind.VERIFY} for node in batch)
+
+
+def next_ready_node(tree: TaskTree) -> SubTaskNode | None:
+    """Return the first node from the current ready execution frontier."""
+    batches = ready_execution_batches(tree)
+    return batches[0][0] if batches and batches[0] else None
+
+
+def _write_conflict(left: SubTaskNode, right: SubTaskNode) -> bool:
+    if left.kind != SubTaskKind.EDIT or right.kind != SubTaskKind.EDIT:
+        return False
+    left_scope = _write_scope(left)
+    right_scope = _write_scope(right)
+    return bool(left_scope and right_scope and left_scope & right_scope)
+
+
+def _write_scope(node: SubTaskNode) -> frozenset[str]:
+    paths: set[str] = set()
+    for raw in [*node.context_files, *node.write_scope]:
+        rel = raw.replace("\\", "/").strip().lstrip("./")
+        if rel:
+            paths.add(rel)
+    return frozenset(paths)

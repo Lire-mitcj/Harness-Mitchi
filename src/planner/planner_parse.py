@@ -16,6 +16,11 @@ _REQUIRED_NODE_FIELDS = (
     "context_files",
     "depends_on",
 )
+_OPTIONAL_LIST_NODE_FIELDS = (
+    "requires_artifacts",
+    "produces_artifacts",
+    "write_scope",
+)
 _VALID_KINDS = frozenset(k.value for k in SubTaskKind)
 
 
@@ -73,6 +78,9 @@ def normalize_planner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             node["context_files"] = []
         if not isinstance(node.get("allowed_tools"), list):
             node["allowed_tools"] = []
+        for field_name in _OPTIONAL_LIST_NODE_FIELDS:
+            if not isinstance(node.get(field_name), list):
+                node[field_name] = []
 
         crit = node.get("acceptance_criteria")
         if not isinstance(crit, str) or not crit.strip():
@@ -140,7 +148,7 @@ def validate_planner_payload(payload: dict[str, Any]) -> list[str]:
                 if not isinstance(tool, str):
                     errors.append(f"{label} allowed_tools must contain strings only.")
                     break
-        for list_field in ("context_files", "depends_on"):
+        for list_field in ("context_files", "depends_on", *_OPTIONAL_LIST_NODE_FIELDS):
             val = item.get(list_field)
             if val is not None and not isinstance(val, list):
                 errors.append(f"{label} {list_field} must be an array.")
@@ -192,6 +200,13 @@ def build_task_tree_from_payload(
                 needs_l1=needs_l1 if isinstance(needs_l1, bool) else None,
                 context_files=[str(p) for p in item.get("context_files") or []],
                 depends_on=[str(d) for d in item.get("depends_on") or []],
+                requires_artifacts=[
+                    str(a) for a in item.get("requires_artifacts") or []
+                ],
+                produces_artifacts=[
+                    str(a) for a in item.get("produces_artifacts") or []
+                ],
+                write_scope=[str(p) for p in item.get("write_scope") or []],
                 status=SubTaskStatus(str(item.get("status", SubTaskStatus.PENDING))),
                 checkpoint_id=item.get("checkpoint_id"),
             )

@@ -93,6 +93,69 @@ def test_plan_gate_allows_edit_first_subtask(tmp_path: Path) -> None:
     assert result.verdict in {GateVerdict.PASS, GateVerdict.WARN}
 
 
+def test_plan_gate_blocks_unserialized_edit_write_conflict(tmp_path: Path) -> None:
+    f = tmp_path / "app.py"
+    f.write_text("x = 1\n")
+    tree = TaskTree(
+        root_task="update two behaviors",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.EDIT,
+                description="Update route behavior",
+                context_files=["app.py"],
+                allowed_tools=["edit_file"],
+                acceptance_criteria="route behavior updated",
+            ),
+            SubTaskNode(
+                id="st-2",
+                kind=SubTaskKind.EDIT,
+                description="Update report behavior",
+                write_scope=["app.py"],
+                allowed_tools=["edit_file"],
+                acceptance_criteria="report behavior updated",
+            ),
+        ],
+    )
+
+    result = validate_plan(tree, tmp_path)
+
+    assert result.verdict == GateVerdict.BLOCK
+    assert any("without a dependency" in msg for msg in result.messages)
+
+
+def test_plan_gate_allows_serialized_edit_write_conflict(tmp_path: Path) -> None:
+    f = tmp_path / "app.py"
+    f.write_text("x = 1\n")
+    tree = TaskTree(
+        root_task="update two behaviors",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                kind=SubTaskKind.EDIT,
+                description="Update route behavior",
+                context_files=["app.py"],
+                allowed_tools=["edit_file"],
+                acceptance_criteria="route behavior updated",
+            ),
+            SubTaskNode(
+                id="st-2",
+                kind=SubTaskKind.EDIT,
+                description="Update report behavior",
+                write_scope=["app.py"],
+                allowed_tools=["edit_file"],
+                acceptance_criteria="report behavior updated",
+                depends_on=["st-1"],
+            ),
+        ],
+    )
+
+    result = validate_plan(tree, tmp_path)
+
+    assert result.verdict in {GateVerdict.PASS, GateVerdict.WARN}
+    assert not any("without a dependency" in msg for msg in result.messages)
+
+
 def test_preflight_green_small_task(tmp_path: Path) -> None:
     (tmp_path / "small.py").write_text("print('hi')\n")
     settings = MitKIISettings(
@@ -197,7 +260,7 @@ def test_plan_gate_allows_replan_with_wider_context(tmp_path: Path) -> None:
     assert result.verdict in {GateVerdict.PASS, GateVerdict.WARN}
 
 
-def test_plan_gate_blocks_low_value_read_then_edit(tmp_path: Path) -> None:
+def test_plan_gate_warns_low_value_read_then_edit(tmp_path: Path) -> None:
     f = tmp_path / "app.py"
     f.write_text("x = 1\n")
     tree = TaskTree(
@@ -225,11 +288,11 @@ def test_plan_gate_blocks_low_value_read_then_edit(tmp_path: Path) -> None:
 
     result = validate_plan(tree, tmp_path)
 
-    assert result.verdict == GateVerdict.BLOCK
+    assert result.verdict == GateVerdict.WARN
     assert any("low-value read/search/analyze" in msg for msg in result.messages)
 
 
-def test_plan_gate_blocks_diagnose_to_edit_without_handoff_output(tmp_path: Path) -> None:
+def test_plan_gate_warns_diagnose_to_edit_without_handoff_output(tmp_path: Path) -> None:
     f = tmp_path / "app.py"
     f.write_text("x = 1\n")
     tree = TaskTree(
@@ -256,7 +319,7 @@ def test_plan_gate_blocks_diagnose_to_edit_without_handoff_output(tmp_path: Path
 
     result = validate_plan(tree, tmp_path)
 
-    assert result.verdict == GateVerdict.BLOCK
+    assert result.verdict == GateVerdict.WARN
     assert any("file:line, symbol, and snippet/decision" in msg for msg in result.messages)
 
 

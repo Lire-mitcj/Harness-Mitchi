@@ -150,19 +150,25 @@ def validate_exit(data: ExitCheckInput) -> GateResult:
     if data.error_trace and kind == SubTaskKind.EDIT and not data.changed_files:
         blocks.append("Unresolved tool errors and no successful file edits.")
 
+    if kind == SubTaskKind.DIAGNOSE and _message_has_transport_failure(message):
+        blocks.append(
+            "Diagnose summary reports an LLM/tool transport failure; retry before "
+            "using it as evidence."
+        )
+
     if (
         kind == SubTaskKind.DIAGNOSE
         and structured is not None
         and structured.acceptance_met is False
     ):
-        blocks.append(
-            "Diagnose summary indicates acceptance_criteria was not met — "
-            "revise the plan or search strategy before edit."
+        warns.append(
+            "Diagnose summary indicates acceptance_criteria was not met; treating "
+            "output as partial evidence for downstream verification."
         )
     elif kind == SubTaskKind.DIAGNOSE and message and diagnose_acceptance_unmet(message):
-        blocks.append(
-            "Diagnose summary indicates acceptance_criteria was not met — "
-            "revise the plan or search strategy before edit."
+        warns.append(
+            "Diagnose summary indicates acceptance_criteria was not met; treating "
+            "output as partial evidence for downstream verification."
         )
     if kind == SubTaskKind.DIAGNOSE and message:
         missing = diagnose_missing_required_outputs(
@@ -171,7 +177,7 @@ def validate_exit(data: ExitCheckInput) -> GateResult:
             final_data=structured.raw if structured is not None else data.final_data,
         )
         if missing:
-            blocks.append(
+            warns.append(
                 "Diagnose summary is missing required handoff evidence: "
                 + ", ".join(missing)
                 + "."
@@ -189,6 +195,20 @@ def validate_exit(data: ExitCheckInput) -> GateResult:
 def diagnose_acceptance_unmet(message: str) -> bool:
     lower = message.lower()
     return any(phrase in lower for phrase in _ACCEPTANCE_FAILURE_PHRASES)
+
+
+def _message_has_transport_failure(message: str) -> bool:
+    lower = message.lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "llm_call failed",
+            "midstreamfallbackerror",
+            "apiconnectionerror",
+            "llm request timed out",
+            "litellm.",
+        )
+    )
 
 
 def diagnose_missing_required_outputs(

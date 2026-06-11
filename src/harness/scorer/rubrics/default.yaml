@@ -1,7 +1,7 @@
 # MitKII Default Rubric — L1 LLM Judge Red-Line Table
 # Each rubric is a binary pass/fail check with required evidence.
 # severity: blocker → any fail causes needs_retry=True
-# severity: warning → logged but does not block
+# severity: warning → logged as L2 advice; never triggers auto-rewrite by itself
 
 rubrics:
   # ── Task Completion ──

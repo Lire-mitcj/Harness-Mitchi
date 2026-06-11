@@ -4,7 +4,11 @@ import json
 
 from src.planner.patch_plan_parse import parse_patch_plan_output
 from src.planner.planner_node import _parse_task_tree, parse_planner_output
-from src.planner.planner_parse import normalize_planner_payload, validate_planner_payload
+from src.planner.planner_parse import (
+    build_task_tree_from_payload,
+    normalize_planner_payload,
+    validate_planner_payload,
+)
 from src.planner.task_tree import SubTaskKind
 
 
@@ -52,6 +56,33 @@ def test_validate_payload_allows_edit_first() -> None:
     }
     errors = validate_planner_payload(payload)
     assert not errors
+
+
+def test_parser_preserves_artifact_and_write_scope_fields() -> None:
+    payload = {
+        "root_task": "Switch report SQL to view",
+        "nodes": [{
+            "id": "st-1",
+            "kind": "edit",
+            "description": "Rewrite report SQL",
+            "acceptance_criteria": "report uses view",
+            "allowed_tools": ["context_search", "edit_file"],
+            "context_files": [],
+            "depends_on": [],
+            "requires_artifacts": ["database_view"],
+            "produces_artifacts": ["patch_intent"],
+            "write_scope": ["app/report.py"],
+        }],
+    }
+
+    normalized = normalize_planner_payload(payload)
+    errors = validate_planner_payload(normalized)
+    tree = build_task_tree_from_payload(normalized, fallback_task="fallback")
+
+    assert not errors
+    assert tree.nodes[0].requires_artifacts == ["database_view"]
+    assert tree.nodes[0].produces_artifacts == ["patch_intent"]
+    assert tree.nodes[0].write_scope == ["app/report.py"]
 
 
 def test_parse_planner_output_no_silent_ok_on_bad_json() -> None:

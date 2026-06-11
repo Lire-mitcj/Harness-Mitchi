@@ -101,14 +101,23 @@ async def evaluate_quality_gate(
         tests = score_result.scores.get("tests", {})
         rubric = score_result.scores.get("rubric", {})
         l0_passed = bool(lint.get("passed", True)) and bool(tests.get("passed", True))
-        l1_passed = skip_l1 or (
-            (not isinstance(rubric, dict)) or rubric.get("verdict", "pass") == "pass"
-        )
+        blockers = rubric.get("blockers", []) if isinstance(rubric, dict) else []
+        l1_passed = skip_l1 or not blockers
         l2_warning_only = (
             bool(score_result.warnings) and score_result.passed and not score_result.needs_retry
         )
-        auto_rewrite = (not l0_passed) or (not l1_passed) or bool(score_result.needs_retry)
-        blockers = rubric.get("blockers", []) if isinstance(rubric, dict) else []
+        retry_reasons = list(getattr(score_result, "retry_reasons", []) or [])
+        if not retry_reasons and score_result.needs_retry:
+            if not l0_passed:
+                retry_reasons.append("L0")
+            if blockers:
+                retry_reasons.append("L1")
+        rewrite_reasons = [
+            reason
+            for reason in retry_reasons
+            if str(reason).upper() in {"L0", "L1", "SCOPE", "SAFETY"}
+        ]
+        auto_rewrite = (not l0_passed) or bool(blockers) or bool(rewrite_reasons)
         checks: list[dict[str, Any]] = []
         for name, data in score_result.scores.items():
             message = data.get("details", "") if isinstance(data, dict) else ""
@@ -131,6 +140,8 @@ async def evaluate_quality_gate(
             "l1_passed": l1_passed,
             "l2_warning_only": l2_warning_only,
             "auto_rewrite": auto_rewrite,
+            "retry_reasons": retry_reasons,
+            "rewrite_reasons": rewrite_reasons,
             "checks": checks,
             "blockers": blockers,
             "blocker_count": len(blockers),

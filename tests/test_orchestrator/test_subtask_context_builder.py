@@ -7,8 +7,9 @@ from src.orchestrator.orchestrator import (
     _previous_handoff_from_summaries,
     _subtask_context_request,
 )
+from src.harness.subtask.prompt_builder import build_executor_handoff_json
 from src.planner.kinds import SubTaskKind
-from src.planner.task_tree import SubTaskNode
+from src.planner.task_tree import SubTaskNode, TaskTree
 
 
 def test_context_pack_applies_only_to_current_subtask() -> None:
@@ -67,6 +68,36 @@ def test_subtask_context_request_contains_subtask_contract() -> None:
     assert "Acceptance:" in text
     assert "Context files: main.py" in text
     assert "Depends on: st-1" in text
+
+
+def test_executor_handoff_includes_artifacts_and_write_scope(tmp_path) -> None:
+    node = SubTaskNode(
+        id="st-2",
+        kind=SubTaskKind.EDIT,
+        description="rewrite query",
+        acceptance_criteria="query uses view",
+        context_files=["app/report.py"],
+        depends_on=["st-1"],
+        requires_artifacts=["database_view"],
+        produces_artifacts=["patch_intent"],
+        write_scope=["app/report.py"],
+    )
+    tree = TaskTree(root_task="switch view", nodes=[node])
+
+    handoff = build_executor_handoff_json(
+        root_task=tree.root_task,
+        task_tree=tree,
+        subtask=node,
+        project_root=tmp_path,
+        runtime_tools=frozenset({"context_search", "edit_file"}),
+        context_files=node.context_files,
+        prior_summaries={},
+    )
+
+    assert handoff["subtask"]["requires_artifacts"] == ["database_view"]
+    assert handoff["subtask"]["produces_artifacts"] == ["patch_intent"]
+    assert handoff["subtask"]["write_scope"] == ["app/report.py"]
+    assert handoff["context_scope"]["write_scope"] == ["app/report.py"]
 
 
 def test_previous_handoff_from_summaries_extracts_json_evidence() -> None:

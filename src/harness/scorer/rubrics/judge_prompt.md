@@ -28,9 +28,14 @@ For **every** rubric entry, independently determine `passed: true` or `passed: f
    set the top-level `verdict` to `"fail"`.
 4. **Do not duplicate L0** — if a rubric's concern (lint errors, test failures) was already
    covered by programmatic L0 checks, assume it passed unless you see strong semantic evidence otherwise.
-5. **Strict on missing evidence** — if you cannot find evidence to support a `passed: true` claim,
+5. **Do not enforce planning hints** — missing Harness artifacts, diagnose dependencies, target views,
+   or prior handoff fields are not blockers by themselves. Fail only when the user request,
+   acceptance criteria, diff, or tests prove the goal is incomplete or regressed.
+6. **Warning severity is advisory** — failed warning rubrics go in `warnings` and must not make
+   top-level `verdict` fail unless a blocker rubric also failed.
+7. **Strict on missing evidence** — if you cannot find evidence to support a `passed: true` claim,
    default to `passed: false`.
-6. **No free-form commentary** — output ONLY the JSON object below. No preamble, no markdown fences.
+8. **No free-form commentary** — output ONLY the JSON object below. No preamble, no markdown fences.
 
 ## Output Schema
 

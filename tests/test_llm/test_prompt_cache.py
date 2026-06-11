@@ -150,6 +150,55 @@ def test_executor_handoff_json_carries_prior_evidence_and_negatives(tmp_path) ->
     assert handoff["prior"]["next_focus"][0]["focus"] == "app.py"
 
 
+def test_executor_handoff_json_carries_artifact_store(tmp_path) -> None:
+    from src.harness.subtask.prompt_builder import build_executor_messages
+    from src.planner.kinds import SubTaskKind
+    from src.planner.task_tree import SubTaskNode, TaskTree
+
+    tree = TaskTree(
+        root_task="task",
+        nodes=[
+            SubTaskNode(id="st-1", kind=SubTaskKind.DIAGNOSE, description="find"),
+            SubTaskNode(
+                id="st-2",
+                kind=SubTaskKind.EDIT,
+                description="edit",
+                depends_on=["st-1"],
+                requires_artifacts=["database_view"],
+            ),
+        ],
+    )
+    messages = build_executor_messages(
+        root_task="task",
+        task_tree=tree,
+        subtask=tree.nodes[1],
+        project_root=tmp_path,
+        runtime_tools=frozenset({"context_search", "edit_file"}),
+        prior_summaries={
+            "st-1": json.dumps({
+                "status": "success",
+                "changed_files": [],
+                "validation": {"ran": [], "result": "skipped", "summary": ""},
+                "risks": [],
+                "handoff": {
+                    "artifacts": [
+                        {
+                            "kind": "database_view",
+                            "canonical_id": "database_view:v_order_detail",
+                            "name": "v_order_detail",
+                            "confidence": 0.91,
+                        }
+                    ]
+                },
+            })
+        },
+    )
+    handoff = json.loads((messages[1].content or "").split("\n", 1)[1])
+
+    assert handoff["artifact_store"]["policy"]["may_not_block_edit"] is True
+    assert handoff["artifact_store"]["artifacts"][0]["name"] == "v_order_detail"
+
+
 def test_executor_prompt_carries_context_pack_json(tmp_path) -> None:
     from src.context.pack import ContextPack, ContextSnippet
     from src.harness.subtask.prompt_builder import build_executor_messages

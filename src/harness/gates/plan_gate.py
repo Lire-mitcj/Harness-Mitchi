@@ -83,6 +83,10 @@ def _normalize_path_set(paths: tuple[str, ...] | list[str]) -> frozenset[str]:
     return frozenset(out)
 
 
+def _node_write_scope(node: SubTaskNode) -> frozenset[str]:
+    return _normalize_path_set([*node.context_files, *node.write_scope])
+
+
 def find_replan_duplicates(tree: TaskTree, ctx: ReplanGateContext) -> list[str]:
     """Return PlanGate blocks when re-plan repeats the failed subtask unchanged."""
     blocks: list[str] = []
@@ -186,18 +190,18 @@ def validate_plan(
                 blocks.append(f"Subtask [{node.id}] depends on unknown id '{dep}'.")
             else:
                 graph.add_edge(dep, node.id)
-        if node.kind == SubTaskKind.EDIT and not node.context_files:
+        if node.kind == SubTaskKind.EDIT and not _node_write_scope(node):
             if re.search(r"\.\w+", node.description):
                 warns.append(
-                    f"Subtask [{node.id}] kind=edit but context_files is empty — "
-                    "executor may lack file whitelist."
+                    f"Subtask [{node.id}] kind=edit but context_files/write_scope is empty — "
+                    "executor may lack an explicit write scope."
                 )
         if node.kind == SubTaskKind.EDIT:
             desc = node.description.lower()
             if any(k in desc for k in ("schema", "procedure", "sp_", "sql", "存储过程", "事务")):
-                if not any(f.endswith(".sql") for f in node.context_files):
+                if not any(f.endswith(".sql") for f in _node_write_scope(node)):
                     warns.append(
-                        f"Subtask [{node.id}] edit involves DB/schema but context_files "
+                        f"Subtask [{node.id}] edit involves DB/schema but scope "
                         "has no .sql — executor cannot read schema files."
                     )
 
@@ -209,16 +213,19 @@ def validate_plan(
         blocks.append("TaskTree dependency cycle detected.")
 
     blocks.extend(_check_distinct_milestones(tree))
-    blocks.extend(_check_milestone_structure(tree))
+    blocks.extend(_check_edit_write_conflicts(tree))
+    milestone_blocks, milestone_warns = _check_milestone_structure(tree)
+    blocks.extend(milestone_blocks)
+    warns.extend(milestone_warns)
 
     root = project_root.resolve()
     for node in tree.nodes:
-        for rel in node.context_files:
+        for rel in [*node.context_files, *node.write_scope]:
             path = _resolve_under_root(root, rel)
             if path is None:
-                blocks.append(f"Subtask [{node.id}] context file outside project: {rel}")
+                blocks.append(f"Subtask [{node.id}] scoped file outside project: {rel}")
             elif not path.is_file():
-                warns.append(f"Subtask [{node.id}] context file missing: {rel}")
+                warns.append(f"Subtask [{node.id}] scoped file missing: {rel}")
 
     _check_db_step_order(tree, warns)
 
@@ -253,8 +260,9 @@ def _check_db_step_order(tree: TaskTree, warns: list[str]) -> None:
             )
 
 
-def _check_milestone_structure(tree: TaskTree) -> list[str]:
+def _check_milestone_structure(tree: TaskTree) -> tuple[list[str], list[str]]:
     blocks: list[str] = []
+    warns: list[str] = []
     by_id = {node.id: node for node in tree.nodes}
     edit_deps: dict[str, list[SubTaskNode]] = {}
     for node in tree.nodes:
@@ -268,17 +276,59 @@ def _check_milestone_structure(tree: TaskTree) -> list[str]:
     for diag_id, edits in edit_deps.items():
         diag = by_id[diag_id]
         if _is_low_value_diagnose(diag, edits):
-            blocks.append(
+            warns.append(
                 f"Subtask [{diag.id}] is a low-value read/search/analyze step before edit. "
                 "Merge scoped read/grep into the edit subtask, or make diagnose produce a "
                 "concrete milestone output."
             )
         if not _diagnose_handoff_complete(diag.acceptance_criteria):
-            blocks.append(
+            warns.append(
                 f"Subtask [{diag.id}] feeds edit but acceptance_criteria lacks required "
-                "handoff output: file:line, symbol, and snippet/decision."
+                "handoff output: file:line, symbol, and snippet/decision. Treat prior "
+                "findings as partial evidence and let edit verify or fill gaps."
+            )
+    return blocks, warns
+
+
+def _check_edit_write_conflicts(tree: TaskTree) -> list[str]:
+    blocks: list[str] = []
+    edit_nodes = [node for node in tree.nodes if node.kind == SubTaskKind.EDIT]
+    for idx, left in enumerate(edit_nodes):
+        left_scope = _node_write_scope(left)
+        if not left_scope:
+            continue
+        for right in edit_nodes[idx + 1 :]:
+            right_scope = _node_write_scope(right)
+            overlap = left_scope & right_scope
+            if not overlap:
+                continue
+            if _depends_transitively(tree, left.id, right.id) or _depends_transitively(
+                tree, right.id, left.id
+            ):
+                continue
+            blocks.append(
+                f"Edit subtasks [{left.id}] and [{right.id}] both write "
+                f"{', '.join(sorted(overlap))} without a dependency. Add depends_on "
+                "to serialize the write conflict or split write_scope."
             )
     return blocks
+
+
+def _depends_transitively(tree: TaskTree, node_id: str, dependency_id: str) -> bool:
+    by_id = {node.id: node for node in tree.nodes}
+    seen: set[str] = set()
+    stack = list(by_id.get(node_id).depends_on if by_id.get(node_id) else [])
+    while stack:
+        current = stack.pop()
+        if current == dependency_id:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        dep = by_id.get(current)
+        if dep is not None:
+            stack.extend(dep.depends_on)
+    return False
 
 
 def _check_distinct_milestones(tree: TaskTree) -> list[str]:

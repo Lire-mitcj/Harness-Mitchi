@@ -126,7 +126,7 @@ def test_exit_gate_blocks_incomplete_agent_output_schema() -> None:
     assert "changed_files" in "; ".join(result.messages)
 
 
-def test_exit_gate_blocks_diagnose_acceptance_unmet() -> None:
+def test_exit_gate_warns_diagnose_acceptance_unmet() -> None:
     node = SubTaskNode(
         id="st-1",
         description="find sql",
@@ -144,10 +144,10 @@ def test_exit_gate_blocks_diagnose_acceptance_unmet() -> None:
             changed_files=[],
         )
     )
-    assert result.verdict == GateVerdict.BLOCK
+    assert result.verdict == GateVerdict.WARN
 
 
-def test_exit_gate_blocks_diagnose_not_yet_met() -> None:
+def test_exit_gate_warns_diagnose_not_yet_met() -> None:
     node = SubTaskNode(
         id="st-2",
         description="locate query",
@@ -165,10 +165,10 @@ def test_exit_gate_blocks_diagnose_not_yet_met() -> None:
             changed_files=[],
         )
     )
-    assert result.verdict == GateVerdict.BLOCK
+    assert result.verdict == GateVerdict.WARN
 
 
-def test_exit_gate_blocks_diagnose_missing_required_file_line() -> None:
+def test_exit_gate_warns_diagnose_missing_required_file_line() -> None:
     node = SubTaskNode(
         id="st-1",
         description="locate query",
@@ -187,7 +187,7 @@ def test_exit_gate_blocks_diagnose_missing_required_file_line() -> None:
             changed_files=[],
         )
     )
-    assert result.verdict == GateVerdict.BLOCK
+    assert result.verdict == GateVerdict.WARN
     assert "file:line" in "; ".join(result.messages)
 
 
@@ -260,7 +260,7 @@ def test_exit_gate_passes_structured_diagnose_handoff_evidence() -> None:
     assert result.verdict == GateVerdict.PASS
 
 
-def test_exit_gate_blocks_structured_diagnose_acceptance_false() -> None:
+def test_exit_gate_warns_structured_diagnose_acceptance_false() -> None:
     node = SubTaskNode(
         id="st-1",
         description="定位查询接口",
@@ -278,7 +278,7 @@ def test_exit_gate_blocks_structured_diagnose_acceptance_false() -> None:
             changed_files=[],
         )
     )
-    assert result.verdict == GateVerdict.BLOCK
+    assert result.verdict == GateVerdict.WARN
 
 
 def test_exit_gate_blocks_llm_transport_error_summary() -> None:

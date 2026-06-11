@@ -36,6 +36,7 @@ class ScoreResult:
     feedback: str | None = None
     needs_retry: bool = False
     warnings: list[str] = field(default_factory=list)
+    retry_reasons: list[str] = field(default_factory=list)
 
 
 class ScoringEngine:
@@ -79,6 +80,7 @@ class ScoringEngine:
                 feedback=feedback,
                 needs_retry=True,
                 warnings=warnings,
+                retry_reasons=["L0"],
             )
 
         if skip_l1:
@@ -105,14 +107,15 @@ class ScoringEngine:
             ],
         }
 
-        if not verdict.passed:
+        if verdict.blockers:
             feedback = self._formatter.format_rubric_feedback(verdict)
             return ScoreResult(
                 passed=False,
                 scores=scores,
                 feedback=feedback,
-                needs_retry=bool(verdict.blockers),
+                needs_retry=True,
                 warnings=verdict.warnings,
+                retry_reasons=["L1"],
             )
 
         # --- L2: quality hints (non-blocking) ---

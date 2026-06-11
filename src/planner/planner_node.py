@@ -25,8 +25,9 @@ _GATE_REWRITE_NUDGE = (
     "PlanGate / schema rejected your TaskTree:\n{errors}\n\n"
     "Reply with ONE corrected raw JSON object only (double-quoted keys, no fences).\n"
     "Checklist: st-1 kind matches intent (edit/diagnose/verify/shell); "
-    "st-2+ depends_on when ordered; every node has all 8 fields; "
-    "allowed_tools match kind table; edit includes edit_file or write_file."
+    "st-2+ depends_on when ordered; every node has all base fields; "
+    "allowed_tools match kind table; edit includes edit_file or write_file; "
+    "preserve requires_artifacts/produces_artifacts/write_scope when relevant."
 )
 
 log = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ def planner_output_instruction(*, require_trace: bool) -> str:
         )
     return (
         "Output ONE raw TaskTree JSON only (no planning_trace, no markdown, no prose). "
-        "Copy the example structure from the system prompt — all 8 fields on every node."
+        "Copy the example structure from the system prompt — all base fields on every node."
     )
 
 

@@ -68,3 +68,24 @@ def test_task_tree_outline_contains_status_icons() -> None:
     outline = tree.to_outline()
     assert "○ [st-1]" in outline
     assert "demo" in outline
+
+
+def test_task_tree_json_preserves_artifact_and_write_scope_fields() -> None:
+    tree = TaskTree(
+        root_task="view rewrite",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                description="rewrite query",
+                requires_artifacts=["database_view"],
+                produces_artifacts=["patch_intent"],
+                write_scope=["app/report.py"],
+            )
+        ],
+    )
+
+    restored = TaskTree.from_json(tree.to_json())
+
+    assert restored.nodes[0].requires_artifacts == ["database_view"]
+    assert restored.nodes[0].produces_artifacts == ["patch_intent"]
+    assert restored.nodes[0].write_scope == ["app/report.py"]

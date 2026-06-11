@@ -7,6 +7,7 @@ from typing import Any
 
 from src.agent.types import Message, system_message, user_message
 from src.executor.final_output import parse_executor_final
+from src.harness.subtask.artifacts import build_artifact_store
 from src.harness.gates.types import TruncationPolicy
 from src.harness.probe.token_budget import TokenBudget
 from src.harness.subtask.preload import load_context_file_contents
@@ -201,6 +202,10 @@ def build_executor_handoff_json(
         prior_summaries,
         project_root,
     )
+    artifact_store = build_artifact_store(
+        prior_summaries,
+        required=subtask.requires_artifacts,
+    )
     payload: dict[str, Any] = {
         "schema": "mitkii.executor_handoff.v1",
         "root_task": root_task,
@@ -210,11 +215,15 @@ def build_executor_handoff_json(
             "description": subtask.description,
             "acceptance_criteria": subtask.acceptance_criteria,
             "depends_on": list(subtask.depends_on),
+            "requires_artifacts": list(subtask.requires_artifacts),
+            "produces_artifacts": list(subtask.produces_artifacts),
+            "write_scope": list(subtask.write_scope),
         },
         "allowed_tools": allowed_tools,
         "denied_tools": _denied_tools_for_allowed(allowed_tools),
         "context_scope": {
             "context_files": list(context_files),
+            "write_scope": list(subtask.write_scope),
             "preload_mode": "paths_only" if context_files and runtime_tools and "context_search" in runtime_tools else "full_or_none",
         },
         "prior": {
@@ -223,6 +232,7 @@ def build_executor_handoff_json(
             "known_negatives": prior["known_negatives"],
             "next_focus": prior["next_focus"],
         },
+        "artifact_store": artifact_store,
         "plan_state": {
             "nodes": siblings,
         },

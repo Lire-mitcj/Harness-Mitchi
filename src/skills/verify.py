@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-import asyncio
+import os
+import subprocess
+import sys
 from pathlib import Path
-from src.skills.base import SkillContext, SkillResult
+
 from src.harness.scorer.test_runner import TestRunner, FRAMEWORK_COMMANDS
+from src.skills.base import SkillContext, SkillResult
 
 
 class VerifySkill:
@@ -15,7 +18,7 @@ class VerifySkill:
 
     async def run(self, context: SkillContext, **kwargs: object) -> SkillResult:
         changed_files = list(kwargs.get("changed_files", ()) or ())
-        
+
         # Enforce SQL references check first
         from src.skills.validator import validate_sql_references
         db_errors = validate_sql_references(self.project_root, changed_files)
@@ -38,6 +41,8 @@ class VerifySkill:
         related = self.test_runner._find_related_tests(changed_files, framework)
 
         cmd = list(FRAMEWORK_COMMANDS[framework])
+        if framework == "pytest" and cmd[:3] == ["python", "-m", "pytest"]:
+            cmd[0] = sys.executable
         if related:
             cmd.extend(related)
             test_scope_desc = f"{len(related)} related test file(s)"
@@ -45,14 +50,17 @@ class VerifySkill:
             test_scope_desc = "all tests (fallback)"
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            completed = subprocess.run(
+                cmd,
                 cwd=str(self.project_root),
+                env=_subprocess_env(self.project_root, framework),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+                check=False,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        except asyncio.TimeoutError:
+        except subprocess.TimeoutExpired:
             return SkillResult(
                 success=False,
                 summary=f"Verification failed: Tests timed out after 120s ({framework})",
@@ -65,8 +73,8 @@ class VerifySkill:
                 validation_result="failed",
             )
 
-        output = stdout.decode(errors="replace") + stderr.decode(errors="replace")
-        passed = proc.returncode == 0
+        output = (completed.stdout or "") + (completed.stderr or "")
+        passed = completed.returncode == 0
 
         summary = f"{framework} ({test_scope_desc}): {'PASSED' if passed else 'FAILED'}"
         if not passed:
@@ -85,3 +93,24 @@ class VerifySkill:
             validation_result="passed",
             metadata={"test_output": output[-3000:]},
         )
+
+
+def _subprocess_env(project_root: Path, framework: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("PYTEST_CURRENT_TEST", None)
+    if framework == "pytest" and not _has_pytest_config(project_root):
+        env.setdefault("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    return env
+
+
+def _has_pytest_config(project_root: Path) -> bool:
+    for name in ("pytest.ini", "pyproject.toml", "setup.cfg"):
+        path = project_root / name
+        if not path.is_file():
+            continue
+        if name == "pyproject.toml":
+            content = path.read_text(errors="replace")
+            if "[tool.pytest" not in content and "pytest" not in content.lower():
+                continue
+        return True
+    return False

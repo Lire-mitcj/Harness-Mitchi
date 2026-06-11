@@ -29,6 +29,9 @@ class SubTaskNode:
     needs_l1: bool | None = None
     context_files: list[str] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)
+    requires_artifacts: list[str] = field(default_factory=list)
+    produces_artifacts: list[str] = field(default_factory=list)
+    write_scope: list[str] = field(default_factory=list)
     checkpoint_id: str | None = None
     error_trace: list[str] = field(default_factory=list)
 
@@ -51,6 +54,9 @@ class SubTaskNode:
             "needs_l1": self.needs_l1,
             "context_files": list(self.context_files),
             "depends_on": list(self.depends_on),
+            "requires_artifacts": list(self.requires_artifacts),
+            "produces_artifacts": list(self.produces_artifacts),
+            "write_scope": list(self.write_scope),
             "checkpoint_id": self.checkpoint_id,
             "error_trace": list(self.error_trace),
         }
@@ -81,6 +87,9 @@ class SubTaskNode:
             needs_l1=needs_l1 if isinstance(needs_l1, bool) else None,
             context_files=[str(p) for p in data.get("context_files") or []],
             depends_on=[str(d) for d in data.get("depends_on") or []],
+            requires_artifacts=[str(a) for a in data.get("requires_artifacts") or []],
+            produces_artifacts=[str(a) for a in data.get("produces_artifacts") or []],
+            write_scope=[str(p) for p in data.get("write_scope") or []],
             checkpoint_id=data.get("checkpoint_id"),
             error_trace=[str(e) for e in data.get("error_trace") or []],
         )
@@ -95,10 +104,9 @@ class TaskTree:
     version: int = 1
 
     def first_pending(self) -> SubTaskNode | None:
-        from src.planner.strategy import ready_pending_nodes
+        from src.planner.strategy import next_ready_node
 
-        ready = ready_pending_nodes(self)
-        return ready[0] if ready else None
+        return next_ready_node(self)
 
     def get(self, node_id: str) -> SubTaskNode | None:
         for node in self.nodes:
