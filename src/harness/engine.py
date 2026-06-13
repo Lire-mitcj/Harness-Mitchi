@@ -151,9 +151,11 @@ class HarnessEngine:
         """LLM callback used by L1 rubric judge."""
         if not self.settings.judge_model:
             return ""
+        from src.llm.client import canonicalize_model_name
+        model = canonicalize_model_name(self.settings.judge_model)
         try:
             resp = await litellm.acompletion(
-                model=self.settings.judge_model,
+                model=model,
                 messages=messages,
                 temperature=self.settings.judge_temperature,
                 max_tokens=self.settings.judge_max_tokens,

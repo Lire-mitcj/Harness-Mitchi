@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from copy import deepcopy
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -112,7 +113,9 @@ class LiteLLMPlannerClient:
         prompt_cache_min_tokens: int = 1024,
         prompt_cache_ttl: CacheTTL = "5m",
     ) -> None:
-        self.model = model
+        from src.llm.client import canonicalize_model_name
+
+        self.model = canonicalize_model_name(model)
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
@@ -420,18 +423,39 @@ class PlannerNode:
         from src.executor.retry_strategy import replan_revision_directive
 
         failed = current_tree.get(evidence.subtask_id)
-        pending_tail = [
+        downstream_ids = _downstream_ids(current_tree, evidence.subtask_id)
+        affected_tail = [
             n
             for n in current_tree.nodes
-            if n.status == SubTaskStatus.PENDING and n.id != evidence.subtask_id
+            if n.status == SubTaskStatus.PENDING
+            and n.id != evidence.subtask_id
+            and n.id in downstream_ids
         ]
-        if pending_tail:
+        unrelated_tail = [
+            n
+            for n in current_tree.nodes
+            if n.status == SubTaskStatus.PENDING
+            and n.id != evidence.subtask_id
+            and n.id not in downstream_ids
+        ]
+        if affected_tail:
             tail_lines = "\n".join(
                 f"  - [{n.id}] kind={n.kind.value}: {n.description}"
-                for n in pending_tail
+                for n in affected_tail
             )
             prompt_parts.append(
-                "Later pending steps (orchestrator keeps these unchanged — "
+                "Affected downstream pending steps (orchestrator keeps these "
+                "unchanged if you omit them; include one ONLY when its "
+                "depends_on/acceptance must change after replacing the failed step):\n"
+                f"{tail_lines}\n"
+            )
+        if unrelated_tail:
+            tail_lines = "\n".join(
+                f"  - [{n.id}] kind={n.kind.value}: {n.description}"
+                for n in unrelated_tail
+            )
+            prompt_parts.append(
+                "Unrelated later pending steps (orchestrator keeps these unchanged — "
                 "do NOT include in output):\n"
                 f"{tail_lines}\n"
             )
@@ -452,10 +476,12 @@ class PlannerNode:
                     "must be kind=edit with edit_file allowed.\n"
                 )
         prompt_parts.extend([
-            f"Replace ONLY failed subtask [{evidence.subtask_id}]. "
+            f"Re-plan ONLY the local failed subgraph rooted at [{evidence.subtask_id}]. "
             + planner_output_instruction(require_trace=self._require_trace)
-            + "\n- Output nodes array with ONLY replacement subtask(s) for that step.\n"
-            "- Do NOT output completed ids or later pending steps listed above.\n"
+            + "\n- Output nodes array with replacement subtask(s) for the failed step.\n"
+            "- You may also include affected downstream pending steps listed above "
+            "ONLY when their dependency or acceptance contract must change.\n"
+            "- Do NOT output completed ids or unrelated later pending steps listed above.\n"
             "- Use new ids (e.g. st-2a, st-2b) that do not collide with completed ids.\n"
             "- edit context_files must list files to touch.",
         ])
@@ -485,54 +511,117 @@ def _merge_replanned_tree(
     *,
     failed_subtask_id: str,
 ) -> TaskTree:
-    """Replace the failed subtask only; keep completed and later pending steps."""
+    """Replace the failed subtask locally; preserve unrelated DAG nodes.
+
+    By default, unchanged downstream nodes are kept and direct dependencies on the
+    failed node are rewired to the final replacement node. If the Planner emits a
+    node whose id matches a downstream dependent, treat that node as an explicit
+    replacement for that local subgraph node instead of producing duplicate ids.
+    """
     merged = TaskTree(root_task=current_tree.root_task, version=current_tree.version)
+    current_nodes = deepcopy(current_tree.nodes)
+    revised_nodes = deepcopy(revised.nodes)
     failed_idx: int | None = None
-    for i, node in enumerate(current_tree.nodes):
+    for i, node in enumerate(current_nodes):
         if node.id == failed_subtask_id:
             failed_idx = i
             break
 
     if failed_idx is None:
-        merged.nodes = list(current_tree.completed_nodes())
+        affected_ids: set[str] = set()
+        merged.nodes = [n for n in current_nodes if n.status == SubTaskStatus.SUCCESS]
         merged_ids = {n.id for n in merged.nodes}
-        for node in revised.nodes:
+        inserted_revised_ids: set[str] = set()
+        for node in revised_nodes:
             if node.id in merged_ids:
                 continue
             node.status = SubTaskStatus.PENDING
             node.checkpoint_id = None
             merged.nodes.append(node)
             merged_ids.add(node.id)
+            inserted_revised_ids.add(node.id)
     else:
-        merged.nodes = list(current_tree.nodes[:failed_idx])
+        affected_ids = _downstream_ids(current_tree, failed_subtask_id)
+        suffix = current_nodes[failed_idx + 1 :]
+        preserved_suffix_ids = {
+            node.id for node in suffix if node.id not in affected_ids
+        }
+        merged.nodes = list(current_nodes[:failed_idx])
         merged_ids = {n.id for n in merged.nodes}
+        inserted_revised_ids: set[str] = set()
 
-        for node in revised.nodes:
-            if node.id in merged_ids:
+        for node in revised_nodes:
+            if node.id in merged_ids or node.id in preserved_suffix_ids:
                 continue
             node.status = SubTaskStatus.PENDING
             node.checkpoint_id = None
+            node.error_trace.clear()
+            merged.nodes.append(node)
+            merged_ids.add(node.id)
+            inserted_revised_ids.add(node.id)
+
+        for node in suffix:
+            if node.id in inserted_revised_ids:
+                continue
+            if node.id in merged_ids:
+                continue
             merged.nodes.append(node)
             merged_ids.add(node.id)
 
-        for node in current_tree.nodes[failed_idx + 1 :]:
-            merged.nodes.append(node)
-
-    replacement_id = revised.nodes[-1].id if revised.nodes else None
+    replacement_id = _replacement_target_id(
+        merged.nodes,
+        inserted_revised_ids=inserted_revised_ids,
+        affected_ids=affected_ids,
+    )
     for node in merged.nodes:
-        if node in revised.nodes:
-            continue
         if failed_subtask_id in node.depends_on:
             if replacement_id:
-                node.depends_on = [
-                    replacement_id if dep == failed_subtask_id else dep
-                    for dep in node.depends_on
-                ]
+                if node.id == replacement_id:
+                    node.depends_on = [
+                        dep for dep in node.depends_on if dep != failed_subtask_id
+                    ]
+                else:
+                    node.depends_on = [
+                        replacement_id if dep == failed_subtask_id else dep
+                        for dep in node.depends_on
+                    ]
             else:
                 node.depends_on = [dep for dep in node.depends_on if dep != failed_subtask_id]
 
     merged.version = current_tree.version + 1
     return merged
+
+
+def _downstream_ids(tree: TaskTree, node_id: str) -> set[str]:
+    children: dict[str, list[str]] = {}
+    for node in tree.nodes:
+        for dep in node.depends_on:
+            children.setdefault(dep, []).append(node.id)
+
+    downstream: set[str] = set()
+    stack = list(children.get(node_id, []))
+    while stack:
+        current = stack.pop()
+        if current in downstream:
+            continue
+        downstream.add(current)
+        stack.extend(children.get(current, []))
+    return downstream
+
+
+def _replacement_target_id(
+    nodes: list[SubTaskNode],
+    *,
+    inserted_revised_ids: set[str],
+    affected_ids: set[str],
+) -> str | None:
+    for node in reversed(nodes):
+        if node.id in inserted_revised_ids and node.id not in affected_ids:
+            return node.id
+    for node in reversed(nodes):
+        if node.id in inserted_revised_ids:
+            return node.id
+    return None
 
 
 def fallback_replan_for_failed_edit(

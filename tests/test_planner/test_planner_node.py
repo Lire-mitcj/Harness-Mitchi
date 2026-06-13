@@ -191,6 +191,84 @@ def test_merge_replanned_tree_skips_duplicate_completed_ids() -> None:
     assert merged.nodes[1].status == SubTaskStatus.PENDING
 
 
+def test_merge_replanned_tree_replaces_downstream_subgraph_node_by_id() -> None:
+    current = TaskTree(
+        root_task="fix",
+        nodes=[
+            SubTaskNode(
+                id="st-1",
+                description="done",
+                status=SubTaskStatus.SUCCESS,
+            ),
+            SubTaskNode(
+                id="st-2",
+                description="failed edit",
+                status=SubTaskStatus.FAILED,
+            ),
+            SubTaskNode(
+                id="st-3",
+                kind=SubTaskKind.VERIFY,
+                description="old verify",
+                status=SubTaskStatus.PENDING,
+                depends_on=["st-2"],
+            ),
+            SubTaskNode(
+                id="st-4",
+                description="unrelated pending",
+                status=SubTaskStatus.PENDING,
+            ),
+        ],
+    )
+    revised = TaskTree(
+        root_task="fix",
+        nodes=[
+            SubTaskNode(id="st-2a", kind=SubTaskKind.DIAGNOSE, description="grep first"),
+            SubTaskNode(id="st-2b", kind=SubTaskKind.EDIT, description="narrow edit"),
+            SubTaskNode(
+                id="st-3",
+                kind=SubTaskKind.VERIFY,
+                description="new verify",
+                depends_on=["st-2"],
+            ),
+        ],
+    )
+
+    merged = _merge_replanned_tree(current, revised, failed_subtask_id="st-2")
+
+    assert [n.id for n in merged.nodes] == ["st-1", "st-2a", "st-2b", "st-3", "st-4"]
+    assert merged.get("st-3").description == "new verify"
+    assert merged.get("st-3").depends_on == ["st-2b"]
+    assert current.get("st-3").description == "old verify"
+    assert current.get("st-3").depends_on == ["st-2"]
+
+
+def test_merge_replanned_tree_does_not_replace_unrelated_pending_id_collision() -> None:
+    current = TaskTree(
+        root_task="fix",
+        nodes=[
+            SubTaskNode(id="st-1", description="failed edit", status=SubTaskStatus.FAILED),
+            SubTaskNode(
+                id="st-2",
+                description="unrelated pending",
+                status=SubTaskStatus.PENDING,
+            ),
+        ],
+    )
+    revised = TaskTree(
+        root_task="fix",
+        nodes=[
+            SubTaskNode(id="st-2", description="colliding replacement"),
+            SubTaskNode(id="st-1a", description="actual replacement"),
+        ],
+    )
+
+    merged = _merge_replanned_tree(current, revised, failed_subtask_id="st-1")
+
+    assert [n.id for n in merged.nodes] == ["st-1a", "st-2"]
+    assert merged.get("st-2").description == "unrelated pending"
+    assert len({n.id for n in merged.nodes}) == len(merged.nodes)
+
+
 def test_fallback_replan_for_failed_edit_inserts_diagnose_and_edit() -> None:
     current = TaskTree(
         root_task="把登机牌查询接口改成用视图查询",

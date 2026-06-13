@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import ast
 import py_compile
 import re
 import subprocess
+import textwrap
 from pathlib import Path
 
 import sqlparse
@@ -221,6 +223,22 @@ class ValidatorSkill:
             )
 
         errors: list[str] = []
+
+        original_files = {}
+        for source in (kwargs, context.metadata if context else None):
+            if not isinstance(source, dict):
+                continue
+            for k in ("original_files_json", "original_files"):
+                val = source.get(k)
+                if isinstance(val, dict):
+                    original_files.update(val)
+                elif isinstance(val, str) and val.strip():
+                    try:
+                        d = json.loads(val)
+                        if isinstance(d, dict):
+                            original_files.update(d)
+                    except Exception:
+                        pass
         
         # Extract allowed snippet ranges from context_pack
         snippet_ranges = []
@@ -266,14 +284,7 @@ class ValidatorSkill:
         edit_context = _extract_marker_json(evidence, "EDIT_CONTEXT_JSON")
         target_view = ""
         target_symbols = []
-        strict_symbols_check = False
         is_view_change = False
-        task_analysis = kwargs.get("task_analysis")
-        analysis_strategy = ""
-        if isinstance(task_analysis, dict):
-            analysis_strategy = str(task_analysis.get("edit_strategy") or task_analysis.get("intent") or "")
-            if analysis_strategy == "sql_view_rewrite":
-                is_view_change = True
 
         if isinstance(edit_context, dict):
             # 1. 提取 target_view / replacement_source
@@ -290,22 +301,28 @@ class ValidatorSkill:
             task_intent = edit_context.get("task_intent")
             if isinstance(task_intent, dict):
                 op = task_intent.get("operation")
-                if op in ("replace_dependency", "use_existing", "replace_sql_source"):
+                if op in (
+                    "replace_dependency",
+                    "use_existing",
+                    "replace_sql_source",
+                    "count_query_view_rewrite",
+                    "dynamic_count_query_rewrite",
+                    "dynamic_sql_rewrite",
+                ):
                     is_view_change = True
                 tsym = task_intent.get("target_symbol")
                 if tsym:
                     target_symbols.append(str(tsym))
-                    strict_symbols_check = True
             
             edit_targets = edit_context.get("edit_targets")
-            if isinstance(edit_targets, list):
+            if not primary_target_symbol and isinstance(edit_targets, list):
                 for t in edit_targets:
                     if isinstance(t, dict) and t.get("symbol"):
                         target_symbols.append(str(t.get("symbol")))
                         strict_symbols_check = True
             
             editable_targets = edit_context.get("editable_targets") or edit_context.get("snippets")
-            if isinstance(editable_targets, list):
+            if not primary_target_symbol and isinstance(editable_targets, list):
                 for t in editable_targets:
                     if isinstance(t, dict) and t.get("symbol"):
                         target_symbols.append(str(t.get("symbol")))
@@ -318,6 +335,14 @@ class ValidatorSkill:
                         if isinstance(t, dict) and t.get("symbol"):
                             target_symbols.append(str(t.get("symbol")))
                             strict_symbols_check = True
+
+        # Extract/override from kwargs if provided
+        if not target_type and kwargs.get("target_type"):
+            target_type = str(kwargs.get("target_type")).strip()
+        if not local_target and kwargs.get("local_target"):
+            local_target = str(kwargs.get("local_target")).strip()
+        if not parent_symbol and kwargs.get("parent_symbol"):
+            parent_symbol = str(kwargs.get("parent_symbol")).strip()
 
         # Fallback to contract extraction
         handoff_contract = kwargs.get("handoff_contract")
@@ -337,6 +362,13 @@ class ValidatorSkill:
 
         if not target_symbols:
             target_symbols = _extract_symbols_from_text(context.user_request)
+
+        # Final fallback for primary_target_symbol and parent_symbol
+        if not parent_symbol and target_symbols:
+            parent_symbol = target_symbols[0]
+        if not primary_target_symbol and parent_symbol:
+            primary_target_symbol = parent_symbol
+
 
         checked: list[str] = []
         validation_details_list = []
@@ -375,8 +407,14 @@ class ValidatorSkill:
                     pass
 
             # Diff-based rich validation (PatchIntentValidator)
-            # Retrieve original content from git
-            old_content = get_git_head_content(self.project_root, rel)
+            # Retrieve original content from original_files dict (pre-edit snapshot) or fall back to git
+            old_content = None
+            old_source = "git_head"
+            if rel in original_files:
+                old_content = original_files[rel]
+                old_source = "original_files_json"
+            else:
+                old_content = get_git_head_content(self.project_root, rel)
             if old_content is None:
                 continue
 
@@ -408,10 +446,64 @@ class ValidatorSkill:
 
             # Find changed symbols (classes/functions)
             old_symbol_ranges = _find_symbol_ranges(old_content)
+            
+            # Print validator debugging logs
+            parent_range = old_symbol_ranges.get("admin_list_orders")
+            local_ranges = _find_variable_ranges(old_content, "count_sql")
+            print(f"[DEBUG] validator old_source = {old_source}")
+            print(f"[DEBUG] validator parent_range = {parent_range}")
+            print(f"[DEBUG] validator local_ranges = {local_ranges}")
+            
             changed_symbols = []
-            for sym, (start, end) in old_symbol_ranges.items():
-                if any(start <= line_no <= end for line_no in modified_line_nos):
-                    changed_symbols.append(sym)
+            
+            is_sql_variable_attribution = False
+            if path.suffix == ".py" and target_type == "sql_variable" and local_target and parent_symbol:
+                if parent_symbol in old_symbol_ranges:
+                    parent_start, parent_end = old_symbol_ranges[parent_symbol]
+                    local_ranges = _find_variable_ranges(old_content, local_target)
+                    matching_ranges = [
+                        (start, end) for start, end in local_ranges
+                        if parent_start <= start and end <= parent_end
+                    ]
+                    
+                    if not matching_ranges:
+                        errors.append(
+                            f"Intent validation failed: local target '{local_target}' range not found "
+                            f"within parent symbol '{parent_symbol}' in {rel}."
+                        )
+                    else:
+                        out_of_range_lines = []
+                        for line_no in modified_line_nos:
+                            in_any_range = any(
+                                start <= line_no <= end for start, end in matching_ranges
+                            )
+                            if not in_any_range:
+                                out_of_range_lines.append(line_no)
+                        
+                        if out_of_range_lines:
+                            errors.append(
+                                f"Intent validation failed: changed lines {out_of_range_lines} in {rel} "
+                                f"fall outside the local target '{local_target}' range inside '{parent_symbol}'."
+                            )
+                        else:
+                            changed_symbols = [parent_symbol]
+                            is_sql_variable_attribution = True
+
+            if not is_sql_variable_attribution:
+                for sym, (start, end) in old_symbol_ranges.items():
+                    if any(start <= line_no <= end for line_no in modified_line_nos):
+                        changed_symbols.append(sym)
+                        
+            if primary_target_symbol:
+                outside_symbols = [
+                    sym for sym in changed_symbols
+                    if sym != primary_target_symbol
+                ]
+                if outside_symbols:
+                    errors.append(
+                        "Intent validation failed: modified symbols outside target "
+                        f"'{primary_target_symbol}': {outside_symbols}"
+                    )
 
             # 1. Extract target view if not set yet (only for view change tasks)
             if is_view_change and not target_view:
@@ -533,8 +625,16 @@ class ValidatorSkill:
                                 target_view=target_view,
                                 replaces_objects=replaces_objects,
                                 dependency_columns=_replacement_dependency_columns(edit_context),
+                                target_sql_kind=target_sql_kind,
                             )
                             errors.extend(contract_errors)
+                            if target_sql_kind == "count":
+                                list_errors = _validate_non_count_queries_unchanged(
+                                    old_function_code,
+                                    new_function_code,
+                                    target_sql_variable=target_sql_variable,
+                                )
+                                errors.extend(list_errors)
 
             import hashlib
             file_hash = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
@@ -660,6 +760,21 @@ def _resolve_under_root(project_root: Path, rel: str) -> Path | None:
 
 
 def _find_symbol_ranges(content: str) -> dict[str, tuple[int, int]]:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return _find_symbol_ranges_by_indent(content)
+
+    ranges = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            start = getattr(node, "lineno", 1)
+            end = getattr(node, "end_lineno", start)
+            ranges[node.name] = (start, end)
+    return ranges
+
+
+def _find_symbol_ranges_by_indent(content: str) -> dict[str, tuple[int, int]]:
     """Find the start and end line (1-indexed) of each class/function definition."""
     lines = content.splitlines()
     ranges = {}
@@ -679,6 +794,82 @@ def _find_symbol_ranges(content: str) -> dict[str, tuple[int, int]]:
                 end = j
             ranges[name] = (start + 1, end + 1)
     return ranges
+
+
+def _find_variable_ranges(content: str, var_name: str) -> list[tuple[int, int]]:
+    """Find the start and end lines (1-indexed, inclusive) of assignments to var_name."""
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        # Fallback to regex if syntax error
+        ranges = []
+        lines = content.splitlines()
+        for idx, line in enumerate(lines):
+            if re.search(rf"\b{re.escape(var_name)}\s*=", line):
+                ranges.append((idx + 1, idx + 1))
+        return ranges
+
+    ranges = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == var_name:
+                    start = getattr(node, "lineno", 1)
+                    end = getattr(node, "end_lineno", start)
+                    ranges.append((start, end))
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == var_name:
+                start = getattr(node, "lineno", 1)
+                end = getattr(node, "end_lineno", start)
+                ranges.append((start, end))
+    return ranges
+
+
+
+def _validate_non_count_queries_unchanged(
+    old_code: str,
+    new_code: str,
+    *,
+    target_sql_variable: str,
+) -> list[str]:
+    old_assignments = _query_assignments(old_code)
+    new_assignments = _query_assignments(new_code)
+    errors: list[str] = []
+    for name, old_value in old_assignments.items():
+        lowered = name.lower()
+        if name == target_sql_variable or "count" in lowered or "total" in lowered:
+            continue
+        if name not in new_assignments:
+            errors.append(
+                f"Intent validation failed: non-count query variable '{name}' was removed."
+            )
+        elif new_assignments[name] != old_value:
+            errors.append(
+                f"Intent validation failed: non-count query variable '{name}' was modified."
+            )
+    return errors
+
+
+def _query_assignments(code: str) -> dict[str, str]:
+    try:
+        tree = ast.parse(textwrap.dedent(code))
+    except SyntaxError:
+        return {}
+    assignments: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value = node.value
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            name = target.id
+            lowered = name.lower()
+            if "sql" not in lowered and "query" not in lowered:
+                continue
+            assignments[name] = ast.dump(value, include_attributes=False)
+    return assignments
 
 
 def _parse_modified_old_lines(diff_lines: list[str]) -> list[int]:
@@ -738,6 +929,8 @@ def _extract_symbols_from_text(text: str) -> list[str]:
         "if", "else", "elif", "for", "while", "in", "not", "and", "or", "try", "except",
         "view", "query", "sql", "db", "api", "file", "line", "symbol", "snippet",
         "code", "evidence", "test", "orders", "order", "boarding", "ticket",
+        "count", "select", "where", "join", "from",
+        "need", "list", "app", "py", "init", "subtask", "main", "st", "replan",
         "视图", "查询", "接口", "订单", "登机牌", "机票", "航班", "报表", "方法",
         "change", "replace", "use", "with", "the", "this", "method", "function",
         "using", "into", "from", "to", "for", "in", "of", "and", "a", "an", "is",
@@ -857,6 +1050,7 @@ def _validate_sql_replacement_contract(
     target_view: str,
     replaces_objects: list[str],
     dependency_columns: list[str],
+    target_sql_kind: str = "",
 ) -> list[str]:
     errors: list[str] = []
     if not target_view or not replaces_objects:
@@ -877,14 +1071,28 @@ def _validate_sql_replacement_contract(
 
         if dependency_columns:
             selected = _extract_select_fields(new_sql)
-            if "*" in selected:
-                errors.append("SQL replacement contract failed: SELECT * is not allowed with a resolved dependency column list.")
-            missing = sorted(field for field in selected if field not in columns_lower and field != "*")
-            if missing:
-                errors.append(
-                    "SQL replacement contract failed: SELECT fields are not in "
-                    f"resolved_dependency.columns: {missing}"
-                )
+            is_count = (target_sql_kind == "count") or ("count(" in new_sql.lower()) or ("count (" in new_sql.lower())
+            
+            if not is_count:
+                if "*" in selected:
+                    errors.append("SQL replacement contract failed: SELECT * is not allowed with a resolved dependency column list.")
+                
+                ignored_count_fields = {"total", "count", "total_orders", "total_rows", "cnt"}
+                missing = []
+                for field in selected:
+                    if field == "*":
+                        continue
+                    if field in ignored_count_fields:
+                        continue
+                    if field not in columns_lower:
+                        missing.append(field)
+                
+                missing = sorted(missing)
+                if missing:
+                    errors.append(
+                        "SQL replacement contract failed: SELECT fields are not in "
+                        f"resolved_dependency.columns: {missing}"
+                    )
 
         remaining_tables = _extract_all_tables(new_sql)
         still_joined = sorted(tbl for tbl in forbidden_tables if tbl in remaining_tables)

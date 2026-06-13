@@ -116,10 +116,10 @@ def assess_preflight(
         passed=False,
         verdict=GateVerdict.BLOCK,
         policy=TruncationPolicy.red_fallback(),
-        estimated_tokens=estimated,
+        estimated_tokens=yellow_est,
         budget_tokens=budget,
         messages=[
-            f"Estimated {estimated} tokens exceeds red threshold {red_threshold} "
+            f"Estimated {yellow_est} tokens (after truncation) exceeds red threshold {red_threshold} "
             f"(budget {budget}).",
             "Planner should reduce context_files or split the subtask.",
         ],

@@ -18,6 +18,67 @@ litellm.drop_params = True
 litellm.set_verbose = False
 
 
+def canonicalize_model_name(model: str) -> str:
+    if not model:
+        return model
+
+    # 1. If litellm can already parse the provider, don't change it
+    try:
+        litellm.get_llm_provider(model)
+        return model
+    except Exception:
+        pass
+
+    # 2. Match common model families first to get the correct provider
+    model_lower = model.lower()
+    if "claude" in model_lower or "anthropic" in model_lower:
+        try:
+            candidate = f"anthropic/{model}"
+            litellm.get_llm_provider(candidate)
+            return candidate
+        except Exception:
+            pass
+    elif "gemini" in model_lower:
+        try:
+            candidate = f"gemini/{model}"
+            litellm.get_llm_provider(candidate)
+            return candidate
+        except Exception:
+            pass
+    elif "gpt-" in model_lower or model_lower.startswith("gpt") or "o1-" in model_lower or "o3-" in model_lower:
+        try:
+            candidate = f"openai/{model}"
+            litellm.get_llm_provider(candidate)
+            return candidate
+        except Exception:
+            pass
+
+    # 3. Check for LITELLM_PROVIDER or LLM_PROVIDER env vars
+    import os
+    provider = os.environ.get("LITELLM_PROVIDER") or os.environ.get("LLM_PROVIDER")
+    if provider:
+        provider = provider.strip().lower()
+        if provider:
+            try:
+                candidate = f"{provider}/{model}"
+                litellm.get_llm_provider(candidate)
+                return candidate
+            except Exception:
+                pass
+
+    # 4. Check if OPENAI_API_BASE is set and is an OpenAI-compatible base URL
+    openai_base = os.environ.get("OPENAI_API_BASE")
+    if openai_base:
+        try:
+            candidate = f"openai/{model}"
+            litellm.get_llm_provider(candidate)
+            return candidate
+        except Exception:
+            pass
+
+    return model
+
+
 class LLMClient:
     """Unified LLM client backed by litellm.
 
@@ -36,7 +97,7 @@ class LLMClient:
         prompt_cache_min_tokens: int = 1024,
         prompt_cache_ttl: CacheTTL = "5m",
     ) -> None:
-        self.model = model
+        self.model = canonicalize_model_name(model)
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.request_timeout = request_timeout

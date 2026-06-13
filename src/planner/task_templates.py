@@ -114,13 +114,20 @@ _ANSWER_INTENT = (
     "统计",
     "架构",
     "结构",
+    "查询",
+    "查找",
+    "搜索",
     "what",
     "which",
     "list",
     "show",
     "describe",
     "overview",
+    "find",
+    "search",
+    "query",
 )
+
 
 
 def select_task_template(user_request: str) -> TaskTemplate:
@@ -133,6 +140,16 @@ def select_task_template(user_request: str) -> TaskTemplate:
     answer_score = _score_terms(text, _ANSWER_INTENT)
     if text.endswith("?") or text.endswith("？"):
         answer_score += 1
+
+    edit_keywords = (
+        "edit", "write", "modify", "replace", "delete", "update", "refactor",
+        "implement", "add", "fix", "patch", "migrate", "debug", "create",
+        "修复", "实现", "重构", "添加", "删除", "优化", "修改", "改成", "改为", "写入", "创建"
+    )
+    has_change_intent = any(_contains_term(text, term) for term in edit_keywords)
+
+    if answer_score >= change_score and not has_change_intent:
+        return ANSWER_TEMPLATE
 
     if change_score > answer_score:
         return INVESTIGATE_TEMPLATE

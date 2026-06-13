@@ -82,3 +82,43 @@ def test_plan_gate_enriches_before_sql_warn() -> None:
     result = validate_plan(tree, project_root=__import__("pathlib").Path("."))
     assert result.passed
     assert "db/init/01_schema.sql" in tree.get("st-2").context_files  # type: ignore[union-attr]
+
+
+def test_resolve_project_paths_ambiguous_and_unique(tmp_path, caplog) -> None:
+    from src.planner.context_policy import resolve_project_paths
+    import logging
+
+    # Setup temporary files:
+    # 1. A unique file: src/utils/helper.py
+    # 2. Ambiguous files: db/init/init.sql and src/init.sql
+    unique_dir = tmp_path / "src" / "utils"
+    unique_dir.mkdir(parents=True, exist_ok=True)
+    unique_file = unique_dir / "helper.py"
+    unique_file.touch()
+
+    db_init_dir = tmp_path / "db" / "init"
+    db_init_dir.mkdir(parents=True, exist_ok=True)
+    init_sql1 = db_init_dir / "init.sql"
+    init_sql1.touch()
+
+    src_dir = tmp_path / "src"
+    init_sql2 = src_dir / "init.sql"
+    init_sql2.touch()
+
+    # Unique match should resolve to full path
+    paths = ["helper.py"]
+    resolved = resolve_project_paths(tmp_path, paths)
+    assert resolved == ["src/utils/helper.py"]
+
+    # Ambiguous match should log a warning and retain original path
+    with caplog.at_level(logging.WARNING):
+        paths_ambiguous = ["init.sql"]
+        resolved_ambiguous = resolve_project_paths(tmp_path, paths_ambiguous)
+        assert resolved_ambiguous == ["init.sql"]
+        assert any("ambiguous_path: init.sql matches multiple files" in record.message for record in caplog.records)
+
+    # Missing file should retain original path
+    paths_missing = ["nonexistent.py"]
+    resolved_missing = resolve_project_paths(tmp_path, paths_missing)
+    assert resolved_missing == ["nonexistent.py"]
+

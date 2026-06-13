@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import json
 import re
+import ast
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from src.context.retriever import build_context_queries
 from src.skills.base import SkillContext, SkillResult
+from src.skills.sql_ast import (
+    ProjectSqlAstCache,
+    extract_sql_literals_from_python,
+    parse_query,
+    parse_python_sql_queries,
+)
 from src.tools.registry import ToolRegistry
 
-_HYDRATION_VERSION = "edit_context_hydration_v5_sql_simplified_edit_context"
+_HYDRATION_VERSION = "edit_context_hydration_v4_view_dependency_columns"
 
 
 class CodeSearchSkill:
@@ -82,11 +90,15 @@ class CodeSearchSkill:
             )
         else:
             edit_context_json = ""
-        if errors and not outputs:
+        if hydrated.target_error:
+            missing_info_list = ["target_not_hydrated"]
+            for err in hydrated.target_error.split("; "):
+                missing_info_list.append(err)
             return SkillResult(
                 success=False,
-                summary="code_search failed: " + "; ".join(errors),
-                missing_info=tuple(errors),
+                summary=f"code_search target resolution failed: {hydrated.target_error}",
+                missing_info=tuple(missing_info_list),
+                warnings=tuple(hydrated.warnings),
                 metadata={
                     "search_output": search_output,
                     "edit_context_targets": str(_edit_context_target_count(hydrated.edit_context)),
@@ -96,11 +108,34 @@ class CodeSearchSkill:
                     "hydration_version": _HYDRATION_VERSION,
                     "edit_context_json": edit_context_json,
                     "hydration_hit_paths": "; ".join(hydrated.hit_paths[:8]),
+                    "warnings": json.dumps(hydrated.warnings, ensure_ascii=False),
                 },
             )
+        if errors and not outputs:
+            return SkillResult(
+                success=False,
+                summary="code_search failed: " + "; ".join(errors),
+                missing_info=tuple(errors),
+                warnings=tuple(hydrated.warnings),
+                metadata={
+                    "search_output": search_output,
+                    "edit_context_targets": str(_edit_context_target_count(hydrated.edit_context)),
+                    "hydration_root": str(self.project_root),
+                    "hydration_hits": str(hydrated.hit_count),
+                    "hydration_failures": "; ".join(hydrated.failures[:4]),
+                    "hydration_version": _HYDRATION_VERSION,
+                    "edit_context_json": edit_context_json,
+                    "hydration_hit_paths": "; ".join(hydrated.hit_paths[:8]),
+                    "warnings": json.dumps(hydrated.warnings, ensure_ascii=False),
+                },
+            )
+        summary = f"code_search completed {len(calls)} batched call(s)."
+        if hydrated.warnings:
+            summary += f" Warnings: {'; '.join(hydrated.warnings)}"
         return SkillResult(
             success=True,
-            summary=f"code_search completed {len(calls)} batched call(s).",
+            summary=summary,
+            warnings=tuple(hydrated.warnings),
             metadata={
                 "search_output": search_output,
                 "edit_context_targets": str(_edit_context_target_count(hydrated.edit_context)),
@@ -110,6 +145,7 @@ class CodeSearchSkill:
                 "hydration_version": _HYDRATION_VERSION,
                 "edit_context_json": edit_context_json,
                 "hydration_hit_paths": "; ".join(hydrated.hit_paths[:8]),
+                "warnings": json.dumps(hydrated.warnings, ensure_ascii=False),
             },
         )
 
@@ -230,7 +266,7 @@ def _append_fallback_search_calls(
 def _search_pattern(query: str, queries: list[str], root_query: str = "", file_type: str = "py") -> str:
     text = query.lower()
     root_text = root_query.lower()
-    
+
     is_view_change = (
         "视图" in query
         or "view" in text
@@ -249,7 +285,7 @@ def _search_pattern(query: str, queries: list[str], root_query: str = "", file_t
             for v in views_in_query:
                 sql_patterns.append(rf"\b{re.escape(v)}\b")
             return "|".join(dict.fromkeys(sql_patterns))
-    
+
     # 1. symbol 精确匹配
     symbols = _extract_symbols(query)
     if symbols:
@@ -328,7 +364,7 @@ def _search_pattern(query: str, queries: list[str], root_query: str = "", file_t
                 unique_terms.append(t)
             else:
                 unique_terms.append(re.escape(t))
-                
+
     return "|".join(unique_terms)
 
 
@@ -367,18 +403,22 @@ class _HydratedSearch:
         hit_count: int,
         failures: list[str],
         hit_paths: list[str],
+        target_error: str = "",
+        warnings: list[str] | None = None,
     ) -> None:
         self.snippets = snippets
         self.edit_context = edit_context
         self.hit_count = hit_count
         self.failures = failures
         self.hit_paths = hit_paths
+        self.target_error = target_error
+        self.warnings = warnings or []
 
 
 def _merge_ranges(ranges: list[tuple[int, int]], gap: int = 20, max_lines: int = 140) -> list[tuple[int, int]]:
     if not ranges:
         return []
-    
+
     # First split any range that is too large
     split_inputs = []
     for r_start, r_end in ranges:
@@ -405,132 +445,6 @@ def _merge_ranges(ranges: list[tuple[int, int]], gap: int = 20, max_lines: int =
     return merged
 
 
-def _optimize_snippet_body(body: str, file_path: str) -> str:
-    try:
-        # If the file is not python or sql, do not optimize
-        ext = file_path.split(".")[-1].lower() if "." in file_path else ""
-        if ext not in ("py", "sql"):
-            return body
-
-        # Extract the raw lines
-        raw_lines = []
-        line_prefixes = []
-        for line in body.splitlines():
-            parts = line.split(": ", 1)
-            if len(parts) == 2 and parts[0].strip().isdigit():
-                line_prefixes.append(parts[0] + ": ")
-                raw_lines.append(parts[1])
-            else:
-                line_prefixes.append("")
-                raw_lines.append(line)
-                
-        raw_content = "\n".join(raw_lines)
-        
-        optimized_raw = _simplify_long_sql(raw_content)
-        if optimized_raw == raw_content:
-            return body
-        
-        optimized_lines = optimized_raw.splitlines()
-        new_lines = []
-        start_line = 1
-        for prefix in line_prefixes:
-            if prefix:
-                m = re.match(r"^(\d+): ", prefix)
-                if m:
-                    start_line = int(m.group(1))
-                    break
-                    
-        for i, line in enumerate(optimized_lines):
-            new_lines.append(f"{start_line + i}: {line}")
-            
-        return "\n".join(new_lines)
-    except Exception:
-        return body
-
-
-def _simplify_long_sql(text: str, *, min_projection_chars: int = 120) -> str:
-    """Compress large SQL projections while preserving FROM/JOIN and column mapping."""
-    match = re.search(r"(?is)\bSELECT\b(?P<columns>[\s\S]+?)\bFROM\b", text)
-    if not match:
-        return text
-
-    columns_part = match.group("columns")
-    if len(columns_part.strip()) < min_projection_chars and "\n" not in columns_part:
-        return text
-
-    columns = _extract_projection_column_names(columns_part)
-    if not columns:
-        return text
-
-    indent_match = re.search(r"(?m)^(?P<indent>\s*)SELECT\b", text[match.start():])
-    indent = indent_match.group("indent") if indent_match else "    "
-    comment_indent = indent + "  "
-    mapping = (
-        f"\n{comment_indent}/* COLUMN MAPPING (Total {len(columns)} columns):\n"
-        f"{comment_indent}   "
-        + ", ".join(columns[:30])
-    )
-    if len(columns) > 30:
-        mapping += f" ... (+{len(columns) - 30} more)"
-    mapping += f"\n{comment_indent}*/\n{indent}"
-
-    from_index = match.end() - len("FROM")
-    return text[:match.start()] + "SELECT" + mapping + text[from_index:]
-
-
-def _extract_projection_column_names(columns_part: str) -> list[str]:
-    columns: list[str] = []
-    for col in _split_sql_projection(columns_part):
-        col = col.strip()
-        if not col:
-            continue
-        as_match = re.search(r"\bAS\s+([a-zA-Z0-9_\"'`\[\]]+)", col, re.I)
-        if as_match:
-            columns.append(_clean_sql_identifier(as_match.group(1)))
-            continue
-        parts = re.findall(r"\b[a-zA-Z0-9_.]+\b", col)
-        if parts:
-            columns.append(_clean_sql_identifier(parts[-1]))
-    return [col for col in dict.fromkeys(columns) if col]
-
-
-def _split_sql_projection(columns_part: str) -> list[str]:
-    out: list[str] = []
-    start = 0
-    depth = 0
-    quote = ""
-    for idx, ch in enumerate(columns_part):
-        if quote:
-            if ch == quote:
-                quote = ""
-            continue
-        if ch in {"'", '"', "`"}:
-            quote = ch
-            continue
-        if ch == "(":
-            depth += 1
-            continue
-        if ch == ")" and depth > 0:
-            depth -= 1
-            continue
-        if ch == "," and depth == 0:
-            out.append(columns_part[start:idx])
-            start = idx + 1
-    out.append(columns_part[start:])
-    return out
-
-
-def _edit_context_code_for_target(current_code: str, display: str, edit_strategy: str) -> str:
-    if edit_strategy != "sql_view_rewrite":
-        return current_code
-    simplified = _simplify_long_sql(current_code)
-    if simplified != current_code:
-        return simplified
-    if len(current_code) <= 6_000:
-        return current_code
-    return current_code[:6_000] + "\n# ... omitted after SQL context budget\n"
-
-
 def _hydrate_snippets(
     project_root: Path,
     search_output: str,
@@ -543,12 +457,6 @@ def _hydrate_snippets(
     **kwargs: object,
 ) -> _HydratedSearch:
     """Read bounded snippets around repo_map/grep hits; never expose raw full-file IO."""
-    task_analysis = kwargs.get("task_analysis")
-    analysis_strategy = ""
-    if isinstance(task_analysis, dict):
-        analysis_strategy = str(
-            task_analysis.get("edit_strategy") or task_analysis.get("intent") or ""
-        ).strip()
     if context is not None and context.context_pack is not None:
         budget_chars = context.context_pack.budget.get("snippet_chars")
         if budget_chars:
@@ -592,8 +500,10 @@ def _hydrate_snippets(
             flat_hits.append((resolved, display, start, end))
 
     snippets: list[str] = []
-    editable_targets: list[dict[str, object]] = []
+    evidence_targets: list[dict[str, object]] = []
     used_chars = 0
+    target_keys: set[tuple[str, int, int]] = set()
+
     ordered_hits = sorted(
         flat_hits,
         key=lambda item: (
@@ -622,19 +532,27 @@ def _hydrate_snippets(
         target_start = max(1, start)
         target_end = min(len(lines), end)
         if path.suffix == ".py":
-            target_start, target_end = _expand_python_symbol_range(
-                lines,
-                target_start,
-                target_end,
-                max_lines=1000,
-            )
+            ast_range = _view_ast_range_for_hit(project_root, display, target_start, target_end)
+            if ast_range is not None:
+                target_start, target_end = ast_range
+            else:
+                target_start, target_end = _expand_python_symbol_range(
+                    lines,
+                    target_start,
+                    target_end,
+                    max_lines=1000,
+                )
         elif path.suffix == ".sql":
-            target_start, target_end = _expand_sql_symbol_range(
-                lines,
-                target_start,
-                target_end,
-                max_lines=1000,
-            )
+            ast_range = _view_ast_range_for_hit(project_root, display, target_start, target_end)
+            if ast_range is not None:
+                target_start, target_end = ast_range
+            else:
+                target_start, target_end = _expand_sql_symbol_range(
+                    lines,
+                    target_start,
+                    target_end,
+                    max_lines=1000,
+                )
         if target_end < target_start:
             failures.append(
                 f"{display}:{start}-{end}: invalid target range "
@@ -646,21 +564,10 @@ def _hydrate_snippets(
             failures.append(f"{display}:{target_start}-{target_end}: empty target code")
             continue
         if path.suffix in {".py", ".ts", ".tsx", ".js", ".jsx", ".sql"}:
-            if _is_editable_target(
-                target_code,
-                display,
-                intended_change,
-                context,
-                edit_strategy=analysis_strategy,
-                task_analysis=task_analysis,
-            ):
-                edit_context_code = _edit_context_code_for_target(
-                    target_code,
-                    display,
-                    analysis_strategy,
-                )
+            if _is_editable_target(target_code, display, intended_change, context):
                 editable_targets.append({
                     "file": display,
+                    "symbol": symbol_lock.name if symbol_lock else "",
                     "start_line": target_start,
                     "end_line": target_end,
                     "current_code": target_code,
@@ -670,14 +577,14 @@ def _hydrate_snippets(
                     "intended_change": intended_change,
                     "acceptance_criteria": ["Target behavior is changed as requested."],
                 })
-            elif analysis_strategy == "sql_view_rewrite":
+            elif _is_sql_view_change(intended_change):
                 failures.append(
                     f"{display}:{target_start}-{target_end}: not editable for "
                     "SQL/view query change; no SELECT/FROM/JOIN table reference"
                 )
 
-        s = max(1, start - padding)
-        e = min(len(lines), end + padding)
+        s = max(1, target_start - padding)
+        e = min(len(lines), target_end + padding)
         if e < s:
             failures.append(f"{display}:{start}-{end}: invalid hydrated range {s}-{e}")
             continue
@@ -685,7 +592,6 @@ def _hydrate_snippets(
             f"{line_no}: {lines[line_no - 1]}"
             for line_no in range(s, e + 1)
         )
-        body = _optimize_snippet_body(body, display)
         chunk = f'<snippet path="{display}" lines="{s}-{e}">\n{body}\n</snippet>'
         if used_chars + len(chunk) <= max_chars:
             snippets.append(chunk)
@@ -693,11 +599,11 @@ def _hydrate_snippets(
         else:
             core_body = "\n".join(
                 f"{line_no}: {lines[line_no - 1]}"
-                for line_no in range(start, end + 1)
+                for line_no in range(target_start, target_end + 1)
             )
             core_body = _optimize_snippet_body(core_body, display)
             core_chunk = (
-                f'<snippet path="{display}" lines="{start}-{end}" status="truncated_to_core">\n'
+                f'<snippet path="{display}" lines="{target_start}-{target_end}" status="truncated_to_core">\n'
                 f"# Padding lines omitted due to token budget limits. Use read_file/view_file to view context.\n"
                 f"{core_body}\n"
                 f"</snippet>"
@@ -708,8 +614,8 @@ def _hydrate_snippets(
                 failures.append(f"{display}:{s}-{e}: snippet padded lines omitted due to budget")
             else:
                 ref_chunk = (
-                    f'<snippet path="{display}" lines="{start}-{end}" status="omitted_due_to_budget">\n'
-                    f"# Full snippet omitted due to token budget limits. Use read_file/view_file to view lines {start}-{end}.\n"
+                    f'<snippet path="{display}" lines="{target_start}-{target_end}" status="omitted_due_to_budget">\n'
+                    f"# Full snippet omitted due to token budget limits. Use read_file/view_file to view lines {target_start}-{target_end}.\n"
                     f"</snippet>"
                 )
                 if used_chars + len(ref_chunk) <= max_chars:
@@ -719,139 +625,435 @@ def _hydrate_snippets(
                 else:
                     failures.append(f"{display}:{s}-{e}: snippet skipped by display token budget")
 
+    resolution = resolve_targets(
+        context.user_request if context is not None else intended_change,
+        intended_change=intended_change,
+        context=context,
+        fallback_targets=evidence_targets,
+    )
+    primary_targets, target_failures = hydrate_targets(
+        root,
+        resolution,
+        intended_change=intended_change,
+    )
+
+    # Gather warnings and check hard failures
+    warnings_list = []
+    primary_symbol_not_found_errors = []
+    primary_not_hydrated_errors = []
+    no_sql_errors = []
+
+    hydrated_symbols = {str(t.get("symbol") or "") for t in primary_targets}
+
+    for failure in target_failures:
+        if ":" in failure:
+            reason, sym = failure.split(":", 1)
+            exists_in_repo = sym in hydrated_symbols
+            if reason != "primary_target_required":
+                exists_in_repo = True
+
+            if _is_primary_symbol(sym, intended_change, exists_in_repo):
+                if reason == "primary_target_required":
+                    primary_symbol_not_found_errors.append(failure)
+                elif reason == "current_code_required":
+                    primary_not_hydrated_errors.append(failure)
+                elif reason == "no_rewriteable_sql_found":
+                    if requires_editable_target:
+                        no_sql_errors.append(failure)
+                    else:
+                        warnings_list.append(failure)
+                else:
+                    warnings_list.append(failure)
+            else:
+                warnings_list.append(failure)
+
+    # Check if explicitly specified files exist
+    search_paths = tuple(
+        str(path).strip().replace("\\", "/").lstrip("./")
+        for path in (kwargs.get("search_paths") or ())
+        if str(path).strip()
+    )
+    explicit_files = _extract_explicit_files_from_query(intended_change)
+    file_not_found_errors = []
+    for path_str in list(search_paths) + explicit_files:
+        if "*" in path_str or not path_str.endswith((".py", ".sql", ".js", ".ts", ".tsx", ".jsx", ".json", ".toml", ".yaml", ".yml", ".md")):
+            continue
+        p = (root / path_str.lstrip("./")).resolve()
+        try:
+            if not p.is_file():
+                file_not_found_errors.append(f"file_not_found:{path_str}")
+        except OSError:
+            file_not_found_errors.append(f"file_not_found:{path_str}")
+
+    editable_targets = _merge_primary_and_evidence_targets(primary_targets, evidence_targets)
+    fully_hydrated_targets = []
+    for target in editable_targets:
+        if "inner_targets" not in target or not target.get("hydrated"):
+            hydrated_target = _resolve_inner_targets(target, resolution, intended_change)
+            fully_hydrated_targets.append(hydrated_target.to_edit_target(intended_change))
+        else:
+            fully_hydrated_targets.append(target)
+    editable_targets = fully_hydrated_targets
+
+    edit_context = build_edit_context(
+        editable_targets,
+        intended_change=intended_change,
+        project_root=root,
+        context=context,
+        resolution=resolution,
+        **kwargs,
+    )
+    edit_context_targets = _edit_context_target_count(edit_context)
+
+    hard_errors = list(file_not_found_errors) + list(primary_symbol_not_found_errors) + list(primary_not_hydrated_errors) + list(no_sql_errors)
+    if requires_editable_target and edit_context is None:
+        hard_errors.append("target_symbol_required")
+    if requires_editable_target and not hard_errors:
+        primary_symbols_in_query = [sym for sym in resolution.symbols if _is_primary_symbol(sym, intended_change, True)]
+        if primary_symbols_in_query:
+            matched_targets = [t for t in primary_targets if str(t.get("symbol")) in primary_symbols_in_query]
+            writable_matched = [t for t in matched_targets if not t.get("read_only") and not str(t.get("file", "")).endswith(".sql")]
+            if not matched_targets:
+                hard_errors.append("primary_target_required")
+            elif writable_matched and not any(str(t.get("current_code", "")).strip() for t in writable_matched):
+                hard_errors.append("current_code_required")
+            elif _is_sql_view_change(intended_change):
+                if writable_matched and not any(_code_contains_sql(str(t.get("current_code", ""))) or _has_dynamic_sql_clues(str(t.get("current_code", ""))) for t in writable_matched):
+                    hard_errors.append("no_rewriteable_sql_found")
+        else:
+            writable_edit_context_targets = len([t for t in editable_targets if not t.get("read_only") and not str(t.get("file", "")).endswith(".sql")])
+            if writable_edit_context_targets == 0:
+                hard_errors.append("current_code_required")
+
+    target_error = ""
+    if hard_errors:
+        unique_hard_errors = list(dict.fromkeys(hard_errors))
+        target_error = "; ".join(unique_hard_errors)
+
+    primary_snippets, used_chars = _snippets_for_targets(
+        root,
+        primary_targets,
+        padding=padding,
+        max_chars=max_chars,
+        used_chars=0,
+    )
+    if primary_snippets:
+        snippets = primary_snippets + snippets
+        used_chars = sum(len(chunk) for chunk in snippets)
+
     return _HydratedSearch(
         snippets=snippets,
-        edit_context=_build_edit_plan_context(
-            editable_targets,
-            intended_change=intended_change,
-            project_root=project_root,
-            context=context,
-            **kwargs,
-        ),
+        edit_context=edit_context,
         hit_count=len(file_hits),
-        failures=failures,
+        failures=failures + target_failures,
         hit_paths=[f"{display}:{start}-{end}" for _path, display, start, end in ordered_hits],
+        target_error=target_error,
+        warnings=warnings_list,
     )
+
+
+def _format_snippet(display: str, lines: list[str], start: int, end: int) -> str:
+    body = "\n".join(
+        f"{line_no}: {lines[line_no - 1]}"
+        for line_no in range(start, end + 1)
+    )
+    return f'<snippet path="{display}" lines="{start}-{end}">\n{body}\n</snippet>'
+
+
+def _merge_primary_and_evidence_targets(
+    primary_targets: list[dict[str, object]],
+    evidence_targets: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    merged: list[dict[str, object]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for target in [*primary_targets, *evidence_targets]:
+        key = (
+            str(target.get("file") or ""),
+            int(target.get("start_line") or 0),
+            int(target.get("end_line") or 0),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(target)
+    return merged
+
+
+def _snippets_for_targets(
+    project_root: Path,
+    targets: list[dict[str, object]],
+    *,
+    padding: int,
+    max_chars: int,
+    used_chars: int,
+) -> tuple[list[str], int]:
+    snippets: list[str] = []
+    for target in targets:
+        display = str(target.get("file") or "")
+        if not display:
+            continue
+        path = project_root / display
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        start = int(target.get("start_line") or 1)
+        end = int(target.get("end_line") or start)
+        s = max(1, start - padding)
+        e = min(len(lines), end + padding)
+        if e < s:
+            continue
+        chunk = _format_snippet(display, lines, s, e)
+        if used_chars + len(chunk) > max_chars:
+            continue
+        snippets.append(chunk)
+        used_chars += len(chunk)
+    return snippets, used_chars
+
+
+def _symbol_text_for_targeting(
+    context: SkillContext | None,
+    intended_change: str,
+) -> str:
+    parts = []
+    if context is not None:
+        parts.append(context.user_request)
+    parts.append(intended_change)
+    if context is not None:
+        parts.append(str(context.metadata.get("target_symbol", "") or ""))
+        if context.context_pack is not None:
+            parts.append(str(context.context_pack.metadata.get("target_symbol", "") or ""))
+    return " ".join(part for part in parts if part)
+
+
+def _target_view_from_context_or_text(
+    context: SkillContext | None,
+    text: str,
+) -> str:
+    if context is not None:
+        if context.context_pack is not None:
+            value = str(context.context_pack.metadata.get("target_view") or "").strip()
+            if value:
+                return value
+        value = str(context.metadata.get("target_view") or "").strip()
+        if value:
+            return value
+    views = _extract_views_from_text(text)
+    return views[0] if views else ""
+
+
+def _context_pack_symbols(context: SkillContext | None) -> list[str]:
+    if context is None or context.context_pack is None:
+        return []
+    symbols: list[str] = []
+    for info in context.context_pack.candidate_symbols:
+        name = str(info.get("name") or "").strip()
+        if name and not _looks_like_sql_variable(name):
+            symbols.append(name)
+    value = str(context.context_pack.metadata.get("target_symbol") or "").strip()
+    if value and not _looks_like_sql_variable(value):
+        symbols.insert(0, value)
+    return list(dict.fromkeys(symbols))
+
+
+def _extract_python_symbol_candidates(text: str) -> list[str]:
+    return list(dict.fromkeys(
+        symbol
+        for symbol in _extract_symbols(text)
+        if not _looks_like_sql_variable(symbol)
+        and not _looks_like_view_name(symbol)
+    ))
+
+
+def _looks_like_sql_variable(name: str) -> bool:
+    lowered = name.lower()
+    return lowered.endswith("sql") or lowered.endswith("_sql") or lowered in {"sql", "count_sql"}
+
+
+def _looks_like_view_name(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        lowered.startswith("v_")
+        or lowered.startswith("view_")
+        or lowered.endswith("_view")
+        or "_view_" in lowered
+    )
+
+
+def _resolve_inner_targets(
+    target: dict[str, object],
+    resolution: TargetResolution,
+    intended_change: str,
+) -> HydratedTarget:
+    current_code = str(target.get("current_code") or "")
+    sql_presence = _code_contains_sql(current_code)
+    inner: dict[str, object] = {}
+    is_readonly = target.get("read_only") or str(target.get("file", "")).endswith(".sql")
+    hydrated = bool(current_code.strip()) or is_readonly
+    sql_dynamic = False
+    has_clues = _has_dynamic_sql_clues(current_code)
+    if resolution.target_sql_kind == "count":
+        inner["sql_kind"] = "count"
+        literal = _select_count_literal(current_code, resolution.target_sql_variable)
+        if literal is None:
+            if has_clues:
+                sql_dynamic = True
+        else:
+            model = parse_query(literal.sql)
+            if model is None or not model.from_table:
+                sql_dynamic = True
+            else:
+                where_clean = model.where
+                if where_clean.upper().startswith("WHERE "):
+                    where_clean = where_clean[6:].strip()
+                inner.update({
+                    "sql_variable": literal.variable,
+                    "count_where_clause": where_clean,
+                    "count_clauses": {
+                        "where": where_clean,
+                        "joins": [join.to_dict() for join in model.joins],
+                        "from": model.from_table,
+                    }
+                })
+    else:
+        if not parse_python_sql_queries(current_code) and has_clues:
+            sql_dynamic = True
+    inner["sql_dynamic"] = sql_dynamic
+
+    ret_sql_kind = resolution.target_sql_kind
+    if ret_sql_kind == "count" and sql_dynamic:
+        ret_sql_kind = "dynamic_count_query"
+
+    return HydratedTarget(
+        file=str(target.get("file") or ""),
+        symbol=str(target.get("symbol") or target.get("name") or ""),
+        start_line=int(target.get("start_line") or 0),
+        end_line=int(target.get("end_line") or 0),
+        current_code=current_code,
+        sql_presence=sql_presence,
+        target_sql_kind=ret_sql_kind,
+        target_sql_variable=resolution.target_sql_variable,
+        hydrated=hydrated,
+        inner_targets=inner,
+        source=str(target.get("targeting") or resolution.source),
+    )
+
+
+def _select_count_literal(current_code: str, target_sql_variable: str):
+    literals = extract_sql_literals_from_python(current_code)
+    if target_sql_variable:
+        for literal in literals:
+            if literal.variable == target_sql_variable and _is_count_sql(literal.sql):
+                return literal
+    for literal in literals:
+        if _is_count_sql(literal.sql):
+            return literal
+    return None
+
+
+def _find_explicit_python_symbol_targets(
+    project_root: Path,
+    intended_change: str,
+    *,
+    symbol_text: str = "",
+) -> list[dict[str, object]]:
+    symbols = _extract_symbols(symbol_text or intended_change)
+    if not symbols:
+        return []
+    symbol_order = {symbol: idx for idx, symbol in enumerate(symbols)}
+    symbol_set = set(symbols)
+    targets: list[dict[str, object]] = []
+    for path in sorted(project_root.rglob("*.py")):
+        if _is_ignored_path(path):
+            continue
+        try:
+            code = path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(code)
+        except (OSError, SyntaxError):
+            continue
+        lines = code.splitlines()
+        display = str(path.resolve().relative_to(project_root)).replace("\\", "/")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                continue
+            if node.name not in symbol_set:
+                continue
+            start = int(getattr(node, "lineno", 1) or 1)
+            end = int(getattr(node, "end_lineno", start) or start)
+            current_code = "\n".join(lines[start - 1 : end])
+            if not current_code.strip():
+                continue
+            sql_presence = _code_contains_sql(current_code)
+            targets.append({
+                "file": display,
+                "symbol": node.name,
+                "start_line": start,
+                "end_line": end,
+                "current_code": current_code,
+                "intended_change": intended_change,
+                "acceptance_criteria": ["Target behavior is changed as requested."],
+                "targeting": "explicit_python_symbol_ast",
+                "sql_presence": sql_presence,
+            })
+    targets.sort(
+        key=lambda target: (
+            symbol_order.get(str(target.get("symbol") or ""), 10_000),
+            str(target.get("file") or ""),
+            int(target.get("start_line") or 0),
+        )
+    )
+    return targets
+
+
+def _is_ignored_path(path: Path) -> bool:
+    ignored = {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "node_modules",
+        ".mypy_cache",
+        ".pytest_cache",
+    }
+    return any(part in ignored for part in path.parts)
+
+
+def _code_contains_sql(code: str) -> bool:
+    return bool(re.search(r"(?is)\bSELECT\b.{0,500}\bFROM\b", code))
+
+
+def _has_dynamic_sql_clues(code: str) -> bool:
+    lowered = code.lower()
+    clues = ("sql", "query", "select", "count", "join", "from", "where")
+    return any(w in lowered for w in clues)
 
 
 def _find_all_views(project_root: Path) -> list[str]:
-    views = set()
-    pattern = re.compile(
-        r"\bCREATE\s+[^;]*?\bVIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_\.\"'\`\[\]]+)",
-        re.IGNORECASE
-    )
-    for path in project_root.rglob("*"):
-        try:
-            if path.suffix.lower() in {".sql", ".py"} and path.is_file():
-                content = path.read_text(encoding="utf-8", errors="ignore")
-                for match in pattern.finditer(content):
-                    raw_name = match.group(1)
-                    cleaned = re.sub(r'[\"\'\`\[\]]', '', raw_name)
-                    views.add(cleaned.lower())
-                    if '.' in cleaned:
-                        views.add(cleaned.split('.')[-1].lower())
-        except Exception:
-            pass
-    return sorted(list(views))
+    return ProjectSqlAstCache(project_root).view_names()
 
 
 def _find_all_view_details(project_root: Path) -> dict[str, dict[str, object]]:
     details: dict[str, dict[str, object]] = {}
-    pattern = re.compile(
-        r"\bCREATE\s+[^;]*?\bVIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-        r"(?P<name>[a-zA-Z0-9_\.\"'\`\[\]]+)\s+AS\s+"
-        r"(?P<select>SELECT\b[\s\S]*?)(?:;|$)",
-        re.IGNORECASE,
-    )
-    for path in project_root.rglob("*"):
-        try:
-            if path.suffix.lower() not in {".sql", ".py"} or not path.is_file():
-                continue
-            content = path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-        for match in pattern.finditer(content):
-            raw_name = match.group("name")
-            cleaned = re.sub(r'[\"\'\`\[\]]', '', raw_name).strip()
-            if not cleaned:
-                continue
-            columns = _extract_select_output_columns(match.group("select"))
-            replaces = _extract_all_tables_from_sql(match.group("select"))
-            detail = {
-                "role": "replacement_source",
-                "kind": "database_view",
-                "name": cleaned,
-                "columns": columns,
-                "replaces_objects": replaces,
-                "evidence": [str(path.relative_to(project_root)).replace("\\", "/")],
-                "confidence": 0.95,
-            }
-            for key in {cleaned.lower(), cleaned.split(".")[-1].lower()}:
-                details[key] = detail
+    for key, model in ProjectSqlAstCache(project_root).views().items():
+        details[key] = model.to_dependency_dict()
     return details
 
 
-def _extract_select_output_columns(sql: str) -> list[str]:
-    try:
-        import sqlparse
-
-        parsed = sqlparse.parse(sql)
-        if not parsed:
-            return []
-        stmt = parsed[0]
-        tokens = list(stmt.tokens)
-        select_idx = -1
-        from_idx = -1
-        for idx, token in enumerate(tokens):
-            if token.ttype is sqlparse.tokens.Keyword.DML and token.value.upper() == "SELECT":
-                select_idx = idx
-            elif token.ttype is sqlparse.tokens.Keyword and token.value.upper() == "FROM":
-                from_idx = idx
-                break
-        if select_idx < 0 or from_idx <= select_idx:
-            return []
-        columns: list[str] = []
-        for token in tokens[select_idx + 1 : from_idx]:
-            if token.is_whitespace:
-                continue
-            if isinstance(token, sqlparse.sql.IdentifierList):
-                items = list(token.get_identifiers())
-            elif isinstance(token, sqlparse.sql.Identifier):
-                items = [token]
-            else:
-                items = [token] if token.value.strip() and token.value.strip() != "," else []
-            for item in items:
-                if "*" in item.value:
-                    continue
-                alias = item.get_alias() if hasattr(item, "get_alias") else None
-                real_name = item.get_real_name() if hasattr(item, "get_real_name") else None
-                name = alias or real_name or item.value
-                clean = _clean_sql_identifier(name)
-                if clean and clean.lower() not in {"as", "case", "when", "then", "else", "end"}:
-                    columns.append(clean)
-        return list(dict.fromkeys(columns))
-    except Exception:
-        return []
-
-
-def _extract_all_tables_from_sql(sql: str) -> list[str]:
-    tables: list[str] = []
-    for match in re.finditer(
-        r"\b(?:FROM|JOIN)\s+[`\"\[]?([a-zA-Z0-9_.]+)[`\"\]]?",
-        sql,
-        re.IGNORECASE,
-    ):
-        tables.append(match.group(1).split(".")[-1].lower())
-    return list(dict.fromkeys(tables))
-
-
-def _clean_sql_identifier(raw: str) -> str:
-    text = raw.strip().split(".")[-1]
-    text = re.sub(r'[\"\'\`\[\]]', "", text)
-    text = re.sub(r"\W+$", "", text)
-    return text.strip()
-
-
+def _view_ast_range_for_hit(
+    project_root: Path,
+    display_file: str,
+    start: int,
+    end: int,
+) -> tuple[int, int] | None:
+    for view in ProjectSqlAstCache(project_root).views().values():
+        sql_range = view.sql_range
+        if sql_range is None or sql_range.file != display_file:
+            continue
+        if start <= sql_range.end_line and end >= sql_range.start_line:
+            return sql_range.start_line, sql_range.end_line
+    return None
 
 
 def _extract_views_from_text(text: str) -> list[str]:
@@ -970,42 +1172,42 @@ def _build_edit_plan_context(
         ).strip()
 
     target_view = ""
-    is_view = analysis_strategy == "sql_view_rewrite"
-    if is_view:
-        if context is not None:
-            if context.context_pack is not None:
-                target_view = context.context_pack.metadata.get("target_view") or ""
-            if not target_view:
-                target_view = context.metadata.get("target_view") or ""
+    if context is not None:
+        if context.context_pack is not None:
+            target_view = context.context_pack.metadata.get("target_view") or ""
         if not target_view:
-            target_view = str(kwargs.get("target_view") or "").strip()
-        if not target_view and isinstance(task_analysis, dict):
-            target_view = str(task_analysis.get("target_view") or "").strip()
-            if not target_view:
-                patch_intent = task_analysis.get("patch_intent")
-                if isinstance(patch_intent, dict):
-                    target_view = str(patch_intent.get("target_view") or "").strip()
-        if not target_view:
-            patch_intent_json = _extract_patch_intent_json(context, **kwargs)
-            if isinstance(patch_intent_json, dict):
-                target_view = str(patch_intent_json.get("target_view") or "").strip()
-        if not target_view and isinstance(task_analysis, dict):
-            resolved_deps = task_analysis.get("resolved_dependencies") or []
-            for dep in resolved_deps:
-                if isinstance(dep, dict) and dep.get("role") == "replacement_source":
-                    target_view = str(dep.get("name") or "").strip()
-                    break
+            target_view = context.metadata.get("target_view") or ""
+    if not target_view:
+        target_view = str(kwargs.get("target_view") or "").strip()
+    if not target_view:
+        target_view = _infer_target_view(intended_change, views, editable_targets)
         
     target_symbols = _extract_symbols(intended_change)
     target_symbol = target_symbols[0] if target_symbols else "目标代码"
     
-    edit_strategy = analysis_strategy or "general_edit"
+    is_view = "视图" in intended_change or "view" in intended_change.lower() or "sql" in intended_change.lower()
     operation = "replace_dependency" if is_view else "general_edit"
+    edit_strategy = "deterministic_rewrite"
+    if operation == "replace_dependency":
+        if target_sql_kind == "count":
+            if is_dynamic_count:
+                operation = "dynamic_count_query_rewrite"
+                edit_strategy = "dynamic_sql_rewrite"
+            else:
+                operation = "count_query_view_rewrite"
+                edit_strategy = "deterministic_rewrite"
+        else:
+            if has_dynamic_sql:
+                operation = "dynamic_sql_rewrite"
+                edit_strategy = "dynamic_sql_rewrite"
+            else:
+                edit_strategy = "deterministic_rewrite"
     
     replaces = []
     for target in editable_targets:
         code = str(target.get("current_code") or "")
-        replaces.extend(_extract_all_tables_from_python_code(code))
+        for query in parse_python_sql_queries(code):
+            replaces.extend(query.source_tables)
     replaces = list(dict.fromkeys(replaces))
     
     resolved_deps = []
@@ -1016,16 +1218,42 @@ def _build_edit_plan_context(
         evidence: list[str] = []
         if isinstance(detail, dict):
             columns = [str(col) for col in detail.get("columns") or [] if str(col).strip()]
+            column_sources = [
+                item
+                for item in detail.get("column_sources") or []
+                if isinstance(item, dict)
+            ]
+            source_to_view_column = {
+                str(key): str(value)
+                for key, value in (detail.get("source_to_view_column") or {}).items()
+            }
+            view_column_to_source = {
+                str(key): str(value)
+                for key, value in (detail.get("view_column_to_source") or {}).items()
+            }
+            column_defaults = {
+                str(key): str(value)
+                for key, value in (detail.get("column_defaults") or {}).items()
+            }
             evidence = [str(item) for item in detail.get("evidence") or [] if str(item).strip()]
             dep_replaces = list(dict.fromkeys(
                 dep_replaces
                 + [str(obj) for obj in detail.get("replaces_objects") or [] if str(obj).strip()]
             ))
+        else:
+            column_sources = []
+            source_to_view_column = {}
+            view_column_to_source = {}
+            column_defaults = {}
         resolved_deps.append({
             "role": "replacement_source",
             "kind": "database_view",
             "name": target_view,
             "columns": columns,
+            "column_sources": column_sources,
+            "source_to_view_column": source_to_view_column,
+            "view_column_to_source": view_column_to_source,
+            "column_defaults": column_defaults,
             "replaces_objects": dep_replaces,
             "evidence": evidence,
             "confidence": 0.95
@@ -1033,6 +1261,11 @@ def _build_edit_plan_context(
         
     edit_targets = []
     for target in editable_targets[:4]:
+        sql_literals = extract_sql_literals_from_python(str(target.get("current_code") or ""))
+        query_models = [
+            query.to_dict()
+            for query in parse_python_sql_queries(str(target.get("current_code") or ""))
+        ]
         edit_targets.append({
             "file": str(target.get("file") or ""),
             "symbol": str(target.get("symbol") or target.get("name") or target_symbol),
@@ -1040,7 +1273,12 @@ def _build_edit_plan_context(
             "display_code": str(target.get("display_code") or target.get("current_code") or ""),
             "hydration_simplified": bool(target.get("hydration_simplified")),
             "start_line": target.get("start_line"),
-            "end_line": target.get("end_line")
+            "end_line": target.get("end_line"),
+            "sql_queries": query_models,
+            "sql_literals": _sql_literal_metadata(sql_literals),
+            "sql_presence": bool(target.get("sql_presence", _code_contains_sql(str(target.get("current_code") or "")))),
+            "inner_targets": dict(target.get("inner_targets") or {}),
+            "symbol_lock": target.get("symbol_lock"),
         })
         
     return {
@@ -1052,7 +1290,13 @@ def _build_edit_plan_context(
         "dependencies_resolution_source": "search_hydration_advisory",
         "task_intent": {
             "operation": operation,
+            "edit_strategy": edit_strategy,
             "target_symbol": target_symbol,
+            "target_type": "sql_variable" if target_sql_variable else "symbol",
+            "parent_symbol": target_symbol,
+            "local_target": target_sql_variable,
+            "target_sql_kind": target_sql_kind,
+            "target_sql_variable": target_sql_variable,
             "goal": "use existing implementation/object instead of current query builder" if is_view else "edit code as requested"
         },
         "edit_targets": edit_targets,
@@ -1062,8 +1306,25 @@ def _build_edit_plan_context(
             "Prefer resolved_dependencies when present; fallback may use target_view and available columns",
             "Preserve public function signature",
             "Preserve returned field names used by callers",
-            "For SQL replacement, rebuild SELECT from replacement_source.columns and remove only replaces_objects JOINs"
-        ],
+        ] + (
+            [
+                "Keep original clauses/where_clause for list_sql unchanged.",
+                "Add count_clauses and count_where_clause for count_sql only.",
+                "Do not modify list_sql.",
+                "Do not call or edit build_order_detail_sql.",
+                "Replace o./p./f. aliases only inside count_clauses.",
+            ]
+            if operation == "dynamic_count_query_rewrite"
+            else (
+                [
+                    "For COUNT queries, rewrite the entire SQL statement. Do not just replace FROM/JOIN; you must also rewrite all column references and table aliases in the WHERE clause (and other clauses) to use the new view alias/columns."
+                ]
+                if target_sql_kind == "count"
+                else [
+                    "For SQL replacement, rebuild SELECT from replacement_source.columns and remove only replaces_objects JOINs"
+                ]
+            )
+        ),
         "acceptance": [
             {
                 "type": "diff_must_touch_symbol",
@@ -1089,8 +1350,63 @@ def _build_edit_plan_context(
         "intended_change": intended_change,
         "available_views": views,
         "target_view": target_view,
+        "target_sql_kind": target_sql_kind,
+        "target_sql_variable": target_sql_variable,
         "acceptance_criteria": ["Target behavior is changed as requested."],
     }
+
+
+def _infer_target_sql_kind(text: str) -> str:
+    lowered = text.lower()
+    if "count" in lowered or "计数" in text or "数量" in text or "总数" in text:
+        return "count"
+    return ""
+
+
+def _infer_target_sql_variable(text: str, target_sql_kind: str) -> str:
+    explicit = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*sql[A-Za-z0-9_]*)\b", text)
+    for name in explicit:
+        if target_sql_kind == "count" and "count" in name.lower():
+            return name
+    if target_sql_kind == "count":
+        return "count_sql"
+    return explicit[0] if explicit else ""
+
+
+def _target_symbol_from_context(context: SkillContext | None) -> str:
+    if context is None:
+        return ""
+    for source in (
+        context.metadata,
+        context.context_pack.metadata if context.context_pack is not None else {},
+    ):
+        value = str(source.get("target_symbol", "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _is_count_sql(sql: str) -> bool:
+    model = parse_query(sql)
+    if model is None:
+        return bool(re.search(r"(?is)\bSELECT\s+COUNT\s*\(", sql))
+    return any(
+        item.kind == "aggregate" and re.search(r"(?i)\bCOUNT\s*\(", item.expression)
+        for item in model.selects
+    )
+
+
+def _sql_literal_metadata(sql_literals: list[object]) -> list[dict[str, object]]:
+    metadata: list[dict[str, object]] = []
+    for literal in sql_literals:
+        sql = str(getattr(literal, "sql", "") or "")
+        model = parse_query(sql)
+        metadata.append({
+            "variable": str(getattr(literal, "variable", "") or ""),
+            "kind": "count" if _is_count_sql(sql) else "query",
+            "source_tables": model.source_tables if model is not None else [],
+        })
+    return metadata
 
 
 def _extract_symbols(query: str) -> list[str]:
@@ -1100,6 +1416,8 @@ def _extract_symbols(query: str) -> list[str]:
         "if", "else", "elif", "for", "while", "in", "not", "and", "or", "try", "except",
         "view", "query", "sql", "db", "api", "file", "line", "symbol", "snippet",
         "code", "evidence", "test", "orders", "order", "boarding", "ticket",
+        "count", "select", "where", "join", "from",
+        "need", "list", "app", "py", "init", "subtask", "main", "st", "replan",
         "视图", "查询", "接口", "订单", "登机牌", "机票", "航班", "报表", "方法",
         "change", "replace", "use", "with", "the", "this", "method", "function",
         "using", "into", "from", "to", "for", "in", "of", "and", "a", "an", "is",
@@ -1110,6 +1428,53 @@ def _extract_symbols(query: str) -> list[str]:
         if token.lower() not in stopwords:
             symbols.append(token)
     return symbols
+
+
+def _is_code_style(token: str, query: str) -> bool:
+    if "_" in token and not token.startswith("_") and not token.endswith("_"):
+        return True
+    if re.match(r"^[A-Z][a-z0-9]+[A-Z][a-zA-Z0-9]*$", token):
+        return True
+    escaped = re.escape(token)
+    if re.search(rf"[`'\"]{escaped}[`'\"]|\b{escaped}\s*\(", query):
+        return True
+    return False
+
+
+def _is_primary_symbol(symbol: str, query: str, symbol_exists_in_repo: bool) -> bool:
+    stopwords = {
+        "def", "class", "async", "await", "return", "import", "from", "as",
+        "if", "else", "elif", "for", "while", "in", "not", "and", "or", "try", "except",
+        "view", "query", "sql", "db", "api", "file", "line", "symbol", "snippet",
+        "code", "evidence", "test", "orders", "order", "boarding", "ticket",
+        "count", "select", "where", "join", "from",
+        "need", "list", "app", "py", "init", "subtask", "main", "st", "replan",
+        "视图", "查询", "接口", "订单", "登机牌", "机票", "航班", "报表", "方法",
+        "change", "replace", "use", "with", "the", "this", "method", "function",
+        "using", "into", "from", "to", "for", "in", "of", "and", "a", "an", "is",
+        "用", "替换", "这个", "改成", "修改", "使用"
+    }
+    lowered = symbol.lower()
+    if lowered in stopwords:
+        return False
+    soft_or_noise = {
+        "count", "list", "app", "init", "view", "sql", "join", "query", "main", "py",
+        "subtask", "st", "replan", "file"
+    }
+    if lowered in soft_or_noise:
+        return False
+    return symbol_exists_in_repo or _is_code_style(symbol, query)
+
+
+def _extract_explicit_files_from_query(query: str) -> list[str]:
+    files = []
+    for token in re.split(r"[\s`']+", query):
+        token = token.strip(".,;:?!()")
+        if "." in token:
+            ext = token.split(".")[-1].lower()
+            if ext in {"py", "sql", "js", "ts", "tsx", "jsx", "json", "toml", "yaml", "yml", "md"}:
+                files.append(token)
+    return files
 
 
 def _find_enclosing_python_symbol_range(lines: list[str], line_no: int) -> tuple[int, int]:
@@ -1160,6 +1525,36 @@ def _expand_python_symbol_range(
     target_start = max(sym_start, mid - max_lines // 2)
     target_end = min(sym_end, target_start + max_lines - 1)
     return target_start, target_end
+
+
+def _python_symbol_lock(
+    code: str,
+    *,
+    file: str,
+    absolute_start: int,
+) -> TargetSymbol | None:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+    ]
+    if len(nodes) != 1:
+        return None
+    node = nodes[0]
+    relative_start = int(getattr(node, "lineno", 1) or 1)
+    relative_end = int(getattr(node, "end_lineno", relative_start) or relative_start)
+    return TargetSymbol(
+        name=node.name,
+        file=file,
+        range=(
+            absolute_start + relative_start - 1,
+            absolute_start + relative_end - 1,
+        ),
+    )
 
 
 def _find_enclosing_sql_range(lines: list[str], line_no: int) -> tuple[int, int]:
@@ -1371,48 +1766,31 @@ def _is_editable_target(
         if context.context_pack is not None:
             for f_info in context.context_pack.candidate_files:
                 f_path = str(f_info.get("file") or "")
-                if f_path:
-                    target_files.add(f_path.replace("\\", "/"))
-            for r_path in context.context_pack.relevant_files:
-                target_files.add(r_path.replace("\\", "/"))
-
-    file_matched = False
-    if target_files:
-        clean_display = display_file.replace("\\", "/")
-        for tf in target_files:
-            if clean_display == tf or clean_display.endswith("/" + tf) or tf.endswith("/" + clean_display):
-                file_matched = True
-                break
-    else:
-        file_matched = True
-
-    if not file_matched:
-        return False
-
-    has_sql = False
-    lowered_code = current_code.lower()
-    if re.search(r"(?is)\bSELECT\b.*\bFROM\b", current_code):
-        has_sql = True
-    elif re.search(r"(?is)\b(?:FROM|JOIN)\s+[`\"]?[A-Za-z_][A-Za-z0-9_]*", current_code):
-        has_sql = True
-    elif any(kw in lowered_code for kw in ("select", "from", "join", "view")):
-        has_sql = True
-    elif any(term in lowered_code for term in ("sql", "query", "database", "table")):
-        has_sql = True
-    is_sql_change = edit_strategy == "sql_view_rewrite"
-
+                if display_file == f_path or display_file.endswith("/" + f_path) or f_path.endswith("/" + display_file):
+                    handoff_matched = True
+                    break
+            if not handoff_matched:
+                for s_info in context.context_pack.candidate_symbols:
+                    s_name = str(s_info.get("name") or "")
+                    if re.search(rf"(?:\b|_){re.escape(s_name)}(?:\b|_)", current_code, re.IGNORECASE):
+                        handoff_matched = True
+                        break
+            if not handoff_matched:
+                for r_path in context.context_pack.relevant_files:
+                    if display_file == r_path or display_file.endswith("/" + r_path) or r_path.endswith("/" + display_file):
+                        handoff_matched = True
+                        break
+                        
+    has_sql = bool(re.search(r"(?is)\bSELECT\b.{0,200}\bFROM\b|\b(?:FROM|JOIN)\s+[`\"]?[A-Za-z_][A-Za-z0-9_]*", current_code))
+    is_sql_change = _is_sql_view_change(intended_change)
+    
     if display_file.endswith(".sql"):
-        return has_sql or bool(re.search(r"(?is)\b(SELECT|FROM|JOIN|VIEW)\b", current_code))
-
+        return has_sql and (symbol_matched or handoff_matched or is_sql_change)
+        
     if is_sql_change:
-        has_sql_terms = bool(re.search(
-            r"(?is)\b(SELECT|FROM|JOIN|VIEW|SQL|QUERY|DB|schema|database|table)\b",
-            current_code + " " + display_file
-        ))
-        symbol_has_sql = any("sql" in sym.lower() or "query" in sym.lower() or "db" in sym.lower() or "view" in sym.lower() for sym in target_symbols)
-        return has_sql or has_sql_terms or symbol_has_sql
-
-    return True
+        return (symbol_matched or handoff_matched) and has_sql
+        
+    return symbol_matched or handoff_matched
 
 
 def _is_sql_view_change(text: str) -> bool:
@@ -1474,18 +1852,20 @@ def _edit_context_target_count(edit_context: dict[str, object] | None) -> int:
         return 0
     targets = edit_context.get("editable_targets")
     return len(targets) if isinstance(targets, list) else 0
+    if line_no <= 1:
+        return path.is_file()
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for idx, _line in enumerate(fh, start=1):
+                if idx >= line_no:
+                    return True
+    except OSError:
+        return False
+    return False
 
 
-def _extract_all_tables_from_python_code(code: str) -> list[str]:
-    string_pattern = re.compile(
-        r'(?P<quote>"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\')',
-        re.DOTALL
-    )
-    tables = set()
-    for match in string_pattern.finditer(code):
-        quote_content = match.group("quote")
-        inner = quote_content[3:-3] if quote_content.startswith(('"""', "'''")) else quote_content[1:-1]
-        if "SELECT" in inner.upper() and "FROM" in inner.upper():
-            for m in re.finditer(r"\b(?:FROM|JOIN)\s+[`\"]?([a-zA-Z0-9_.]+)[`\"]?", inner, re.IGNORECASE):
-                tables.add(m.group(1).split(".")[-1].lower())
-    return sorted(list(tables))
+def _edit_context_target_count(edit_context: dict[str, object] | None) -> int:
+    if not edit_context:
+        return 0
+    targets = edit_context.get("editable_targets")
+    return len(targets) if isinstance(targets, list) else 0

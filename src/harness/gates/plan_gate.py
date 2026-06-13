@@ -160,7 +160,7 @@ def validate_plan(
     task_analysis: HarnessTaskAnalysis | None = None,
 ) -> GateResult:
     """Rule-based PlanGate on a parsed TaskTree — no LLM calls."""
-    enrich_task_tree_context_files(tree)
+    enrich_task_tree_context_files(tree, project_root)
 
     blocks: list[str] = []
     warns: list[str] = []

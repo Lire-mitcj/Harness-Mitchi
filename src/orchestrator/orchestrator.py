@@ -98,6 +98,30 @@ def _compact_preview(text: str, *, limit: int = 500) -> str:
     return preview[: limit - 3] + "..."
 
 
+def _primary_edit_target_from_metadata(
+    metadata: dict[str, str],
+) -> tuple[str, str]:
+    raw = str(metadata.get("edit_context_json") or "").strip()
+    if not raw:
+        return "", ""
+    try:
+        ctx = json.loads(raw)
+    except json.JSONDecodeError:
+        return "", ""
+    targets = ctx.get("editable_targets")
+    if not isinstance(targets, list) or not targets:
+        targets = ctx.get("edit_targets")
+    if not isinstance(targets, list) or not targets:
+        return "", ""
+    first = targets[0]
+    if not isinstance(first, dict):
+        return "", ""
+    return (
+        str(first.get("file") or "").strip(),
+        str(first.get("symbol") or first.get("name") or "").strip(),
+    )
+
+
 def _restore_original_files(project_root: Any, raw: str) -> str:
     if not raw:
         return ""
@@ -144,6 +168,7 @@ class OrchestratorState:
     plan_gate_replans: int = 0
     discovery_manifest: DiagnosticsManifest | None = None
     subtask_attempts: dict[str, int] = field(default_factory=dict)
+    failure_fingerprints: dict[str, int] = field(default_factory=dict)
     subtask_summaries: dict[str, str] = field(default_factory=dict)
     subtask_exploration_digests: dict[str, str] = field(default_factory=dict)
     task_analysis: HarnessTaskAnalysis | None = None
@@ -962,11 +987,6 @@ class OrchestratorLoop:
             "code_search",
             skill_context,
             extra_query=f"{task_tree.root_task} {node.description} {node.acceptance_criteria}",
-            task_analysis=(
-                self.state.task_analysis.to_dict()
-                if self.state.task_analysis is not None
-                else {}
-            ),
         )
         elapsed = time.perf_counter() - started
         search_output = str(search.metadata.get("search_output", ""))
@@ -1207,11 +1227,6 @@ class OrchestratorLoop:
             "code_search",
             skill_context,
             extra_query=f"{task_tree.root_task} {node.description}",
-            task_analysis=(
-                self.state.task_analysis.to_dict()
-                if self.state.task_analysis is not None
-                else {}
-            ),
         )
         search_elapsed = time.perf_counter() - search_started
         search_output = search.metadata.get("search_output", "")
@@ -1275,14 +1290,20 @@ class OrchestratorLoop:
             )
             return
 
+        target_file, target_symbol = _primary_edit_target_from_metadata(search.metadata)
+        edit_label = f"code_edit · {target_file}" if target_file else "code_edit"
+        if target_symbol and target_file:
+            edit_label += f" · {target_symbol}"
         yield AgentEvent(
             type=EventType.STATUS,
-            content=f"SkillExecutor [{node.id}] · code_edit",
+            content=f"SkillExecutor [{node.id}] · {edit_label}",
             data=_skill_status_data(
                 subtask_id=node.id,
                 spinner_only=True,
                 llm_loading=True,
                 skill="code_edit",
+                target_file=target_file,
+                target_symbol=target_symbol,
             ),
         )
         edit_started = time.perf_counter()
@@ -1296,34 +1317,7 @@ class OrchestratorLoop:
             user_request=f"{task_tree.root_task}\n\nSubtask: {node.description}",
             prior_summaries=prior_ctx,
             current_search_output=str(search_output),
-            global_summaries=self.state.subtask_summaries,
         )
-        edit_analysis = _analysis_for_edit(
-            self.state.task_analysis,
-            prior_ctx,
-            self.state.subtask_summaries,
-        )
-        if not edit_analysis.get("edit_ready"):
-            failed_checks = [k for k, v in edit_analysis.get("readiness_checks", {}).items() if not v]
-            msg = f"Harness edit_ready=false. The handoff from prior design/diagnose steps is incomplete or missing required fields. Missing readiness checks: {', '.join(failed_checks) if failed_checks else 'all'}."
-            yield AgentEvent(
-                type=EventType.STATUS,
-                content=f"SkillExecutor [{node.id}] · code_edit blocked: {msg}",
-                data=_skill_status_data(subtask_id=node.id, skill_error=True),
-            )
-            yield self._skill_failure_stream_end(
-                node,
-                msg,
-                exploration_digest=str(search_output),
-            )
-            return
-
-        search_output = _append_effective_edit_context(
-            str(search_output),
-            handoff_contract=contract,
-            edit_analysis=edit_analysis,
-        )
-
         edit = await self._skill_executor.run(
             "code_edit",
             SkillContext(
@@ -1333,7 +1327,6 @@ class OrchestratorLoop:
             instruction=f"{task_tree.root_task}\n\nSubtask: {node.description}",
             search_output=search_output,
             handoff_contract=contract,
-            task_analysis=edit_analysis,
         )
         edit_elapsed = time.perf_counter() - edit_started
         yield AgentEvent(
@@ -1355,6 +1348,15 @@ class OrchestratorLoop:
             },
         )
         if not edit.success:
+            failure_type = str(edit.missing_info[0] if edit.missing_info else "code_edit")
+            fingerprint = "|".join([
+                target_symbol,
+                _edit_operation_from_search_output(str(search_output)),
+                failure_type,
+                ",".join(edit.changed_files),
+            ])
+            fingerprint_count = self.state.failure_fingerprints.get(fingerprint, 0) + 1
+            self.state.failure_fingerprints[fingerprint] = fingerprint_count
             edit_preview = _compact_preview(edit.metadata.get("raw_preview", ""))
             preview_suffix = f" raw_preview={edit_preview}" if edit_preview else ""
             yield AgentEvent(
@@ -1368,6 +1370,7 @@ class OrchestratorLoop:
             yield self._skill_failure_stream_end(
                 node,
                 edit.summary,
+                requires_executor_fallback=fingerprint_count < 2,
                 exploration_digest=str(search_output),
             )
             return
@@ -1381,12 +1384,6 @@ class OrchestratorLoop:
             ),
             changed_files=edit.changed_files,
             handoff_contract=contract,
-            task_analysis=_analysis_for_edit(
-                self.state.task_analysis,
-                prior_ctx,
-                self.state.subtask_summaries,
-            ),
-            search_output=search_output,
         )
         validation_elapsed = time.perf_counter() - validation_started
         content = (
@@ -2167,6 +2164,20 @@ def _extract_marker_json_block(text: str, marker: str) -> str:
                 end = idx
                 break
     return payload[start : end + 1] if end >= start else ""
+
+
+def _edit_operation_from_search_output(search_output: str) -> str:
+    block = _extract_marker_json_block(search_output, "EDIT_CONTEXT_JSON")
+    if not block:
+        return ""
+    try:
+        payload = json.loads(block)
+    except json.JSONDecodeError:
+        return ""
+    task_intent = payload.get("task_intent") if isinstance(payload, dict) else None
+    if not isinstance(task_intent, dict):
+        return ""
+    return str(task_intent.get("operation") or "")
 
 
 def _apply_context_pack_to_subtask(node: SubTaskNode, context_pack: Any | None) -> None:

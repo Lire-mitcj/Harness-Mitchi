@@ -60,3 +60,23 @@ def test_repair_trailing_comma() -> None:
     raw = '{"root_task":"x","nodes":[{"id":"st-1","kind":"diagnose",},]}'
     payload = _extract_json(raw)
     assert payload.get("root_task") == "x"
+
+
+def test_task_template_selection_refinement() -> None:
+    # 1. Pure queries should map to ANSWER_TEMPLATE
+    t1 = select_task_template("查询机票有哪些视图")
+    assert t1.mode == TaskMode.ANSWER
+
+    t2 = select_task_template("show all user tables")
+    assert t2.mode == TaskMode.ANSWER
+
+    t3 = select_task_template("有哪些航班查询接口？")
+    assert t3.mode == TaskMode.ANSWER
+
+    # 2. Queries with edit/change keywords should map to INVESTIGATE_TEMPLATE
+    t4 = select_task_template("修改机票查询视图的逻辑")
+    assert t4.mode == TaskMode.INVESTIGATE
+
+    t5 = select_task_template("add a new column to passenger table")
+    assert t5.mode == TaskMode.INVESTIGATE
+

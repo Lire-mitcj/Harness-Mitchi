@@ -639,7 +639,7 @@ def commit_subtask_success(
 
     if node.kind == SubTaskKind.DIAGNOSE and summary:
         propagate_diagnose_paths(task_tree, node.id, summary, project_root)
-        enrich_task_tree_context_files(task_tree)
+        enrich_task_tree_context_files(task_tree, project_root)
         context_updated = True
 
     return SubtaskCommitResult(

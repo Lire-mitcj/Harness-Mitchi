@@ -22,6 +22,7 @@ class SkillResult:
     changed_files: tuple[str, ...] = ()
     validation_result: str = ""
     missing_info: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
     requires_fallback: bool = False
     metadata: dict[str, str] = field(default_factory=dict)
 

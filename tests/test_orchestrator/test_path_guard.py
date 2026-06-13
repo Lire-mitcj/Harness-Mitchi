@@ -74,3 +74,26 @@ def test_restore_original_files_restores_only_project_files(tmp_path: Path) -> N
     assert target.read_text(encoding="utf-8") == "original"
     assert "restored app.py" in result
     assert "outside.py" in result
+
+
+def test_primary_edit_target_from_metadata_reads_first_editable_target() -> None:
+    from src.orchestrator.orchestrator import _primary_edit_target_from_metadata
+
+    file, symbol = _primary_edit_target_from_metadata({
+        "edit_context_json": json.dumps({
+            "editable_targets": [
+                {
+                    "file": "main.py",
+                    "symbol": "admin_list_orders",
+                    "current_code": "def admin_list_orders(): ...",
+                },
+                {
+                    "file": "other.py",
+                    "symbol": "other",
+                },
+            ],
+        })
+    })
+
+    assert file == "main.py"
+    assert symbol == "admin_list_orders"

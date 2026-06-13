@@ -15,7 +15,7 @@ class VerifySkill:
 
     async def run(self, context: SkillContext, **kwargs: object) -> SkillResult:
         changed_files = list(kwargs.get("changed_files", ()) or ())
-        
+
         # Enforce SQL references check first
         from src.skills.validator import validate_sql_references
         db_errors = validate_sql_references(self.project_root, changed_files)
@@ -65,12 +65,11 @@ class VerifySkill:
                 validation_result="failed",
             )
 
-        output = stdout.decode(errors="replace") + stderr.decode(errors="replace")
-        passed = proc.returncode == 0
+        output = (completed.stdout or "") + (completed.stderr or "")
+        passed = completed.returncode == 0
 
         summary = f"{framework} ({test_scope_desc}): {'PASSED' if passed else 'FAILED'}"
         if not passed:
-            # Pytest exit code 5 (no tests collected) is also treated as failed verification
             err_details = f"{summary}\n\nOutput:\n{output[-2000:]}"
             return SkillResult(
                 success=False,

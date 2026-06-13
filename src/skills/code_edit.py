@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import ast
+import asyncio
+import difflib
+import inspect
 import json
 import re
+import textwrap
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-import sqlparse
-
-
 from src.skills.base import SkillContext, SkillResult
+from src.skills.sql_ast import (
+    extract_sql_literals_from_python,
+    parse_query,
+    rewrite_query_with_view,
+)
 
 EditComplete = Callable[[list[dict[str, object]]], Awaitable[str]]
 
@@ -21,9 +28,13 @@ class CodeEditSkill:
         *,
         project_root: Path,
         llm_complete: EditComplete | None = None,
+        edit_plan_timeout: float = 12.0,
+        patch_window_timeout: float = 25.0,
     ) -> None:
         self.project_root = project_root.resolve()
         self.llm_complete = llm_complete
+        self.edit_plan_timeout = edit_plan_timeout
+        self.patch_window_timeout = patch_window_timeout
 
     async def run(self, context: SkillContext, **kwargs: object) -> SkillResult:
         plan = context.patch_plan
@@ -109,6 +120,14 @@ class CodeEditSkill:
             )
         instruction = str(kwargs.get("instruction") or context.user_request).strip()
         evidence = str(kwargs.get("search_output") or "").strip()
+        progress_events: list[dict[str, object]] = []
+        progress_callback = kwargs.get("progress_callback")
+        await _emit_progress(
+            progress_events,
+            progress_callback,
+            "code_edit.started",
+            instruction=instruction,
+        )
         if not evidence:
             return SkillResult(
                 success=False,
@@ -141,27 +160,18 @@ class CodeEditSkill:
                         break
             if replacement_source_name:
                 edit_context["target_view"] = replacement_source_name
-
-        if isinstance(edit_context, dict):
-            authoritative_targets = _filter_authoritative_targets(
-                _editable_targets(edit_context),
-                edit_context,
-                self.project_root,
-            )
-            if authoritative_targets is not None:
-                if not authoritative_targets:
-                    return SkillResult(
-                        success=False,
-                        summary=(
-                            "code_edit not ready: target_context_missing; "
-                            "PATCH_INTENT_JSON target is not present in EDIT_CONTEXT_JSON hydration"
-                        ),
-                        missing_info=("target_context_missing",),
-                        metadata={"raw_preview": _preview(evidence)},
+            else:
+                t_view = _extract_target_view_from_contract(contract if isinstance(contract, dict) else None)
+                if not t_view:
+                    t_view = _select_target_view(
+                        evidence=evidence,
+                        instruction=instruction,
+                        handoff_contract=contract if isinstance(contract, dict) else None,
                     )
-                edit_context["editable_targets"] = authoritative_targets
-                edit_context["snippets"] = authoritative_targets
-                evidence = _replace_marker_json(evidence, "EDIT_CONTEXT_JSON", edit_context)
+                if t_view:
+                    edit_context["target_view"] = t_view
+
+        _lock_edit_context_symbols(edit_context)
 
         ready_error = _validate_edit_context_ready(self.project_root, edit_context)
         if ready_error:
@@ -171,21 +181,34 @@ class CodeEditSkill:
                 missing_info=(ready_error,),
                 metadata={"raw_preview": _preview(evidence)},
             )
+        target_symbol = _target_symbol_from_edit_context(edit_context)
+        await _emit_progress(
+            progress_events,
+            progress_callback,
+            "target.selected",
+            symbol=target_symbol,
+        )
         plan_messages = _edit_plan_messages(
             instruction=instruction,
             evidence=evidence,
             handoff_contract=contract if isinstance(contract, dict) else None,
         )
-        plan_raw = await self.llm_complete(plan_messages)
+        try:
+            plan_raw = await asyncio.wait_for(
+                self.llm_complete(plan_messages),
+                timeout=self.edit_plan_timeout,
+            )
+        except TimeoutError:
+            return SkillResult(
+                success=False,
+                summary="EditPlanBuilder timed out.",
+                missing_info=("edit_plan_timeout",),
+                metadata={"progress_events": json.dumps(progress_events)},
+            )
         plan_payload = _extract_json_payload(plan_raw)
         edit_targets = _editable_targets(edit_context)
         if plan_payload is None:
-            payload = _fallback_edit_payload(
-                edit_context,
-                evidence=evidence,
-                instruction=instruction,
-                handoff_contract=contract if isinstance(contract, dict) else None,
-            )
+            payload = None
             raw_preview = plan_raw
         else:
             payload, raw_preview = await self._build_payload_from_plan(
@@ -193,6 +216,8 @@ class CodeEditSkill:
                 edit_targets=edit_targets,
                 instruction=instruction,
                 evidence=evidence,
+                progress_events=progress_events,
+                progress_callback=progress_callback,
             )
         if payload is None:
             return SkillResult(
@@ -201,8 +226,11 @@ class CodeEditSkill:
                     "code_edit could not produce a valid structured edit plan, "
                     "and no deterministic SQL view edit could be derived."
                 ),
-                missing_info=("edit_plan_json", "deterministic_edit"),
-                metadata={"raw_preview": _preview(raw_preview)},
+                missing_info=("edit_plan_json",),
+                metadata={
+                    "raw_preview": _preview(raw_preview),
+                    "progress_events": json.dumps(progress_events),
+                },
             )
 
         edits = payload.get("edits")
@@ -216,14 +244,20 @@ class CodeEditSkill:
                     f"(confidence={confidence}, missing_info={missing})"
                 ),
                 missing_info=tuple(str(item) for item in missing if isinstance(item, str)),
-                metadata={"raw_preview": _preview(raw_preview)},
+                metadata={
+                    "raw_preview": _preview(raw_preview),
+                    "progress_events": json.dumps(progress_events),
+                },
             )
         if not isinstance(edits, list) or not edits:
             return SkillResult(
                 success=False,
                 summary="code_edit model returned no edits.",
                 missing_info=("edits",),
-                metadata={"raw_preview": _preview(raw_preview)},
+                metadata={
+                    "raw_preview": _preview(raw_preview),
+                    "progress_events": json.dumps(progress_events),
+                },
             )
 
         changed: list[str] = []
@@ -237,8 +271,7 @@ class CodeEditSkill:
             new_string = str(item.get("new_string") or "")
             if not path or not old_string or not new_string:
                 errors.append(
-                    f"edits[{idx}] requires target_index+new_string or "
-                    "path+old_string+new_string"
+                    f"edits[{idx}] requires path+old_string+new_string"
                 )
                 continue
             if old_string == new_string:
@@ -247,15 +280,44 @@ class CodeEditSkill:
             if len(old_string) > 50_000 or len(new_string) > 50_000:
                 errors.append(f"edits[{idx}] is too large; use a smaller exact snippet")
                 continue
+            target = _find_target_for_edit(path, old_string, edit_targets)
+            if target is None:
+                errors.append(f"edits[{idx}] is not contained in an editable target")
+                continue
+            current_code = str(target.get("current_code") or "")
+            symbol = str(target.get("symbol") or target.get("name") or target_symbol)
+            if current_code.count(old_string) != 1:
+                errors.append(
+                    f"edits[{idx}] old_string occurrence count in target symbol is "
+                    f"{current_code.count(old_string)}, expected 1"
+                )
+                continue
+            syntax_error = _validate_python_patch(
+                path=path,
+                current_code=current_code,
+                old_string=old_string,
+                new_string=new_string,
+            )
+            if syntax_error:
+                errors.append(f"edits[{idx}] {syntax_error}")
+                continue
             result = _apply_exact_edit(
                 self.project_root,
                 path=path,
                 old_string=old_string,
                 new_string=new_string,
                 original_files=original_files,
+                target_item=target,
             )
             if result.startswith("ok:"):
                 changed.append(result[3:])
+                await _emit_progress(
+                    progress_events,
+                    progress_callback,
+                    "patch.applied",
+                    file=path,
+                    symbol=symbol,
+                )
             else:
                 errors.append(result)
 
@@ -265,8 +327,17 @@ class CodeEditSkill:
                 summary="code_edit failed: " + "; ".join(errors),
                 changed_files=tuple(dict.fromkeys(changed)),
                 missing_info=tuple(errors),
-                metadata={"raw_preview": _preview(raw_preview)},
+                metadata={
+                    "raw_preview": _preview(raw_preview),
+                    "progress_events": json.dumps(progress_events),
+                },
             )
+        await _emit_progress(
+            progress_events,
+            progress_callback,
+            "validator.started",
+            files=list(dict.fromkeys(changed)),
+        )
         return SkillResult(
             success=True,
             summary=f"Applied {len(changed)} edit_file action(s).",
@@ -275,6 +346,7 @@ class CodeEditSkill:
                 "raw_preview": _preview(raw_preview),
                 "confidence": str(confidence),
                 "original_files_json": json.dumps(original_files),
+                "progress_events": json.dumps(progress_events),
             },
         )
 
@@ -285,13 +357,15 @@ class CodeEditSkill:
         edit_targets: list[dict[str, object]],
         instruction: str,
         evidence: str,
+        progress_events: list[dict[str, object]] | None = None,
+        progress_callback: object = None,
     ) -> tuple[dict[str, object] | None, str]:
         edits = plan_payload.get("edits")
         confidence = plan_payload.get("confidence", 0.0)
         missing = plan_payload.get("missing_info") or []
         if not isinstance(edits, list) or not edits:
             return plan_payload, json.dumps(plan_payload, ensure_ascii=False)
-            
+
         edit_context = _extract_marker_json(evidence, "EDIT_CONTEXT_JSON")
         fallback_view = ""
         if isinstance(edit_context, dict):
@@ -303,6 +377,7 @@ class CodeEditSkill:
                         break
             if not fallback_view:
                 fallback_view = str(edit_context.get("target_view") or "").strip()
+        target_symbol = _target_symbol_from_edit_context(edit_context)
             
         built_edits: list[dict[str, object]] = []
         raw_parts = [json.dumps(plan_payload, ensure_ascii=False)]
@@ -312,45 +387,149 @@ class CodeEditSkill:
             target_index = edit.get("target_index")
             if not isinstance(target_index, int) or not (0 <= target_index < len(edit_targets)):
                 return None, raw_parts[0]
+            if target_symbol and not _target_matches_symbol(edit_targets[target_index], target_symbol):
+                return {
+                    "edits": [],
+                    "confidence": 0.0,
+                    "missing_info": ["target_symbol"],
+                }, (
+                    f"selected target_index {target_index} does not match "
+                    f"required target_symbol {target_symbol}"
+                )
             current_code = str(edit_targets[target_index].get("current_code") or "")
             display_code = str(edit_targets[target_index].get("display_code") or current_code)
             file = str(edit_targets[target_index].get("file") or "")
             
             operation = edit.get("operation")
-            target_view = str(edit.get("target_view") or fallback_view).strip()
-            new_string = None
-            strategy = _edit_strategy(edit_context)
-            if (
-                operation in ("replace_sql_source", "replace_dependency", "use_existing")
-                and strategy != "sql_view_rewrite"
-            ):
-                error_json = json.dumps({
-                    "expected_strategy": "sql_view_rewrite",
-                    "actual_strategy": strategy or "general_edit",
-                    "reason": f"Operation '{operation}' conflicts with Harness edit_strategy '{strategy}'"
-                })
+            is_dynamic_op = operation in ("dynamic_sql_rewrite", "dynamic_count_query_rewrite")
+            if _is_count_target(edit_context, edit) and not is_dynamic_op and not _target_has_sql_query(current_code):
                 return {
                     "edits": [],
                     "confidence": 0.0,
-                    "missing_info": ["diagnose_strategy_mismatch"],
-                }, f"diagnose_strategy_mismatch {error_json}"
+                    "missing_info": ["target_not_hydrated"],
+                }, "count target current_code is not hydrated with SELECT/FROM SQL"
+            target_view = str(edit.get("target_view") or fallback_view).strip()
+            if operation == "dynamic_count_query_rewrite":
+                patch_window = _extract_patch_window(
+                    current_code,
+                    edit_context or {},
+                    edit,
+                    target=edit_targets[target_index],
+                    target_view=target_view,
+                )
+                if patch_window is None:
+                    return {
+                        "edits": [],
+                        "confidence": 0.0,
+                        "missing_info": ["patch_window"],
+                    }, "failed to resolve a writable patch window"
+                await _emit_progress(
+                    progress_events,
+                    progress_callback,
+                    "patch_window.resolved",
+                    file=file,
+                    symbol=patch_window["symbol"],
+                    absolute_start_line=patch_window["absolute_start_line"],
+                    absolute_end_line=patch_window["absolute_end_line"],
+                    target_type=patch_window.get("target_type") or "",
+                    parent_symbol=patch_window.get("parent_symbol") or "",
+                    local_target=patch_window.get("local_target") or "",
+                    canonical_old_string=patch_window.get("canonical_old_string") or "",
+                )
+                await _emit_progress(
+                    progress_events,
+                    progress_callback,
+                    "patch_builder.started",
+                    file=file,
+                    symbol=patch_window["symbol"],
+                )
+                try:
+                    patch_raw = await asyncio.wait_for(
+                        self.llm_complete(
+                            _patch_window_messages(
+                                instruction=instruction,
+                                target_view=target_view,
+                                target_sql_kind="count",
+                                target_symbol=str(patch_window["symbol"]),
+                                patch_window=patch_window,
+                                constraints=_patch_constraints(edit_context),
+                            )
+                        ),
+                        timeout=self.patch_window_timeout,
+                    )
+                except TimeoutError:
+                    return {
+                        "edits": [],
+                        "confidence": 0.0,
+                        "missing_info": ["patch_window_timeout"],
+                    }, "PatchWindowBuilder timed out"
+                raw_parts.append(patch_raw)
+                await _emit_progress(
+                    progress_events,
+                    progress_callback,
+                    "patch_builder.finished",
+                    file=file,
+                    symbol=patch_window["symbol"],
+                )
+                patch_payload = _parse_patch_window_payload(patch_raw)
+                if patch_payload is None:
+                    return {
+                        "edits": [],
+                        "confidence": 0.0,
+                        "missing_info": ["patch_window_json"],
+                    }, "\n\n".join(raw_parts)
+                if "replacement" in patch_payload:
+                    old_str = str(patch_window.get("canonical_old_string") or "")
+                    new_str = str(patch_payload["replacement"].get("new_string") or "")
+                    if old_str and new_str:
+                        if old_str.endswith("\n") and not new_str.endswith("\n"):
+                            new_str += "\n"
+                        elif old_str.endswith("\r\n") and not new_str.endswith("\r\n"):
+                            new_str += "\r\n"
+                        old_indent = len(old_str) - len(old_str.lstrip(" \t"))
+                        new_indent = len(new_str) - len(new_str.lstrip(" \t"))
+                        if old_indent > 0 and new_indent == 0:
+                            indent_prefix = old_str[:old_indent]
+                            new_str_lines = new_str.splitlines(keepends=True)
+                            new_str = "".join(indent_prefix + line for line in new_str_lines)
+                    patch_payload["patches"] = [{
+                        "old_string": old_str,
+                        "new_string": new_str
+                    }]
+                patch_errors = _validate_patch_window_payload(
+                    patch_payload,
+                    current_code=current_code,
+                    patch_window=patch_window,
+                    target_view=target_view,
+                    target_sql_kind="count",
+                    target_sql_variable=_target_sql_variable(edit_context, edit),
+                    constraints=_patch_constraints(edit_context),
+                    path=file,
+                )
+                if patch_errors:
+                    return {
+                        "edits": [],
+                        "confidence": 0.0,
+                        "missing_info": patch_errors,
+                    }, "\n\n".join(raw_parts)
+                for patch in patch_payload["patches"]:
+                    built_edits.append({
+                        "path": file,
+                        "old_string": patch["old_string"],
+                        "new_string": patch["new_string"],
+                    })
+                confidence = min(
+                    float(confidence) if isinstance(confidence, int | float) else 0.0,
+                    float(patch_payload.get("confidence", 0.0)),
+                )
+                continue
 
-            target_symbol = ""
-            if isinstance(edit_context, dict):
-                task_intent = edit_context.get("task_intent")
-                if isinstance(task_intent, dict):
-                    target_symbol = str(task_intent.get("target_symbol") or "").strip()
-
-            is_view_op = (
-                operation in ("replace_sql_source", "replace_dependency", "use_existing")
-                and target_view
-                and strategy == "sql_view_rewrite"
-            )
-
-            last_projection_error = None
-            if is_view_op:
+            new_string = None
+            if operation in ("replace_sql_source", "replace_dependency", "use_existing") and target_view:
                 tmp_ctx = dict(edit_context or {})
                 tmp_ctx["target_view"] = target_view
+                if operation == "count_query_view_rewrite":
+                    tmp_ctx["target_sql_kind"] = "count"
                 if "resolved_dependencies" in tmp_ctx:
                     resolved_deps = []
                     for dep in tmp_ctx["resolved_dependencies"]:
@@ -363,132 +542,37 @@ class CodeEditSkill:
                     tmp_ctx["resolved_dependencies"] = resolved_deps
                 try:
                     new_string = generate_sql_patch(current_code, tmp_ctx)
-                    if new_string is not None and new_string.strip() == current_code.strip():
-                        new_string = None
-                except ProjectionMappingError as exc:
-                    last_projection_error = exc
-                    new_string = None
+                except ProjectionMappingError:
+                    return {
+                        "edits": [],
+                        "confidence": 0.0,
+                        "missing_info": ["column_mapping"],
+                    }, "failed to rewrite projection: missing column mapping"
+            
+            if new_string is not None:
+                built_edits.append({
+                    "target_index": target_index,
+                    "new_string": _clean_llm_code(new_string),
+                })
+                continue
 
-            if new_string is None:
-                if is_view_op:
-                    if bool(edit_targets[target_index].get("hydration_simplified")):
-                        return {
-                            "edits": [],
-                            "confidence": 0.0,
-                            "missing_info": ["simplified_context_requires_deterministic_patch"],
-                        }, "simplified_context_requires_deterministic_patch"
-                    # Bounded SQL replacement fallback
-                    available_columns = []
-                    replaces = []
-                    resolved_deps = edit_context.get("resolved_dependencies") or []
-                    for dep in resolved_deps:
-                        if isinstance(dep, dict) and dep.get("role") == "replacement_source":
-                            available_columns = list(dep.get("columns") or [])
-                            replaces = list(dep.get("replaces_objects") or [])
-                            break
-                    
-                    old_aliases = _extract_sql_aliases_from_python(current_code)
-                    table_aliases = _extract_table_aliases_from_sql(current_code)
-                    
-                    replacement_messages = _sql_bounded_replacement_messages(
-                        instruction=instruction,
-                        file=file,
-                        target_index=target_index,
-                        current_code=display_code,
-                        target_view=target_view,
-                        available_columns=available_columns,
-                        old_aliases=old_aliases,
-                        constraints=edit_context.get("constraints") or ["Do not invent dependencies"],
-                    )
-                    replacement_raw = await self.llm_complete(replacement_messages)
-                    raw_parts.append(replacement_raw)
-                    replacement_payload = _extract_json_payload(replacement_raw)
-                    new_string = str(replacement_payload.get("new_string") or "") if replacement_payload else ""
-                    
-                    # Validate the LLM fallback output
-                    validation_errors = []
-                    if not new_string or new_string.strip() == display_code.strip():
-                        validation_errors.append("LLM fallback generated empty or unchanged string")
-                    
-                    # 1. Full-file compile check
-                    if not validation_errors:
-                        path = _resolve_under_root(self.project_root, file)
-                        if path and path.is_file():
-                            try:
-                                orig_file_content = path.read_text(encoding="utf-8")
-                                new_file_content = orig_file_content.replace(current_code, new_string, 1)
-                                compile(new_file_content, str(path), "exec")
-                            except SyntaxError as e:
-                                validation_errors.append(f"LLM fallback has python syntax errors: {e.msg} at line {e.lineno}")
-                            except Exception as e:
-                                validation_errors.append(f"LLM fallback compilation failed: {str(e)}")
-                    
-                    # 2. Function signature unchanged
-                    if not validation_errors and target_symbol and target_symbol != "目标代码":
-                        if not _verify_signature_unchanged(display_code, new_string, target_symbol):
-                            validation_errors.append(f"LLM fallback function signature changed or target symbol deleted: {target_symbol}")
-                    
-                    # 3. Target symbol body changed and contains target_view
-                    if not validation_errors:
-                        body_changed, contains_view = _verify_body_changed_and_contains_view(
-                            display_code, new_string, target_symbol, target_view
-                        )
-                        if not body_changed:
-                            validation_errors.append("LLM fallback function body has no change")
-                        if not contains_view:
-                            validation_errors.append(f"LLM fallback does not reference target_view '{target_view}' inside target function body")
-                    
-                    # 4. Legacy SQL aliases/tables removed from SQL clauses
-                    if not validation_errors:
-                        legacy_refs = _contains_legacy_sql_references(new_string, replaces, table_aliases)
-                        if legacy_refs:
-                            validation_errors.append(f"LLM fallback still references removed tables or aliases: {legacy_refs}")
-                    
-                    if validation_errors:
-                        missing_cols = []
-                        exc_str = str(last_projection_error)
-                        if "missing column mapping:" in exc_str:
-                            missing_cols.append(exc_str.split("missing column mapping:")[-1].strip())
-                        elif "SELECT *" in exc_str:
-                            missing_cols.append("*")
-                        
-                        error_json = json.dumps({
-                            "expected_strategy": "sql_view_rewrite",
-                            "actual_strategy": "sql_view_rewrite",
-                            "reason": "projection_mapping_failed",
-                            "missing_columns": missing_cols,
-                            "target_view": target_view,
-                            "fallback": f"llm_replacement_failed: {'; '.join(validation_errors)}"
-                        })
-                        return {
-                            "edits": [],
-                            "confidence": 0.0,
-                            "missing_info": ["diagnose_strategy_mismatch"],
-                        }, f"diagnose_strategy_mismatch {error_json}"
-                else:
-                    # Generic LLM replacement fallback (for non-SQL ops)
-                    replacement_messages = _replacement_messages(
-                        instruction=instruction,
-                        file=file,
-                        target_index=target_index,
-                        current_code=display_code,
-                        edit_plan=(
-                            edit
-                            if strategy == "sql_view_rewrite"
-                            else {key: value for key, value in edit.items() if key != "target_view"}
-                        ),
-                        evidence=evidence,
-                        target_view=target_view if strategy == "sql_view_rewrite" else "",
-                    )
-                    replacement_raw = await self.llm_complete(replacement_messages)
-                    raw_parts.append(replacement_raw)
-                    replacement_payload = _extract_json_payload(replacement_raw)
-                    if replacement_payload is None:
-                        return None, "\n\n".join(raw_parts)
-                    new_string = str(replacement_payload.get("new_string") or "")
-                    if not new_string:
-                        return None, "\n\n".join(raw_parts)
-
+            replacement_messages = _replacement_messages(
+                instruction=instruction,
+                file=file,
+                target_index=target_index,
+                current_code=current_code,
+                edit_plan=edit,
+                evidence=evidence,
+                target_view=target_view,
+            )
+            replacement_raw = await self.llm_complete(replacement_messages)
+            raw_parts.append(replacement_raw)
+            replacement_payload = _extract_json_payload(replacement_raw)
+            if replacement_payload is None:
+                return None, "\n\n".join(raw_parts)
+            new_string = str(replacement_payload.get("new_string") or "")
+            if not new_string:
+                return None, "\n\n".join(raw_parts)
             built_edits.append({
                 "target_index": target_index,
                 "new_string": _clean_llm_code(new_string),
@@ -510,246 +594,33 @@ def rewrite_query_source(
     replaces_objects: list[str],
     target_columns: list[str] | None = None,
     column_defaults: dict[str, str] | None = None,
+    column_sources: list[dict[str, object]] | None = None,
+    source_to_view_column: dict[str, object] | None = None,
 ) -> str:
-    parsed = sqlparse.parse(current_sql)[0]
-    tokens = list(parsed.tokens)
-    
-    from_idx = -1
-    for idx, token in enumerate(tokens):
-        if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == "FROM":
-            from_idx = idx
-            break
-            
-    if from_idx == -1:
-        return current_sql
-        
-    main_table_idx = -1
-    for j in range(from_idx + 1, len(tokens)):
-        t = tokens[j]
-        if t.is_whitespace:
-            continue
-        main_table_idx = j
-        break
-        
-    if main_table_idx == -1:
-        return current_sql
-        
-    main_table_token = tokens[main_table_idx]
-    alias = main_table_token.get_alias() if hasattr(main_table_token, 'get_alias') else None
-    old_main_alias = alias
-    old_main_table_name = ""
-    if isinstance(main_table_token, sqlparse.sql.Identifier):
-        old_main_table_name = main_table_token.get_real_name() or main_table_token.value
-    elif main_table_token.ttype is None and main_table_token.value.strip():
-        old_main_table_name = main_table_token.value.strip()
-    
-    replaces_lower = {obj.lower() for obj in replaces_objects}
-    old_main_clean = old_main_table_name.strip().split('.')[-1].split()[0].replace('"', '').replace("'", "").replace("`", "").lower()
-    strict_projection = bool(target_columns)
-    if strict_projection and (old_main_clean in replaces_lower or replaces_lower):
-        alias = _fresh_view_alias({old_main_alias or "", *replaces_lower})
+    model = parse_query(current_sql)
+    target_alias = "v"
+    if not replaces_objects:
+        if model is not None and model.from_table:
+            replaces_objects = [model.from_table]
+            if not target_columns and model.from_alias:
+                target_alias = model.from_alias
 
-    new_val = f"{target_source} {alias}" if alias else target_source
-    new_token = sqlparse.sql.Token(sqlparse.tokens.Name, new_val)
-    
-    end_idx = len(tokens)
-    for j in range(main_table_idx + 1, len(tokens)):
-        t = tokens[j]
-        val = t.value.upper().strip()
-        if isinstance(t, sqlparse.sql.Where) or val.startswith("WHERE"):
-            end_idx = j
-            break
-        if t.ttype is sqlparse.tokens.Keyword or t.ttype is sqlparse.tokens.Keyword.DML:
-            if val in ("GROUP", "ORDER", "LIMIT", "UNION", "HAVING", ";", "SELECT", "INSERT", "UPDATE", "DELETE"):
-                end_idx = j
-                break
-            if any(val.startswith(kw) for kw in ("GROUP", "ORDER", "LIMIT", "UNION", "HAVING")):
-                end_idx = j
-                break
-                
-    j = main_table_idx + 1
-    middle_tokens = []
-    removed_aliases = set()
-    
-    while j < end_idx:
-        t = tokens[j]
-        val = t.value.upper().strip()
-        if "JOIN" in val and (t.ttype is sqlparse.tokens.Keyword or t.ttype is None):
-            join_end = end_idx
-            for k in range(j + 1, end_idx):
-                tk = tokens[k]
-                tk_val = tk.value.upper().strip()
-                if "JOIN" in tk_val and (tk.ttype is sqlparse.tokens.Keyword or tk.ttype is None):
-                    join_end = k
-                    break
-            
-            joined_table_name = ""
-            joined_table_alias = ""
-            for k in range(j + 1, join_end):
-                tk = tokens[k]
-                if isinstance(tk, sqlparse.sql.Identifier):
-                    real_name = tk.get_real_name()
-                    joined_table_name = real_name or tk.value
-                    joined_table_alias = tk.get_alias()
-                    break
-                elif tk.ttype is None and tk.value.strip() and not tk.is_whitespace:
-                    joined_table_name = tk.value
-                    break
-            
-            cleaned_joined_table = joined_table_name.strip().split('.')[-1].split()[0].replace('"', '').replace("'", "").replace("`", "").lower()
-            
-            if cleaned_joined_table in replaces_lower:
-                if joined_table_alias:
-                    removed_aliases.add(joined_table_alias)
-                j = join_end
-            else:
-                middle_tokens.extend(tokens[j:join_end])
-                j = join_end
-        else:
-            middle_tokens.append(t)
-            j += 1
-            
-    target_alias = alias or target_source
-    
-    legacy_lower = {a.lower() for a in removed_aliases if a}
-    for obj in replaces_objects:
-        legacy_lower.add(obj.lower())
-    if old_main_table_name:
-        legacy_lower.add(old_main_table_name.lower())
-    if old_main_alias:
-        legacy_lower.add(old_main_alias.lower())
-        
-    def references_aliases(token, replaced_aliases):
-        if isinstance(token, sqlparse.sql.Identifier):
-            sub = token.tokens
-            if len(sub) >= 2 and sub[1].value == '.':
-                prefix = sub[0].value.strip().replace('`','').replace('"','').replace("'", "").lower()
-                if prefix in replaced_aliases:
-                    return True
-        if hasattr(token, 'tokens') and token.tokens:
-            return any(references_aliases(sub, replaced_aliases) for sub in token.tokens)
-        return False
-
-    def rewrite_identifiers(token, legacy_aliases, target_alias):
-        if not hasattr(token, 'tokens') or not token.tokens:
-            return
-        
-        if isinstance(token, sqlparse.sql.Identifier):
-            sub = token.tokens
-            if len(sub) >= 3:
-                first_t = sub[0]
-                second_t = sub[1]
-                if (first_t.ttype in (sqlparse.tokens.Name, sqlparse.tokens.Name.Placeholder) or first_t.ttype is None) and second_t.value == '.':
-                    prefix = first_t.value.strip().replace('`','').replace('"','').replace("'", "").lower()
-                    if prefix in legacy_aliases:
-                        if target_alias:
-                            first_t.value = target_alias
-                        else:
-                            token.tokens = sub[2:]
-                            
-        for sub_token in token.tokens:
-            rewrite_identifiers(sub_token, legacy_aliases, target_alias)
+    ast_rewrite = rewrite_query_with_view(
+        current_sql,
+        target_source=target_source,
+        replaces_objects=replaces_objects,
+        target_columns=target_columns,
+        column_defaults=column_defaults,
+        column_sources=column_sources,
+        source_to_view_column=source_to_view_column,
+        target_alias=target_alias,
+    )
+    if ast_rewrite is not None:
+        return ast_rewrite
 
     if target_columns:
-        select_idx = -1
-        for idx, token in enumerate(tokens):
-            if token.ttype is sqlparse.tokens.Keyword.DML and token.value.upper() == "SELECT":
-                select_idx = idx
-                break
-                
-        if select_idx != -1:
-            def get_select_items(tokens_list, s_idx, f_idx):
-                res_items = []
-                for idx in range(s_idx + 1, f_idx):
-                    token = tokens_list[idx]
-                    if token.is_whitespace:
-                        continue
-                    if isinstance(token, sqlparse.sql.IdentifierList):
-                        for ident in token.get_identifiers():
-                            res_items.append(ident)
-                    elif isinstance(token, sqlparse.sql.Identifier):
-                        res_items.append(token)
-                    elif token.ttype is None and token.value.strip() and token.value.strip() != ',':
-                        res_items.append(token)
-                return res_items
-                
-            def get_output_name(item):
-                if hasattr(item, 'get_alias') and item.get_alias():
-                    return item.get_alias().replace('"', '').replace("'", "").replace("`", "").strip()
-                if hasattr(item, 'get_real_name') and item.get_real_name():
-                    return item.get_real_name().replace('"', '').replace("'", "").replace("`", "").strip()
-                val = item.value.strip()
-                parts = val.split('.')
-                return parts[-1].replace('"', '').replace("'", "").replace("`", "").strip()
-                
-            select_items = get_select_items(tokens, select_idx, from_idx)
-            target_col_lookup = {
-                str(col).strip().lower(): str(col).strip()
-                for col in target_columns
-                if str(col).strip()
-            }
-            defaults = {
-                str(key).strip().lower(): str(value).strip()
-                for key, value in (column_defaults or {}).items()
-                if str(key).strip() and str(value).strip()
-            }
-            items_to_rewrite = []
-            
-            for item in select_items:
-                out_name = get_output_name(item)
-                out_key = out_name.lower()
-                if "*" in item.value:
-                    raise ProjectionMappingError("Projection rewrite failed: SELECT * has no explicit column mapping")
-                if out_key in target_col_lookup:
-                    source_col = target_col_lookup[out_key]
-                    new_val = f"{target_alias}.{source_col}" if target_alias else source_col
-                    items_to_rewrite.append((item, new_val))
-                elif out_key in defaults:
-                    items_to_rewrite.append((item, f"{defaults[out_key]} AS {out_name}"))
-                else:
-                    raise ProjectionMappingError(
-                        f"Projection rewrite failed due to missing column mapping: {out_name}"
-                    )
-                
-            for item, new_val in items_to_rewrite:
-                parsed_new = sqlparse.parse(new_val)[0]
-                new_item_token = parsed_new.tokens[0]
-                
-                parent = item.parent
-                if parent and hasattr(parent, 'tokens'):
-                    idx_in_parent = parent.tokens.index(item)
-                    parent.tokens[idx_in_parent] = new_item_token
-                    new_item_token.parent = parent
-                    
-    rewrite_identifiers(parsed, legacy_lower, target_alias)
-    
-    new_tokens = tokens[:from_idx + 1]
-    if from_idx + 1 < len(tokens) and tokens[from_idx + 1].is_whitespace:
-        new_tokens.append(tokens[from_idx + 1])
-    else:
-        new_tokens.append(sqlparse.sql.Token(sqlparse.tokens.Whitespace, " "))
-        
-    new_tokens.append(new_token)
-    new_tokens.extend(middle_tokens)
-    
-    if end_idx > 0 and end_idx < len(tokens):
-        pre_end_token = tokens[end_idx - 1]
-        if pre_end_token.is_whitespace:
-            new_tokens.append(pre_end_token)
-            
-    if end_idx < len(tokens):
-        new_tokens.extend(tokens[end_idx:])
-        
-    parsed.tokens = new_tokens
-    return str(parsed)
-
-
-def _fresh_view_alias(blocked: set[str]) -> str:
-    blocked_lower = {item.lower() for item in blocked if item}
-    for candidate in ("v", "rv", "src"):
-        if candidate not in blocked_lower:
-            return candidate
-    return "replacement_view"
+        raise ProjectionMappingError("Projection rewrite failed due to missing column mapping")
+    return current_sql
 
 
 def replace_table_with_view_in_sql(current_sql: str, target_view: str) -> str:
@@ -761,12 +632,25 @@ def generate_sql_patch(current_code: str, edit_context: dict) -> str | None:
     replaces = []
     columns = []
     column_defaults = {}
+    column_sources: list[dict[str, object]] = []
+    source_to_view_column: dict[str, object] = {}
     resolved_deps = edit_context.get("resolved_dependencies") or []
     for dep in resolved_deps:
         if isinstance(dep, dict) and dep.get("role") == "replacement_source":
             dep_name = str(dep.get("name") or "").strip()
             replaces = list(dep.get("replaces_objects") or [])
             columns = list(dep.get("columns") or [])
+            column_sources = [
+                item
+                for item in dep.get("column_sources") or []
+                if isinstance(item, dict)
+            ]
+            raw_source_mapping = dep.get("source_to_view_column") or {}
+            if isinstance(raw_source_mapping, dict):
+                source_to_view_column = {
+                    str(key): str(value)
+                    for key, value in raw_source_mapping.items()
+                }
             raw_defaults = dep.get("column_defaults") or {}
             if isinstance(raw_defaults, dict):
                 column_defaults = {
@@ -781,35 +665,72 @@ def generate_sql_patch(current_code: str, edit_context: dict) -> str | None:
     if not dep_name:
         return None
 
-    string_pattern = re.compile(
-        r'(?P<prefix>[frFR]*)(?P<quote>"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\')',
-    )
-    for match in string_pattern.finditer(current_code):
-        quote_content = match.group("quote")
-        if quote_content.startswith(('"""', "'''")):
-            inner = quote_content[3:-3]
-            quote_type = quote_content[:3]
-        else:
-            inner = quote_content[1:-1]
-            quote_type = quote_content[0]
-            
-        if "SELECT" in inner.upper() and "FROM" in inner.upper():
-            modified_inner = rewrite_query_source(
-                inner,
-                dep_name,
-                replaces,
-                columns,
-                column_defaults,
-            )
-            new_quote_content = f"{quote_type}{modified_inner}{quote_type}"
-            start, end = match.span("quote")
-            return current_code[:start] + new_quote_content + current_code[end:]
+    literals = extract_sql_literals_from_python(current_code)
+    literal = _select_sql_literal_for_patch(literals, edit_context)
+    if literal is not None:
+        target_sql_kind = str(edit_context.get("target_sql_kind") or "").strip().lower()
+        effective_columns = [] if target_sql_kind == "count" else columns
+        modified_inner = rewrite_query_source(
+            literal.sql,
+            dep_name,
+            replaces,
+            effective_columns,
+            column_defaults,
+            column_sources,
+            source_to_view_column,
+        )
+        new_quote_content = f"{literal.quote}{modified_inner}{literal.quote}"
+        return (
+            current_code[: literal.start_offset]
+            + new_quote_content
+            + current_code[literal.end_offset :]
+        )
             
     return None
 
 
 def deterministic_replace_sql_with_view(current_code: str, view_name: str) -> str | None:
     return generate_sql_patch(current_code, {"target_view": view_name})
+
+
+def _select_sql_literal_for_patch(
+    literals: list[object],
+    edit_context: dict,
+):
+    if not literals:
+        return None
+
+    target_variable = str(edit_context.get("target_sql_variable") or "").strip()
+    if not target_variable:
+        task_intent = edit_context.get("task_intent")
+        if isinstance(task_intent, dict):
+            target_variable = str(task_intent.get("target_sql_variable") or "").strip()
+    if target_variable:
+        for literal in literals:
+            if str(getattr(literal, "variable", "") or "") == target_variable:
+                return literal
+
+    target_kind = str(edit_context.get("target_sql_kind") or "").strip().lower()
+    if not target_kind:
+        task_intent = edit_context.get("task_intent")
+        if isinstance(task_intent, dict):
+            target_kind = str(task_intent.get("target_sql_kind") or "").strip().lower()
+    if target_kind == "count":
+        for literal in literals:
+            if _is_count_query(str(getattr(literal, "sql", "") or "")):
+                return literal
+
+    return literals[0]
+
+
+def _is_count_query(sql: str) -> bool:
+    model = parse_query(sql)
+    if model is None:
+        return bool(re.search(r"(?is)\bSELECT\s+COUNT\s*\(", sql))
+    return any(
+        item.kind == "aggregate" and re.search(r"(?i)\bCOUNT\s*\(", item.expression)
+        for item in model.selects
+    )
 
 
 
@@ -858,35 +779,59 @@ def _apply_exact_edit(
     old_string: str,
     new_string: str,
     original_files: dict[str, str] | None = None,
+    target_item: dict[str, object] | None = None,
 ) -> str:
-    target = _resolve_under_root(project_root, path)
-    if target is None:
+    target_path = _resolve_under_root(project_root, path)
+    if target_path is None:
         return f"{path}: outside project root"
-    if not target.is_file():
+    if not target_path.is_file():
         return f"{path}: file not found"
     try:
-        content = target.read_text(encoding="utf-8")
+        content = target_path.read_text(encoding="utf-8")
     except OSError as exc:
         return f"{path}: read failed: {exc}"
     
     import hashlib
     original_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    occurrences = content.count(old_string)
-    if occurrences != 1:
-        return f"{path}: old_string occurrence count is {occurrences}, expected 1"
-    
-    new_content = content.replace(old_string, new_string, 1)
+
+    range_restricted = False
+    if target_item is not None:
+        start_line = target_item.get("start_line")
+        end_line = target_item.get("end_line")
+        if isinstance(start_line, int) and isinstance(end_line, int) and start_line > 0 and end_line >= start_line:
+            range_restricted = True
+
+    if range_restricted:
+        content_lines = content.splitlines(keepends=True)
+        if start_line <= len(content_lines) and end_line <= len(content_lines):
+            func_body = "".join(content_lines[start_line - 1 : end_line])
+            occurrences = func_body.count(old_string)
+            if occurrences != 1:
+                return f"{path}: old_string occurrence count in target symbol is {occurrences}, expected 1"
+            new_func_body = func_body.replace(old_string, new_string, 1)
+            new_content = "".join(content_lines[:start_line - 1]) + new_func_body + "".join(content_lines[end_line:])
+        else:
+            occurrences = content.count(old_string)
+            if occurrences != 1:
+                return f"{path}: old_string occurrence count is {occurrences}, expected 1"
+            new_content = content.replace(old_string, new_string, 1)
+    else:
+        occurrences = content.count(old_string)
+        if occurrences != 1:
+            return f"{path}: old_string occurrence count is {occurrences}, expected 1"
+        new_content = content.replace(old_string, new_string, 1)
+
     new_hash = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
     if original_hash == new_hash:
         return f"{path}: file hash did not change (no modification made)"
         
-    rel = _rel_display(project_root, target)
+    rel = _rel_display(project_root, target_path)
     if original_files is not None:
         original_files.setdefault(rel, content)
     try:
-        target.write_text(new_content, encoding="utf-8")
+        target_path.write_text(new_content, encoding="utf-8")
         # Verify immediately from disk
-        written_content = target.read_text(encoding="utf-8")
+        written_content = target_path.read_text(encoding="utf-8")
         written_hash = hashlib.sha256(written_content.encode("utf-8")).hexdigest()
         if written_hash == original_hash:
             return f"{path}: written content hash equals original content hash"
@@ -901,7 +846,153 @@ def _editable_targets(ctx: dict[str, object] | None) -> list[dict[str, object]]:
     targets = ctx.get("editable_targets")
     if not isinstance(targets, list) or not targets:
         targets = ctx.get("snippets")
-    return [target for target in targets or [] if isinstance(target, dict)]
+    edit_targets = ctx.get("edit_targets")
+    merged: list[dict[str, object]] = []
+    for idx, target in enumerate(targets or []):
+        if not isinstance(target, dict):
+            continue
+        item = dict(target)
+        if isinstance(edit_targets, list) and idx < len(edit_targets):
+            rich = edit_targets[idx]
+            if isinstance(rich, dict):
+                for key in ("symbol", "name", "sql_queries", "sql_literals", "sql_presence"):
+                    if key not in item and key in rich:
+                        item[key] = rich[key]
+        merged.append(item)
+    return merged
+
+
+def _target_symbol_from_edit_context(ctx: dict[str, object] | None) -> str:
+    if not isinstance(ctx, dict):
+        return ""
+    task_intent = ctx.get("task_intent")
+    if isinstance(task_intent, dict):
+        value = str(task_intent.get("target_symbol") or "").strip()
+        if value and value != "目标代码":
+            return value
+    value = str(ctx.get("target_symbol") or "").strip()
+    return "" if value == "目标代码" else value
+
+
+def _target_matches_symbol(target: dict[str, object], target_symbol: str) -> bool:
+    symbol = str(target.get("symbol") or target.get("name") or "").strip()
+    if symbol == target_symbol:
+        return True
+    current_code = str(target.get("current_code") or "")
+    return bool(
+        re.search(
+            rf"(?m)^\s*(?:async\s+def|def|class)\s+{re.escape(target_symbol)}\b",
+            current_code,
+        )
+    )
+
+
+_EDIT_OPERATIONS = {
+    "general_edit",
+    "replace_dependency",
+    "use_existing",
+    "replace_sql_source",
+    "count_query_view_rewrite",
+    "dynamic_count_query_rewrite",
+    "dynamic_sql_rewrite",
+}
+
+
+def _declared_target_symbol(current_code: str) -> str:
+    try:
+        tree = ast.parse(current_code)
+    except SyntaxError:
+        return ""
+    declarations = [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+    ]
+    if len(declarations) == 1:
+        return declarations[0]
+    if not declarations and tree.body:
+        return "<module>"
+    return ""
+
+
+def _lock_edit_context_symbols(ctx: dict[str, object] | None) -> None:
+    if not isinstance(ctx, dict):
+        return
+    targets = ctx.get("editable_targets")
+    if not isinstance(targets, list) or not targets:
+        targets = ctx.get("snippets")
+    if not isinstance(targets, list) or not targets:
+        return
+    locked_symbols: list[str] = []
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        symbol = str(target.get("symbol") or target.get("name") or "").strip()
+        if not symbol:
+            symbol = _declared_target_symbol(str(target.get("current_code") or ""))
+            if symbol:
+                target["symbol"] = symbol
+        if not symbol:
+            continue
+        locked_symbols.append(symbol)
+        if "symbol_lock" not in target:
+            target["symbol_lock"] = {
+                "name": symbol,
+                "file": str(target.get("file") or ""),
+                "range": [target.get("start_line"), target.get("end_line")],
+                "immutable": True,
+            }
+    task_intent = ctx.get("task_intent")
+    if not isinstance(task_intent, dict):
+        task_intent = {"operation": "general_edit"}
+        ctx["task_intent"] = task_intent
+    if not str(task_intent.get("target_symbol") or "").strip():
+        unique_symbols = list(dict.fromkeys(locked_symbols))
+        if len(unique_symbols) == 1:
+            task_intent["target_symbol"] = unique_symbols[0]
+
+
+def _validate_symbol_lock(target: dict[str, object]) -> str:
+    symbol = str(target.get("symbol") or target.get("name") or "").strip()
+    if not symbol:
+        return "missing symbol"
+    if symbol in _EDIT_OPERATIONS or symbol.lower() == "modify":
+        return f"operation value '{symbol}' cannot be used as target_symbol"
+    declared = _declared_target_symbol(str(target.get("current_code") or ""))
+    if declared and declared != symbol:
+        return f"AST symbol '{declared}' does not match target symbol '{symbol}'"
+    lock = target.get("symbol_lock")
+    if lock is None:
+        return ""
+    if not isinstance(lock, dict):
+        return "symbol_lock is not an object"
+    lock_name = str(lock.get("name") or "").strip()
+    lock_file = str(lock.get("file") or "").replace("\\", "/")
+    target_file = str(target.get("file") or "").replace("\\", "/")
+    lock_range = lock.get("range")
+    expected_range = [target.get("start_line"), target.get("end_line")]
+    if lock.get("immutable") is not True:
+        return "symbol_lock is not immutable"
+    if lock_name != symbol or lock_file != target_file or lock_range != expected_range:
+        return "symbol_lock does not match editable target"
+    return ""
+
+
+def _is_count_target(
+    ctx: dict[str, object] | None,
+    item: dict[str, object] | None = None,
+) -> bool:
+    values: list[str] = []
+    if isinstance(item, dict):
+        values.append(str(item.get("target_sql_kind") or ""))
+        values.append(str(item.get("operation") or ""))
+    if isinstance(ctx, dict):
+        values.append(str(ctx.get("target_sql_kind") or ""))
+        task_intent = ctx.get("task_intent")
+        if isinstance(task_intent, dict):
+            values.append(str(task_intent.get("target_sql_kind") or ""))
+            values.append(str(task_intent.get("operation") or ""))
+    return any(value.strip().lower() in {"count", "count_query_view_rewrite", "dynamic_count_query_rewrite"} for value in values)
 
 
 def _filter_authoritative_targets(
@@ -1107,22 +1198,6 @@ def _resolve_edit_item_target(
     old_string = str(item.get("old_string") or "")
     if path and old_string:
         return path, old_string
-
-    target_index = item.get("target_index")
-    if isinstance(target_index, int) and 0 <= target_index < len(targets):
-        target = targets[target_index]
-        return (
-            str(target.get("file") or ""),
-            str(target.get("current_code") or ""),
-        )
-
-    if path and not old_string:
-        matching = [
-            target for target in targets
-            if str(target.get("file") or "").replace("\\", "/") == path.replace("\\", "/")
-        ]
-        if len(matching) == 1:
-            return path, str(matching[0].get("current_code") or "")
     return path, old_string
 
 
@@ -1146,6 +1221,10 @@ def _edit_plan_messages(
                 "No markdown, no prose, no Python code. You must not generate "
                 "replacement code or specify any view names. "
                 "Select editable_targets by index and specify the operation. "
+                "If task_intent.target_symbol is set, you must select only an "
+                "editable_target whose symbol matches it. "
+                "Use operation=count_query_view_rewrite or dynamic_count_query_rewrite when the requested SQL target "
+                "is a COUNT/count_sql query. "
                 "Required schema: "
                 '{"edits":[{"target_index":0,"operation":"replace_sql_source"}],'
                 '"confidence":1.0,"missing_info":[]}. '
@@ -1181,26 +1260,16 @@ def _edit_messages(
     )
 
 
-def _replacement_messages(
+def _patch_window_messages(
     *,
     instruction: str,
-    file: str,
-    target_index: int,
-    current_code: str,
-    edit_plan: dict[str, object],
-    evidence: str,
-    target_view: str = "",
+    target_view: str,
+    target_sql_kind: str,
+    target_symbol: str,
+    patch_window: dict[str, object],
+    constraints: list[str],
 ) -> list[dict[str, object]]:
     t_view = target_view or str(edit_plan.get("target_view") or "").strip()
-    dependency_rule = (
-        "CRITICAL: If replacing a query or dependency, you MUST only "
-        f"use the replacement source '{t_view}'. "
-        "Do NOT use any other name. The name MUST exist in the "
-        "repository's resolved dependencies or available views."
-        if t_view
-        else "Do not invent replacement dependencies or database views. "
-        "For refactor/function-reuse tasks, preserve behavior and modify only the requested target."
-    )
     return [
         {
             "role": "system",
@@ -1211,47 +1280,569 @@ def _replacement_messages(
                 "Return only the replacement for the single provided current_code. "
                 "Preserve indentation, imports, surrounding behavior, and style. "
                 "Do not edit files or symbols outside this current_code. "
-                "CRITICAL PATCH SCOPE RULES:\n"
-                "- Edits must be a bounded patch (e.g. replace call, replace block, insert helper, modify statement).\n"
-                "- Avoid rewriting the entire function if a smaller replacement block is possible.\n"
-                "- Never rewrite the entire file or module. Large uncontrolled regeneration is strictly forbidden.\n"
-                f"{dependency_rule}"
+                "CRITICAL: If replacing a query or dependency, you MUST only "
+                f"use the replacement source '{t_view}'. "
+                "Do NOT use any other name. The name MUST exist in the "
+                "repository's resolved dependencies or available views."
             ),
         },
         {
             "role": "user",
             "content": (
                 f"Instruction:\n{instruction}\n\n"
-                f"File: {file}\nTarget index: {target_index}\n\n"
-                "EDIT_PLAN_JSON\n"
-                f"{json.dumps(edit_plan, ensure_ascii=False, indent=2)}\n\n"
-                "Relevant evidence summary:\n"
-                f"{_prepare_replacement_evidence(evidence)}\n\n"
-                "CURRENT_CODE\n"
-                f"{current_code[:50_000]}"
+                f"Target view: {target_view}\n"
+                f"Target SQL kind: {target_sql_kind}\n"
+                f"Target symbol: {target_symbol}\n\n"
+                "PATCH_WINDOW_JSON\n"
+                f"{json.dumps(patch_window, ensure_ascii=False, indent=2)}\n\n"
+                "CONSTRAINTS_JSON\n"
+                f"{json.dumps(constraints, ensure_ascii=False)}"
             ),
         },
     ]
 
 
-def _prepare_replacement_evidence(evidence: str) -> str:
-    marker = "EDIT_CONTEXT_JSON"
-    before = evidence.split(marker, 1)[0] if marker in evidence else evidence
-    return before[:6_000].strip()
+def _find_query_construction_range_text(content: str) -> tuple[int, int, str] | None:
+    """Find the enclosed range of statements constructing query clauses and SQL variables.
+    Returns (start_line_1_indexed, end_line_1_indexed, text_content).
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return None
+
+    def is_query_construction_stmt(node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if isinstance(target, ast.Name) and target.id in {"clauses", "where_clauses", "where_clause", "count_sql", "list_sql", "sql"}:
+                        return True
+            if isinstance(child, ast.Call):
+                if isinstance(child.func, ast.Attribute) and isinstance(child.func.value, ast.Name):
+                    if child.func.value.id in {"clauses", "where_clauses"} and child.func.attr == "append":
+                        return True
+        return False
+
+    body_stmts = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            body_stmts = node.body
+            break
+    if not body_stmts:
+        body_stmts = tree.body
+
+    selected = []
+    for stmt in body_stmts:
+        if is_query_construction_stmt(stmt):
+            selected.append(stmt)
+
+    if not selected:
+        return None
+
+    start_line = min(getattr(stmt, "lineno", 1) for stmt in selected)
+    end_line = max(getattr(stmt, "end_lineno", getattr(stmt, "lineno", 1)) for stmt in selected)
+
+    lines = content.splitlines(keepends=True)
+    if start_line <= len(lines) and end_line <= len(lines):
+        text = "".join(lines[start_line - 1 : end_line])
+        return start_line, end_line, text
+    return None
 
 
-def _prepare_edit_evidence(evidence: str) -> str:
-    marker = "EDIT_CONTEXT_JSON"
-    if marker not in evidence:
-        return evidence[:12_000]
-    before, after = evidence.split(marker, 1)
-    return (
-        before[:6_000].rstrip()
-        + "\n\n"
-        + marker
-        + "\n"
-        + after.strip()[:50_000]
+def _find_variable_assignment_range_text(
+    content: str,
+    var_name: str,
+) -> tuple[int, int, str] | None:
+    """Find the exact assignment statement text for var_name in content."""
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return None
+
+    ranges = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == var_name:
+                    start = getattr(node, "lineno", 1)
+                    end = getattr(node, "end_lineno", start)
+                    ranges.append((start, end))
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == var_name:
+                start = getattr(node, "lineno", 1)
+                end = getattr(node, "end_lineno", start)
+                ranges.append((start, end))
+
+    if len(ranges) != 1:
+        return None
+
+    start, end = ranges[0]
+    lines = content.splitlines(keepends=True)
+    if start <= len(lines) and end <= len(lines):
+        return start, end, "".join(lines[start - 1 : end])
+    return None
+
+
+def _extract_patch_window(
+    current_code: str,
+    edit_context: dict[str, object],
+    edit_plan: dict[str, object],
+    *,
+    target: dict[str, object] | None = None,
+    target_view: str,
+) -> dict[str, object] | None:
+    lines = current_code.splitlines(keepends=True)
+    if not lines:
+        return None
+    task_intent = edit_context.get("task_intent")
+    if not isinstance(task_intent, dict):
+        task_intent = {}
+    operation = str(
+        edit_plan.get("operation")
+        or edit_context.get("operation")
+        or task_intent.get("operation")
+        or ""
+    ).strip()
+    target_data = target or {}
+    symbol = str(target_data.get("symbol") or target_data.get("name") or "").strip()
+    parent_symbol = str(
+        task_intent.get("parent_symbol")
+        or edit_context.get("parent_symbol")
+        or ""
+    ).strip()
+    local_target = str(
+        task_intent.get("local_target")
+        or edit_context.get("local_target")
+        or _target_sql_variable(edit_context, edit_plan)
+        or ""
+    ).strip()
+    target_type = str(
+        task_intent.get("target_type")
+        or edit_context.get("target_type")
+        or ("sql_variable" if local_target else "symbol")
+    ).strip()
+    requires_local_window = target_type == "sql_variable" or operation in {
+        "dynamic_sql_rewrite",
+        "dynamic_count_query_rewrite",
+    }
+    if requires_local_window:
+        if not symbol or not parent_symbol or parent_symbol != symbol or not local_target:
+            return None
+        assignment = _find_variable_assignment_range_text(current_code, local_target)
+        if assignment is None:
+            return None
+        assignment_start, assignment_end, assignment_text = assignment
+        function_start = target_data.get("start_line")
+        if not isinstance(function_start, int):
+            return None
+        target_sql_kind = str(
+            edit_plan.get("target_sql_kind")
+            or edit_context.get("target_sql_kind")
+            or task_intent.get("target_sql_kind")
+            or ""
+        ).strip().lower()
+        return {
+            "file": str(target_data.get("file") or ""),
+            "symbol": symbol,
+            "absolute_start_line": function_start + assignment_start - 1,
+            "absolute_end_line": function_start + assignment_end - 1,
+            "window_code": assignment_text,
+            "canonical_old_string": assignment_text,
+            "target_view": target_view,
+            "target_sql_kind": target_sql_kind,
+            "target_type": "sql_variable",
+            "parent_symbol": parent_symbol,
+            "local_target": local_target,
+            "operation": operation,
+            "target_id": f"{parent_symbol}.{local_target}",
+        }
+    target_sql_kind = str(
+        edit_plan.get("target_sql_kind")
+        or edit_context.get("target_sql_kind")
+        or (
+            edit_context.get("task_intent", {}).get("target_sql_kind")
+            if isinstance(edit_context.get("task_intent"), dict)
+            else ""
+        )
+        or ""
+    ).strip().lower()
+    target_sql_variable = _target_sql_variable(edit_context, edit_plan)
+    priorities = [
+        target_sql_variable,
+        "count_sql",
+        "COUNT(",
+        "count_query",
+        "total_sql",
+        "from_clause",
+        "JOIN",
+        "where_clause",
+    ]
+    hit = -1
+    for needle in priorities:
+        if not needle:
+            continue
+        lowered = needle.lower()
+        hit = next(
+            (idx for idx, line in enumerate(lines) if lowered in line.lower()),
+            -1,
+        )
+        if hit >= 0:
+            break
+    if hit < 0:
+        return None
+
+    operation = str(
+        edit_plan.get("operation")
+        or edit_context.get("operation")
+        or (
+            edit_context.get("task_intent", {}).get("operation")
+            if isinstance(edit_context.get("task_intent"), dict)
+            else ""
+        )
+        or ""
+    ).strip()
+
+    is_dynamic_count = (operation == "dynamic_count_query_rewrite")
+    canonical_old_string = None
+    ast_applied = False
+
+    if is_dynamic_count:
+        ast_res = _find_query_construction_range_text(current_code)
+        if ast_res:
+            ast_start, ast_end, ast_text = ast_res
+            start = ast_start - 1
+            end = ast_end
+            canonical_old_string = ast_text
+            ast_applied = True
+        else:
+            start = max(0, hit - 80)
+            end = min(len(lines), hit + 80)
+            canonical_old_string = "".join(lines[start:end])
+            ast_applied = True
+
+    if not ast_applied:
+        start = max(0, hit - 30)
+        end = min(len(lines), hit + 81)
+        if end - start > 120:
+            start = max(0, hit - 25)
+            end = min(len(lines), start + 120)
+            if hit >= end:
+                end = hit + 1
+                start = max(0, end - 120)
+
+    target_data = target or {}
+    function_start = target_data.get("start_line")
+    if not isinstance(function_start, int):
+        function_start = 1
+    symbol = str(
+        target_data.get("symbol")
+        or target_data.get("name")
+        or _target_symbol_from_edit_context(edit_context)
+    ).strip()
+
+    if not ast_applied and target_sql_variable:
+        assignment = _find_variable_assignment_range_text(current_code, target_sql_variable)
+        canonical_old_string = assignment[2] if assignment else None
+
+    task_intent = edit_context.get("task_intent") if isinstance(edit_context, dict) else None
+    target_type = ""
+    local_target = ""
+    parent_symbol = ""
+    if isinstance(task_intent, dict):
+        target_type = str(task_intent.get("target_type") or "").strip()
+        local_target = str(task_intent.get("local_target") or "").strip()
+        parent_symbol = str(task_intent.get("parent_symbol") or "").strip()
+    if not target_type and isinstance(edit_context, dict):
+        target_type = str(edit_context.get("target_type") or "").strip()
+    if not local_target and isinstance(edit_context, dict):
+        local_target = str(edit_context.get("local_target") or "").strip()
+    if not parent_symbol and isinstance(edit_context, dict):
+        parent_symbol = str(edit_context.get("parent_symbol") or "").strip()
+
+    # Fallbacks
+    if not target_type:
+        if (
+            (task_intent and (task_intent.get("target_sql_variable") or task_intent.get("local_target")))
+            or (isinstance(edit_context, dict) and (edit_context.get("target_sql_variable") or edit_context.get("local_target")))
+            or target_sql_variable
+        ):
+            target_type = "sql_variable"
+    if not local_target:
+        local_target = target_sql_variable
+    if not parent_symbol:
+        local_symbol = target_data.get("symbol") or target_data.get("name")
+        parent_symbol = str(local_symbol or "")
+
+    res = {
+        "file": str(target_data.get("file") or ""),
+        "symbol": symbol,
+        "absolute_start_line": function_start + start,
+        "absolute_end_line": function_start + end - 1,
+        "window_code": "".join(lines[start:end]),
+        "target_view": target_view,
+        "target_sql_kind": target_sql_kind,
+        "target_type": target_type,
+        "parent_symbol": parent_symbol,
+        "local_target": local_target,
+        "operation": operation,
+    }
+    if canonical_old_string:
+        res["canonical_old_string"] = canonical_old_string
+        if operation == "dynamic_count_query_rewrite":
+            res["target_id"] = f"{symbol}.query_construction_block"
+        else:
+            res["target_id"] = f"{symbol}.{target_sql_variable}"
+    return res
+
+
+def _parse_patch_window_payload(raw: str) -> dict[str, object] | None:
+    payload = _extract_json_payload(raw)
+    if not isinstance(payload, dict):
+        return None
+    confidence = payload.get("confidence")
+    if not isinstance(confidence, int | float):
+        return None
+
+    # Handle replacement schema
+    if "replacement" in payload and isinstance(payload["replacement"], dict):
+        rep = payload["replacement"]
+        new_string = rep.get("new_string")
+        if isinstance(new_string, str):
+            return {
+                "replacement": {
+                    "target_id": str(rep.get("target_id") or ""),
+                    "new_string": new_string,
+                },
+                "confidence": float(confidence),
+                "notes": str(payload.get("notes") or ""),
+            }
+
+    # Fallback to patches schema
+    patches = payload.get("patches")
+    if not isinstance(patches, list) or not patches:
+        return None
+    normalized: list[dict[str, str]] = []
+    for patch in patches:
+        if not isinstance(patch, dict):
+            return None
+        old_string = patch.get("old_string")
+        new_string = patch.get("new_string")
+        if not isinstance(old_string, str) or not isinstance(new_string, str):
+            return None
+        normalized.append({
+            "old_string": old_string,
+            "new_string": new_string,
+        })
+    return {
+        "patches": normalized,
+        "confidence": float(confidence),
+        "notes": str(payload.get("notes") or ""),
+    }
+
+
+def _validate_patch_window_payload(
+    payload: dict[str, object],
+    *,
+    current_code: str,
+    patch_window: dict[str, object],
+    target_view: str,
+    target_sql_kind: str,
+    target_sql_variable: str,
+    constraints: list[str],
+    path: str,
+) -> list[str]:
+    errors: list[str] = []
+    window_code = str(patch_window.get("window_code") or "")
+    patches = payload.get("patches")
+    if not isinstance(patches, list):
+        return ["patches"]
+    updated_code = current_code
+    allow_joins = any(
+        "join" in item.lower() and any(word in item.lower() for word in ("allow", "keep", "preserve", "允许", "保留"))
+        for item in constraints
     )
+    for idx, patch in enumerate(patches):
+        if not isinstance(patch, dict):
+            errors.append(f"patches[{idx}]")
+            continue
+        old_string = str(patch.get("old_string") or "")
+        new_string = str(patch.get("new_string") or "")
+        if not old_string:
+            errors.append(f"patches[{idx}].old_string")
+            continue
+        if old_string == new_string:
+            errors.append(f"patches[{idx}].no_change")
+        if current_code.count(old_string) != 1:
+            errors.append(f"patches[{idx}].old_string_not_unique_in_symbol")
+        if old_string not in window_code:
+            errors.append(f"patches[{idx}].outside_patch_window")
+        if target_sql_kind in ("count", "dynamic_count_query"):
+            if target_view and target_view not in new_string:
+                errors.append(f"patches[{idx}].missing_target_view")
+            if not _patch_targets_count(old_string, target_sql_variable, target_sql_kind, window_code, current_code):
+                errors.append(f"patches[{idx}].not_count_query")
+            if target_sql_kind == "dynamic_count_query":
+                if "build_order_detail_sql" in old_string:
+                    errors.append(f"patches[{idx}].cannot_modify_helper_call")
+            if not allow_joins:
+                old_joins = _explicit_join_sources(old_string)
+                retained = old_joins & _explicit_join_sources(new_string)
+                if retained:
+                    errors.append(f"patches[{idx}].retains_old_join:{sorted(retained)[0]}")
+        if old_string in updated_code:
+            updated_code = updated_code.replace(old_string, new_string, 1)
+    syntax_error = _validate_python_code(path, updated_code)
+    if syntax_error:
+        errors.append(syntax_error)
+    return errors
+
+
+def _patch_targets_count(
+    old_string: str,
+    target_sql_variable: str,
+    target_sql_kind: str,
+    window_code: str,
+    current_code: str,
+) -> bool:
+    if "count" in old_string.lower():
+        return True
+    if target_sql_variable and target_sql_variable.lower() in old_string.lower():
+        return True
+    
+    # Check lines before old_string in current_code
+    if old_string:
+        idx = current_code.find(old_string)
+        if idx >= 0:
+            before_code = current_code[:idx]
+            lines = before_code.splitlines()
+            # Also check the current line containing the patch
+            lines.append(current_code[idx:].splitlines()[0] if current_code[idx:].splitlines() else "")
+            # Check last 25 lines
+            for line in lines[-25:]:
+                line_lower = line.lower()
+                if "count" in line_lower:
+                    return True
+                if target_sql_variable and target_sql_variable.lower() in line_lower:
+                    return True
+    return False
+
+
+def _explicit_join_sources(code: str) -> set[str]:
+    return {
+        match.group(1).lower()
+        for match in re.finditer(
+            r"(?i)\bJOIN\s+[`\"]?([A-Za-z_][A-Za-z0-9_.]*)",
+            code,
+        )
+    }
+
+
+def _target_sql_variable(
+    edit_context: dict[str, object] | None,
+    edit_plan: dict[str, object] | None,
+) -> str:
+    for source in (edit_plan, edit_context):
+        if isinstance(source, dict):
+            value = str(source.get("target_sql_variable") or "").strip()
+            if value:
+                return value
+    if isinstance(edit_context, dict):
+        task_intent = edit_context.get("task_intent")
+        if isinstance(task_intent, dict):
+            return str(task_intent.get("target_sql_variable") or "").strip()
+    return ""
+
+
+def _patch_constraints(edit_context: dict[str, object] | None) -> list[str]:
+    if not isinstance(edit_context, dict):
+        return []
+    values = edit_context.get("constraints") or []
+    return [str(item) for item in values if str(item).strip()]
+
+
+def _minimal_exact_patch(old_code: str, new_code: str) -> tuple[str, str] | None:
+    if old_code == new_code:
+        return None
+    old_lines = old_code.splitlines(keepends=True)
+    new_lines = new_code.splitlines(keepends=True)
+    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    changed = [op for op in matcher.get_opcodes() if op[0] != "equal"]
+    if not changed:
+        return None
+    old_start = min(op[1] for op in changed)
+    old_end = max(op[2] for op in changed)
+    new_start = min(op[3] for op in changed)
+    new_end = max(op[4] for op in changed)
+    while old_start >= 0 and old_end <= len(old_lines):
+        old_string = "".join(old_lines[old_start:old_end])
+        new_string = "".join(new_lines[new_start:new_end])
+        if old_string and old_code.count(old_string) == 1:
+            return old_string, new_string
+        if old_start == 0 and old_end == len(old_lines):
+            break
+        if old_start > 0:
+            old_start -= 1
+            new_start = max(0, new_start - 1)
+        if old_end < len(old_lines):
+            old_end += 1
+            new_end = min(len(new_lines), new_end + 1)
+    return None
+
+
+def _find_target_for_edit(
+    path: str,
+    old_string: str,
+    targets: list[dict[str, object]],
+) -> dict[str, object] | None:
+    normalized = path.replace("\\", "/").lstrip("./")
+    matches = [
+        target
+        for target in targets
+        if str(target.get("file") or "").replace("\\", "/").lstrip("./") == normalized
+        and old_string in str(target.get("current_code") or "")
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _validate_python_patch(
+    *,
+    path: str,
+    current_code: str,
+    old_string: str,
+    new_string: str,
+) -> str:
+    if old_string not in current_code:
+        return "old_string is outside target symbol"
+    return _validate_python_code(
+        path,
+        current_code.replace(old_string, new_string, 1),
+    )
+
+
+def _validate_python_code(path: str, code: str) -> str:
+    if not path.lower().endswith(".py"):
+        return ""
+    try:
+        ast.parse(textwrap.dedent(code))
+    except SyntaxError as exc:
+        return f"python_syntax:{exc.msg}:line_{exc.lineno}"
+    return ""
+
+
+async def _emit_progress(
+    events: list[dict[str, object]] | None,
+    callback: object,
+    event: str,
+    **data: object,
+) -> None:
+    item = {"event": event, **data}
+    if events is not None:
+        events.append(item)
+    if not callable(callback):
+        return
+    result = callback(item)
+    if inspect.isawaitable(result):
+        await result
 
 
 def _prepare_edit_plan_evidence(evidence: str) -> str:
@@ -1266,6 +1857,7 @@ def _prepare_edit_plan_evidence(evidence: str) -> str:
         compact_targets.append({
             "index": idx,
             "file": target.get("file"),
+            "symbol": target.get("symbol") or target.get("name"),
             "start_line": target.get("start_line"),
             "end_line": target.get("end_line"),
             "code_preview": _preview(display_code, limit=1200),
@@ -1294,6 +1886,13 @@ def _validate_edit_context_ready(
     if not isinstance(targets, list) or not targets:
         return "no editable_targets/snippets"
     task_intent = ctx.get("task_intent")
+    if not isinstance(task_intent, dict):
+        return "missing task_intent"
+    target_symbol = str(task_intent.get("target_symbol") or "").strip()
+    if not target_symbol or target_symbol == "目标代码":
+        return "missing target_symbol"
+    if target_symbol in _EDIT_OPERATIONS or target_symbol.lower() == "modify":
+        return f"operation value '{target_symbol}' cannot be used as target_symbol"
     intended_change = str(ctx.get("intended_change") or "").strip()
     if not intended_change and isinstance(task_intent, dict):
         intended_change = str(task_intent.get("goal") or "").strip()
@@ -1304,7 +1903,14 @@ def _validate_edit_context_ready(
     is_replacement_op = False
     if isinstance(task_intent, dict):
         op = task_intent.get("operation")
-        if op in ("replace_dependency", "use_existing", "replace_sql_source"):
+        if op in (
+            "replace_dependency",
+            "use_existing",
+            "replace_sql_source",
+            "count_query_view_rewrite",
+            "dynamic_count_query_rewrite",
+            "dynamic_sql_rewrite",
+        ):
             is_replacement_op = True
     if strategy == "sql_view_rewrite":
         is_replacement_op = True
@@ -1346,6 +1952,9 @@ def _validate_edit_context_ready(
     for idx, target in enumerate(targets):
         if not isinstance(target, dict):
             return f"editable_targets[{idx}] is not an object"
+        symbol_error = _validate_symbol_lock(target)
+        if symbol_error:
+            return f"editable_targets[{idx}] {symbol_error}"
         file_raw = str(target.get("file") or "")
         file = file_raw.replace("\\", "/")
         start = target.get("start_line")
@@ -1368,11 +1977,23 @@ def _validate_edit_context_ready(
                     is_db_view_change = True
                     break
 
-        if is_db_view_change and not _target_has_sql_query(current_code):
-            return (
-                f"editable_targets[{idx}] is not a SQL/query target for "
-                "a view-query edit"
-            )
+        if is_db_view_change:
+            op = ""
+            if isinstance(task_intent, dict):
+                op = str(task_intent.get("operation") or "")
+            is_dynamic_op = op in ("dynamic_sql_rewrite", "dynamic_count_query_rewrite")
+            has_static = _target_has_sql_query(current_code)
+            has_dynamic = _has_dynamic_sql_clues(current_code)
+            if not has_static and not has_dynamic:
+                return "no_rewriteable_sql_found: not a SQL/query target for a view-query edit"
+
+            if not is_dynamic_op and not has_static:
+                if _is_count_target(ctx, target):
+                    return "target_not_hydrated"
+                return (
+                    f"editable_targets[{idx}] is not a SQL/query target for "
+                    "a view-query edit"
+                )
         if not target_change:
             return f"editable_targets[{idx}] missing intended_change"
         if not _has_acceptance(target_acceptance):
@@ -1388,6 +2009,12 @@ def _validate_edit_context_ready(
             return f"patch_validator cannot read {file}: {exc}"
         if current_code not in content:
             return f"patch_validator cannot locate current_code in {file}"
+    if not any(
+        isinstance(target, dict)
+        and str(target.get("symbol") or target.get("name") or "").strip() == target_symbol
+        for target in targets
+    ):
+        return f"target_symbol '{target_symbol}' does not match any editable target"
     return ""
 
 
@@ -1417,6 +2044,12 @@ def _target_has_sql_query(current_code: str) -> bool:
     return False
 
 
+def _has_dynamic_sql_clues(code: str) -> bool:
+    lowered = code.lower()
+    clues = ("sql", "query", "select", "count", "join", "from", "where")
+    return any(w in lowered for w in clues)
+
+
 def _scope_key(raw: str, project_root: Path) -> str:
     text = raw.replace("\\", "/").strip()
     try:
@@ -1428,148 +2061,6 @@ def _scope_key(raw: str, project_root: Path) -> str:
             return str(resolved).replace("\\", "/")
     except OSError:
         return text.lstrip("./")
-
-
-def _fallback_edit_payload(
-    ctx: dict[str, object] | None,
-    *,
-    evidence: str,
-    instruction: str,
-    handoff_contract: dict[str, object] | None,
-) -> dict[str, object] | None:
-    if not isinstance(ctx, dict):
-        return {
-            "edits": [],
-            "confidence": 0.0,
-            "missing_info": ["missing_context"],
-            "source": "deterministic_sql_view_fallback",
-        }
-    view_name = str(ctx.get("target_view") or "").strip()
-    if not view_name:
-        view_name = _select_target_view(
-            evidence=evidence,
-            instruction=instruction,
-            handoff_contract=handoff_contract,
-        )
-    if not view_name:
-        return {
-            "edits": [],
-            "confidence": 0.0,
-            "missing_info": ["missing_target_view"],
-            "source": "deterministic_sql_view_fallback",
-        }
-    targets = ctx.get("editable_targets")
-    if not isinstance(targets, list) or not targets:
-        targets = ctx.get("snippets")
-    if not isinstance(targets, list) or not targets:
-        return {
-            "edits": [],
-            "confidence": 0.0,
-            "missing_info": ["missing_targets"],
-            "source": "deterministic_sql_view_fallback",
-        }
-
-    edits: list[dict[str, str]] = []
-    for target in targets:
-        if not isinstance(target, dict):
-            continue
-        path = str(target.get("file") or "").strip()
-        current_code = str(target.get("current_code") or "")
-        if not path or not current_code:
-            continue
-        tmp_ctx = dict(ctx)
-        tmp_ctx["target_view"] = view_name
-        if "resolved_dependencies" in tmp_ctx:
-            resolved_deps = []
-            for dep in tmp_ctx["resolved_dependencies"]:
-                if isinstance(dep, dict) and dep.get("role") == "replacement_source":
-                    new_dep = dict(dep)
-                    new_dep["name"] = view_name
-                    resolved_deps.append(new_dep)
-                else:
-                    resolved_deps.append(dep)
-            tmp_ctx["resolved_dependencies"] = resolved_deps
-        new_code = generate_sql_patch(current_code, tmp_ctx)
-        if new_code is None:
-            new_code = _replace_boarding_pass_table(current_code, view_name)
-        if new_code == current_code:
-            continue
-        edits.append({
-            "path": path,
-            "old_string": current_code,
-            "new_string": new_code,
-        })
-        break
-
-    if not edits:
-        return {
-            "edits": [],
-            "confidence": 0.0,
-            "missing_info": ["no_matching_edits"],
-            "source": "deterministic_sql_view_fallback",
-        }
-    return {
-        "edits": edits,
-        "confidence": 0.82,
-        "missing_info": [],
-        "source": "deterministic_sql_view_fallback",
-    }
-
-
-def _select_target_view(
-    *,
-    evidence: str,
-    instruction: str,
-    handoff_contract: dict[str, object] | None,
-) -> str:
-    contract_text = (
-        json.dumps(handoff_contract, ensure_ascii=False)
-        if handoff_contract
-        else ""
-    )
-    text = "\n".join([instruction, evidence, contract_text])
-    candidates = list(dict.fromkeys(
-        match.group(1)
-        for match in re.finditer(
-            r"(?i)\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+([A-Za-z_][A-Za-z0-9_]*)",
-            text,
-        )
-    ))
-    candidates.extend(
-        candidate
-        for candidate in re.findall(r"\b(?:v|view)_[A-Za-z0-9_]*\b", text)
-        if candidate not in candidates
-    )
-    if not candidates:
-        return ""
-
-    def score(name: str) -> tuple[int, str]:
-        lowered = name.lower()
-        value = 0
-        if "boarding" in lowered:
-            value += 8
-        if "ticket" in lowered:
-            value += 6
-        if "report" in lowered or "detail" in lowered:
-            value += 3
-        if "flight" in lowered or "monitor" in lowered:
-            value -= 5
-        return value, name
-
-    best_score, best = max(score(candidate) for candidate in candidates)
-    return best if best_score > 0 else ""
-
-
-def _replace_boarding_pass_table(current_code: str, view_name: str) -> str:
-    pattern = re.compile(
-        r"(?i)\b(?P<keyword>FROM|JOIN)\s+(?P<quote>[`\"]?)boarding_pass(?P=quote)\b"
-    )
-
-    def repl(match: re.Match[str]) -> str:
-        quote = match.group("quote")
-        return f"{match.group('keyword')} {quote}{view_name}{quote}"
-
-    return pattern.sub(repl, current_code)
 
 
 def _extract_marker_json(text: str, marker: str) -> dict[str, object] | None:
@@ -1640,27 +2131,6 @@ def _extract_json_payload(raw: str) -> dict[str, object] | None:
                 "confidence": 1.0,
                 "missing_info": []
             }
-    except Exception:
-        pass
-
-    # Fallback for ReplacementBuilder JSON corrupted by unescaped quotes/newlines in new_string
-    try:
-        pattern = re.compile(r'["\']new_string["\']\s*:\s*["\']', re.IGNORECASE)
-        match = pattern.search(text)
-        if match:
-            start_idx = match.end()
-            r_brace = text.rfind('}')
-            r_quote = -1
-            for i in range(r_brace - 1, start_idx - 1, -1):
-                if text[i] in ('"', "'"):
-                    r_quote = i
-                    break
-            if r_quote > start_idx:
-                code_part = text[start_idx:r_quote]
-                res = code_part.replace('\\n', '\n').replace('\\t', '\t')
-                res = res.replace('\\"', '"').replace("\\'", "'")
-                res = res.replace('\\\\', '\\')
-                return {"new_string": res}
     except Exception:
         pass
 

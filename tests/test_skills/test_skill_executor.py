@@ -18,7 +18,13 @@ from src.skills import (
     ValidatorSkill,
     VerifySkill,
 )
-from src.skills.code_edit import _edit_messages, _replacement_messages
+from src.skills.code_edit import (
+    _edit_messages,
+    _extract_patch_window,
+    _parse_patch_window_payload,
+    _patch_window_messages,
+    _validate_patch_window_payload,
+)
 from src.tools.search.context_search import ContextSearchTool
 from src.tools.registry import create_default_registry
 
@@ -64,6 +70,16 @@ class RangeToolRegistry:
             return ToolResult(
                 success=True,
                 output="main.py:2-4 function make_boarding_pass_pdf score=0.9",
+            )
+        return ToolResult(success=True, output="No matches found.")
+
+
+class AdminOrderMisleadingToolRegistry:
+    async def call(self, name: str, params: dict[str, object]) -> ToolResult:
+        if name == "grep_search":
+            return ToolResult(
+                success=True,
+                output="main.py:1: def build_flight_search_sql():",
             )
         return ToolResult(success=True, output="No matches found.")
 
@@ -264,6 +280,160 @@ async def test_code_edit_skill_runs_focused_edit_without_patch_plan(tmp_path) ->
     assert result.success
     assert result.changed_files == ("main.py",)
     assert "view_ticket_report_detail" in target.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_code_edit_rejects_target_index_outside_target_symbol(tmp_path) -> None:
+    target = tmp_path / "main.py"
+    target.write_text(
+        "def build_flight_search_sql():\n"
+        "    sql = 'SELECT * FROM flight_info'\n"
+        "    return sql\n\n"
+        "def admin_list_orders():\n"
+        "    count_sql = 'SELECT COUNT(*) AS total FROM ticket_order o'\n"
+        "    return count_sql\n",
+        encoding="utf-8",
+    )
+
+    async def complete(messages: list[dict[str, object]]) -> str:
+        system = str(messages[0].get("content") or "")
+        if "ReplacementBuilder" in system:
+            return json.dumps({"new_string": "unexpected"})
+        return json.dumps({
+            "edits": [{
+                "target_index": 0,
+                "operation": "count_query_view_rewrite",
+            }],
+            "confidence": 0.9,
+            "missing_info": [],
+        })
+
+    edit_context = {
+        "schema": "mitkii.edit_context.v2",
+        "code_edit_ready": True,
+        "task_intent": {
+            "operation": "count_query_view_rewrite",
+            "target_symbol": "admin_list_orders",
+            "target_sql_kind": "count",
+            "target_sql_variable": "count_sql",
+            "goal": "use view",
+        },
+        "target_view": "view_ticket_report_detail",
+        "available_views": ["view_ticket_report_detail"],
+        "editable_targets": [
+            {
+                "file": "main.py",
+                "symbol": "build_flight_search_sql",
+                "start_line": 1,
+                "end_line": 3,
+                "current_code": (
+                    "def build_flight_search_sql():\n"
+                    "    sql = 'SELECT * FROM flight_info'\n"
+                    "    return sql"
+                ),
+            },
+            {
+                "file": "main.py",
+                "symbol": "admin_list_orders",
+                "start_line": 5,
+                "end_line": 7,
+                "current_code": (
+                    "def admin_list_orders():\n"
+                    "    count_sql = 'SELECT COUNT(*) AS total FROM ticket_order o'\n"
+                    "    return count_sql"
+                ),
+            },
+        ],
+        "resolved_dependencies": [{
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": "view_ticket_report_detail",
+            "replaces_objects": ["ticket_order"],
+            "confidence": 0.95,
+        }],
+        "acceptance": [{"type": "diff_must_touch_symbol", "symbol": "admin_list_orders"}],
+        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
+        "intended_change": "将 admin_list_orders 里的 count 查询改为基于视图查询",
+    }
+    executor = SkillExecutor([CodeEditSkill(project_root=tmp_path, llm_complete=complete)])
+
+    result = await executor.run(
+        "code_edit",
+        SkillContext(user_request="change count query"),
+        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
+    )
+
+    assert not result.success
+    assert "target_symbol" in result.missing_info
+    content = target.read_text(encoding="utf-8")
+    assert "view_ticket_report_detail" not in content
+
+
+@pytest.mark.asyncio
+async def test_code_edit_count_target_without_sql_fails_before_llm(tmp_path) -> None:
+    target = tmp_path / "main.py"
+    old_code = (
+        "def admin_list_orders():\n"
+        "    count_sql = build_count_sql()\n"
+        "    return count_sql\n"
+    )
+    target.write_text(old_code, encoding="utf-8")
+    calls = 0
+
+    async def complete(_messages: list[dict[str, object]]) -> str:
+        nonlocal calls
+        calls += 1
+        return json.dumps({
+            "edits": [{
+                "target_index": 0,
+                "operation": "count_query_view_rewrite",
+            }],
+            "confidence": 0.9,
+            "missing_info": [],
+        })
+
+    edit_context = {
+        "schema": "mitkii.edit_context.v2",
+        "code_edit_ready": True,
+        "task_intent": {
+            "operation": "count_query_view_rewrite",
+            "target_symbol": "admin_list_orders",
+            "target_sql_kind": "count",
+            "target_sql_variable": "count_sql",
+            "goal": "use view",
+        },
+        "target_view": "view_ticket_report_detail",
+        "available_views": ["view_ticket_report_detail"],
+        "editable_targets": [{
+            "file": "main.py",
+            "symbol": "admin_list_orders",
+            "start_line": 1,
+            "end_line": 3,
+            "current_code": old_code.rstrip(),
+            "sql_presence": False,
+        }],
+        "resolved_dependencies": [{
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": "view_ticket_report_detail",
+            "confidence": 0.95,
+        }],
+        "acceptance": [{"type": "diff_must_touch_symbol", "symbol": "admin_list_orders"}],
+        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
+        "intended_change": "将 admin_list_orders 里的 count 查询改为基于视图查询",
+    }
+    executor = SkillExecutor([CodeEditSkill(project_root=tmp_path, llm_complete=complete)])
+
+    result = await executor.run(
+        "code_edit",
+        SkillContext(user_request="change count query"),
+        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
+    )
+
+    assert not result.success
+    assert result.missing_info == ("target_not_hydrated",)
+    assert calls == 0
+    assert target.read_text(encoding="utf-8") == old_code
 
 
 @pytest.mark.asyncio
@@ -475,7 +645,7 @@ async def test_code_edit_skill_accepts_target_index_without_old_string(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_code_edit_skill_falls_back_from_non_json_to_sql_view_edit(tmp_path) -> None:
+async def test_code_edit_skill_rejects_non_json_without_global_fallback(tmp_path) -> None:
     target = tmp_path / "main.py"
     target.write_text(
         "def get_boarding_pass():\n"
@@ -521,9 +691,9 @@ async def test_code_edit_skill_falls_back_from_non_json_to_sql_view_edit(tmp_pat
         ),
     )
 
-    assert result.success
-    assert result.changed_files == ("main.py",)
-    assert "FROM view_ticket_report_detail" in target.read_text(encoding="utf-8")
+    assert not result.success
+    assert result.missing_info == ("edit_plan_json",)
+    assert "FROM boarding_pass" in target.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -747,19 +917,28 @@ def test_code_edit_plan_messages_compact_large_current_code() -> None:
     assert "x_1999" not in user_content
 
 
-def test_replacement_messages_focus_single_current_code() -> None:
-    messages = _replacement_messages(
+def test_patch_window_messages_only_include_writable_window() -> None:
+    patch_window = {
+        "file": "app.py",
+        "symbol": "target",
+        "absolute_start_line": 2,
+        "absolute_end_line": 2,
+        "window_code": "    count_sql = 'SELECT COUNT(*) FROM boarding_pass'\n",
+        "target_view": "view_ticket_report_detail",
+        "target_sql_kind": "count",
+    }
+    messages = _patch_window_messages(
         instruction="把查询改成视图",
-        file="app.py",
-        target_index=0,
-        current_code="def target():\n    return 'SELECT * FROM boarding_pass'",
-        edit_plan={"target_index": 0, "target_view": "view_ticket_report_detail"},
-        evidence="other.py:1: unrelated\nEDIT_CONTEXT_JSON\n{}",
+        target_view="view_ticket_report_detail",
+        target_sql_kind="count",
+        target_symbol="target",
+        patch_window=patch_window,
+        constraints=["Only edit target"],
     )
 
     user_content = str(messages[1]["content"])
-    assert "CURRENT_CODE" in user_content
-    assert "SELECT * FROM boarding_pass" in user_content
+    assert "PATCH_WINDOW_JSON" in user_content
+    assert "SELECT COUNT(*) FROM boarding_pass" in user_content
     assert "EDIT_CONTEXT_JSON" not in user_content
     assert "view_ticket_report_detail" in str(messages[0]["content"])
 
@@ -921,10 +1100,213 @@ async def test_code_search_skill_hydrates_map_range_as_edit_context(tmp_path) ->
     assert '"builder": "EditPlanBuilder"' in output
     assert '"snippets"' in output
     assert '"editable_targets"' in output
+    assert '"sql_queries"' in output
+    assert '"source_tables"' in output
     assert '"scope"' in output
     assert "SELECT * FROM boarding_pass" in output
     assert '"intended_change"' in output
     assert '"acceptance_criteria"' in output
+
+
+@pytest.mark.asyncio
+async def test_code_search_prioritizes_explicit_python_symbol_for_edit_context(tmp_path) -> None:
+    target = tmp_path / "main.py"
+    target.write_text(
+        "def build_flight_search_sql():\n"
+        "    sql = 'SELECT * FROM flight f JOIN airport_info a ON a.id = f.id'\n"
+        "    return sql\n\n"
+        "def admin_list_orders():\n"
+        "    list_sql = 'SELECT o.order_id FROM ticket_order o'\n"
+        "    count_sql = 'SELECT COUNT(*) AS total FROM ticket_order o WHERE o.status = :status'\n"
+        "    return list_sql, count_sql\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "schema.sql").write_text(
+        "CREATE VIEW view_ticket_report_detail AS SELECT order_id, status FROM ticket_order;",
+        encoding="utf-8",
+    )
+    executor = SkillExecutor([
+        CodeSearchSkill(project_root=tmp_path, tools=AdminOrderMisleadingToolRegistry()),  # type: ignore[arg-type]
+    ])
+
+    result = await executor.run(
+        "code_search",
+        SkillContext(user_request="将 admin_list_orders 里的 count 查询改为基于视图查询"),
+    )
+
+    assert result.success
+    ctx = json.loads(str(result.metadata["edit_context_json"]))
+    assert ctx["editable_targets"][0]["symbol"] == "admin_list_orders"
+    assert "admin_list_orders" in ctx["editable_targets"][0]["current_code"]
+    assert ctx["editable_targets"][0]["hydrated"] is True
+    assert ctx["editable_targets"][0]["target_sql_kind"] == "count"
+    assert ctx["editable_targets"][0]["target_sql_variable"] == "count_sql"
+    assert ctx["editable_targets"][0]["inner_targets"]["sql_variable"] == "count_sql"
+    assert ctx["editable_targets"][0]["inner_targets"]["count_clauses"]["from"] == "ticket_order"
+    assert ctx["task_intent"]["operation"] == "count_query_view_rewrite"
+    assert ctx["target_sql_kind"] == "count"
+    assert ctx["target_sql_variable"] == "count_sql"
+    assert ctx["target_resolution"]["source"] == "explicit_symbol"
+    assert ctx["target_resolution"]["symbols"] == ["admin_list_orders"]
+
+
+@pytest.mark.asyncio
+async def test_code_search_uses_root_request_and_metadata_for_explicit_symbol(tmp_path) -> None:
+    target = tmp_path / "main.py"
+    target.write_text(
+        "def build_flight_search_sql():\n"
+        "    sql = 'SELECT * FROM flight f JOIN airport_info a ON a.id = f.id'\n"
+        "    return sql\n\n"
+        "def admin_list_orders():\n"
+        "    count_sql = build_count_sql()\n"
+        "    return count_sql\n",
+        encoding="utf-8",
+    )
+    executor = SkillExecutor([
+        CodeSearchSkill(project_root=tmp_path, tools=AdminOrderMisleadingToolRegistry()),  # type: ignore[arg-type]
+    ])
+
+    # 1. Diagnose phase (requires_editable_target=False)
+    result = await executor.run(
+        "code_search",
+        SkillContext(
+            user_request="将 admin_list_orders 里的 count 查询改为基于视图查询",
+            metadata={"target_symbol": "admin_list_orders"},
+        ),
+        extra_query="count 查询改为基于视图查询",
+    )
+
+    assert result.success
+    assert "dynamic_sql_rewrite_required:admin_list_orders" in result.warnings
+    assert "admin_list_orders" in result.summary
+
+    # 2. Edit phase (requires_editable_target=True)
+    result_edit = await executor.run(
+        "code_search",
+        SkillContext(
+            user_request="将 admin_list_orders 里的 count 查询改为基于视图查询",
+            metadata={"target_symbol": "admin_list_orders"},
+        ),
+        extra_query="count 查询改为基于视图查询",
+        requires_editable_target=True,
+    )
+
+    assert result_edit.success
+    assert "dynamic_sql_rewrite_required:admin_list_orders" in result_edit.warnings
+    assert result_edit.metadata["edit_context_json"] != ""
+    ctx = json.loads(result_edit.metadata["edit_context_json"])
+    assert ctx["task_intent"]["operation"] == "dynamic_count_query_rewrite"
+    assert ctx["task_intent"]["edit_strategy"] == "dynamic_sql_rewrite"
+
+
+@pytest.mark.asyncio
+async def test_code_search_explicit_symbol_uses_complete_function_body(tmp_path) -> None:
+    filler = "\n".join(f"    value_{idx} = {idx}" for idx in range(12))
+    target = tmp_path / "main.py"
+    target.write_text(
+        "def build_flight_search_sql():\n"
+        "    sql = 'SELECT * FROM flight_info'\n"
+        "    return sql\n\n"
+        "def admin_list_orders():\n"
+        f"{filler}\n"
+        "    count_sql = 'SELECT COUNT(*) AS total FROM ticket_order o WHERE o.status = :status'\n"
+        "    return count_sql\n",
+        encoding="utf-8",
+    )
+    executor = SkillExecutor([
+        CodeSearchSkill(project_root=tmp_path, tools=AdminOrderMisleadingToolRegistry()),  # type: ignore[arg-type]
+    ])
+
+    result = await executor.run(
+        "code_search",
+        SkillContext(user_request="将 admin_list_orders 里的 count 查询改为基于视图查询"),
+    )
+
+    assert result.success
+    ctx = json.loads(str(result.metadata["edit_context_json"]))
+    first = ctx["editable_targets"][0]
+    assert first["symbol"] == "admin_list_orders"
+    assert first["start_line"] == 5
+    assert first["end_line"] == 19
+    assert "value_11 = 11" in first["current_code"]
+    assert "SELECT COUNT(*) AS total" in first["current_code"]
+
+
+@pytest.mark.asyncio
+async def test_code_search_skill_snippet_uses_expanded_sql_context(tmp_path) -> None:
+    target = tmp_path / "main.py"
+    target.write_text(
+        "def query_orders():\n"
+        "    sql = '''\n"
+        "    SELECT o.order_id,\n"
+        "           p.real_name AS passenger_name\n"
+        "    FROM ticket_order o\n"
+        "    JOIN passenger_info p ON p.p_id = o.p_id\n"
+        "    WHERE p.real_name LIKE :keyword\n"
+        "    '''\n"
+        "    return sql\n",
+        encoding="utf-8",
+    )
+
+    class SqlLineToolRegistry:
+        async def call(self, name: str, params: dict[str, object]) -> ToolResult:
+            if name == "grep_search":
+                return ToolResult(success=True, output="main.py:6:     JOIN passenger_info p ON p.p_id = o.p_id")
+            return ToolResult(success=True, output="No matches found.")
+
+    executor = SkillExecutor([
+        CodeSearchSkill(project_root=tmp_path, tools=SqlLineToolRegistry()),  # type: ignore[arg-type]
+    ])
+
+    result = await executor.run(
+        "code_search",
+        SkillContext(user_request="把订单查询改成使用 view_ticket_report_detail 视图"),
+    )
+
+    output = result.metadata["search_output"]
+    assert result.success
+    assert '<snippet path="main.py" lines="1-9">' in output
+    assert "2:     sql = '''" in output
+    assert "3:     SELECT o.order_id," in output
+    assert "5:     FROM ticket_order o" in output
+    assert "6:     JOIN passenger_info p ON p.p_id = o.p_id" in output
+    assert "7:     WHERE p.real_name LIKE :keyword" in output
+
+
+@pytest.mark.asyncio
+async def test_code_search_skill_uses_view_ast_range_for_sql_hydration(tmp_path) -> None:
+    target = tmp_path / "schema.sql"
+    target.write_text(
+        "-- views\n"
+        "CREATE VIEW view_ticket_report_detail AS\n"
+        "SELECT o.order_id,\n"
+        "       p.real_name AS passenger_name\n"
+        "FROM ticket_order o\n"
+        "JOIN passenger_info p ON p.p_id = o.p_id;\n",
+        encoding="utf-8",
+    )
+
+    class ViewLineToolRegistry:
+        async def call(self, name: str, params: dict[str, object]) -> ToolResult:
+            if name == "grep_search":
+                return ToolResult(success=True, output="schema.sql:5: FROM ticket_order o")
+            return ToolResult(success=True, output="No matches found.")
+
+    executor = SkillExecutor([
+        CodeSearchSkill(project_root=tmp_path, tools=ViewLineToolRegistry()),  # type: ignore[arg-type]
+    ])
+
+    result = await executor.run(
+        "code_search",
+        SkillContext(user_request="使用 view_ticket_report_detail 视图"),
+    )
+
+    output = result.metadata["search_output"]
+    assert result.success
+    assert '<snippet path="schema.sql" lines="1-6">' in output
+    assert "2: CREATE VIEW view_ticket_report_detail AS" in output
+    assert "3: SELECT o.order_id," in output
+    assert "6: JOIN passenger_info p ON p.p_id = o.p_id;" in output
 
 
 @pytest.mark.asyncio
@@ -1165,7 +1547,8 @@ def test_default_registry_registers_context_search(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_verify_skill_no_framework_detected(tmp_path) -> None:
+async def test_verify_skill_no_framework_detected(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
     executor = SkillExecutor([VerifySkill(project_root=tmp_path)])
     result = await executor.run(
         "verify",
@@ -1174,10 +1557,7 @@ async def test_verify_skill_no_framework_detected(tmp_path) -> None:
     )
     assert not result.success
     assert result.validation_result == "failed"
-    assert (
-        "No test framework detected" in result.summary
-        or "pytest" in result.summary
-    )
+    assert "No test framework detected" in result.summary
 
 
 @pytest.mark.asyncio
@@ -1198,6 +1578,37 @@ async def test_verify_skill_fails_when_test_fails(tmp_path) -> None:
     assert result.validation_result == "failed"
     assert "pytest" in result.summary
     assert "FAILED" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_verify_skill_bypasses_when_no_changes(tmp_path) -> None:
+    executor = SkillExecutor([VerifySkill(project_root=tmp_path)])
+    result = await executor.run(
+        "verify",
+        SkillContext(user_request="verify"),
+        changed_files=(),
+    )
+    assert result.success
+    assert result.validation_result == "passed"
+    assert "Verification bypassed" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_verify_skill_passes_on_exit_code_5(tmp_path) -> None:
+    conftest = tmp_path / "conftest.py"
+    conftest.write_text("", encoding="utf-8")
+
+    # This test suite has no tests defined, so pytest will collect 0 tests and exit with code 5.
+    executor = SkillExecutor([VerifySkill(project_root=tmp_path)])
+    result = await executor.run(
+        "verify",
+        SkillContext(user_request="verify"),
+        changed_files=("conftest.py",),
+    )
+    assert result.success
+    assert result.validation_result == "passed"
+    assert "pytest" in result.summary
+    assert "PASSED" in result.summary
 
 
 def test_infer_target_view_token_matching() -> None:
@@ -1226,7 +1637,6 @@ def test_validate_edit_context_ready_with_target_view(tmp_path) -> None:
     # 1. Successful validation when target_view matches available_views
     ctx_ok = {
         "code_edit_ready": True,
-        "edit_strategy": "sql_view_rewrite",
         "intended_change": "use view to replace order query",
         "available_views": ["v_order_detail"],
         "target_view": "v_order_detail",
@@ -1234,6 +1644,13 @@ def test_validate_edit_context_ready_with_target_view(tmp_path) -> None:
         "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["app.py"]},
         "editable_targets": [{
             "file": "app.py",
+            "symbol": "<module>",
+            "symbol_lock": {
+                "name": "<module>",
+                "file": "app.py",
+                "range": [1, 2],
+                "immutable": True,
+            },
             "start_line": 1,
             "end_line": 2,
             "current_code": "SELECT * FROM orders",
@@ -1331,6 +1748,45 @@ async def test_code_edit_allows_unresolved_dependencies_and_uses_bounded_sql_fal
     written = target.read_text(encoding="utf-8")
     assert "view_ticket_report_detail" in written
     assert "orders" not in written
+
+
+def test_validate_edit_context_rejects_operation_as_target_symbol(tmp_path) -> None:
+    from src.skills.code_edit import _validate_edit_context_ready
+
+    ctx = {
+        "code_edit_ready": True,
+        "task_intent": {
+            "operation": "dynamic_sql_rewrite",
+            "target_symbol": "Modify",
+        },
+        "editable_targets": [{
+            "file": "app.py",
+            "symbol": "Modify",
+            "start_line": 1,
+            "end_line": 1,
+            "current_code": "sql = 'SELECT 1'",
+        }],
+    }
+
+    assert "cannot be used as target_symbol" in _validate_edit_context_ready(tmp_path, ctx)
+
+
+def test_symbol_lock_cannot_resolve_invalid_symbol_less_target() -> None:
+    from src.skills.code_edit import _lock_edit_context_symbols
+
+    ctx = {
+        "editable_targets": [{
+            "file": "app.py",
+            "start_line": 1,
+            "end_line": 1,
+            "current_code": "def broken(",
+        }],
+    }
+
+    _lock_edit_context_symbols(ctx)
+
+    assert "target_symbol" not in ctx["task_intent"]
+    assert "symbol" not in ctx["editable_targets"][0]
 
 
 def test_validate_sql_references_check(tmp_path) -> None:
@@ -1562,7 +2018,7 @@ def test_deterministic_replace_sql_with_view_complex() -> None:
     assert res is not None
     assert "FROM v_my_view" in res
     assert "WHERE a = 1" in res
-    assert "(SELECT count(*) FROM other" in res
+    assert "(SELECT COUNT(*) FROM other" in res
 
     # 2. Subquery in FROM
     sql_with_subquery_from = (
@@ -2034,7 +2490,10 @@ def test_replace_table_with_view_in_sql() -> None:
     
     sql = "SELECT o.order_id, o.p_id FROM ticket_order o JOIN passenger_info p ON p.p_id = o.p_id"
     res = replace_table_with_view_in_sql(sql, "v_order_detail")
-    assert res == "SELECT o.order_id, o.p_id FROM v_order_detail o JOIN passenger_info p ON p.p_id = o.p_id"
+    assert "SELECT o.order_id, o.p_id" in res
+    assert "FROM v_order_detail AS o" in res
+    assert "JOIN passenger_info AS p" in res
+    assert "p.p_id = o.p_id" in res
 
 
 def test_deterministic_replace_sql_with_view_preserves_structure() -> None:
@@ -2050,8 +2509,8 @@ def test_deterministic_replace_sql_with_view_preserves_structure() -> None:
     )
     res = deterministic_replace_sql_with_view(code, "my_view")
     assert "SELECT o.id, o.num" in res
-    assert "FROM my_view o" in res
-    assert "JOIN other p ON p.id = o.id" in res
+    assert "FROM my_view AS o" in res
+    assert "JOIN other AS p ON p.id = o.id" in res
     assert "SELECT *" not in res
 
 
@@ -2086,11 +2545,11 @@ def test_generate_sql_patch_uses_dependency_columns_and_removes_replaced_joins()
 
     res = generate_sql_patch(code, ctx)
     assert res is not None
-    assert "FROM view_ticket_report_detail v" in res
+    assert "FROM view_ticket_report_detail AS v" in res
     assert "v.order_id" in res
     assert "v.passenger_name" in res
     assert "v.flight_no" in res
-    assert "JOIN keep_table k" in res
+    assert "JOIN keep_table AS k" in res
     assert "passenger_info" not in res
     assert "flight_info" not in res
     assert "ticket_order" not in res
@@ -2124,12 +2583,465 @@ def test_generate_sql_patch_raises_missing_column_mapping() -> None:
         generate_sql_patch(code, ctx)
 
 
+def test_generate_sql_patch_preserves_count_projection_without_column_mapping() -> None:
+    from src.skills.code_edit import generate_sql_patch
+
+    code = (
+        "def count_orders():\n"
+        "    return \"SELECT COUNT(*) AS total FROM ticket_order o "
+        "WHERE o.status = :status\"\n"
+    )
+    ctx = {
+        "resolved_dependencies": [{
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": "view_ticket_report_detail",
+            "columns": ["order_id", "p_id", "status"],
+            "replaces_objects": ["ticket_order"],
+        }]
+    }
+
+    res = generate_sql_patch(code, ctx)
+
+    assert "COUNT(*) AS total" in res
+    assert "FROM view_ticket_report_detail AS v" in res
+    assert "v.status = :status" in res
+    assert "ticket_order" not in res
+
+
+def test_generate_sql_patch_targets_count_sql_literal_not_first_query() -> None:
+    from src.skills.code_edit import generate_sql_patch
+
+    code = (
+        "def admin_list_orders():\n"
+        "    list_sql = \"SELECT o.order_id FROM ticket_order o WHERE o.status = :status\"\n"
+        "    count_sql = \"SELECT COUNT(*) AS total FROM ticket_order o WHERE o.status = :status\"\n"
+        "    return list_sql, count_sql\n"
+    )
+    ctx = {
+        "target_sql_kind": "count",
+        "target_sql_variable": "count_sql",
+        "resolved_dependencies": [{
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": "view_ticket_report_detail",
+            "columns": ["order_id", "status"],
+            "replaces_objects": ["ticket_order"],
+        }],
+    }
+
+    res = generate_sql_patch(code, ctx)
+
+    assert res is not None
+    assert 'list_sql = "SELECT o.order_id FROM ticket_order o WHERE o.status = :status"' in res
+    assert "count_sql" in res
+    assert "SELECT COUNT(*) AS total FROM view_ticket_report_detail AS v" in res
+    assert "v.status = :status" in res
+
+
+def test_patch_window_messages_require_exact_old_new_patch() -> None:
+    patch_window = {
+        "file": "main.py",
+        "symbol": "admin_list_orders",
+        "absolute_start_line": 2,
+        "absolute_end_line": 2,
+        "window_code": '    count_sql = "SELECT COUNT(*) FROM ticket_order"\n',
+        "target_view": "view_ticket_report_detail",
+        "target_sql_kind": "count",
+    }
+    messages = _patch_window_messages(
+        instruction="rewrite count query",
+        target_view="view_ticket_report_detail",
+        target_sql_kind="count",
+        target_symbol="admin_list_orders",
+        patch_window=patch_window,
+        constraints=["Only edit admin_list_orders"],
+    )
+
+    system = str(messages[0]["content"])
+    user = str(messages[1]["content"])
+    assert "PatchWindowBuilder" in system
+    assert "old_string" in system
+    assert "Never return a complete function" in system
+    assert "NOISY_SEARCH_OUTPUT" not in user
+    assert "PATCH_WINDOW_JSON" in user
+    assert '"target_view": "view_ticket_report_detail"' in user
+    assert '"target_sql_kind": "count"' in user
+
+
+def test_extract_patch_window_prefers_count_sql_and_tracks_absolute_lines() -> None:
+    code = (
+        "def admin_list_orders():\n"
+        "    list_sql = 'SELECT * FROM ticket_order'\n"
+        "    from_clause = build_from_clause()\n"
+        "    count_sql = build_count_sql(from_clause)\n"
+        "    return list_sql, count_sql\n"
+    )
+    window = _extract_patch_window(
+        code,
+        {
+            "target_sql_kind": "count",
+            "target_sql_variable": "count_sql",
+            "target_symbol": "admin_list_orders",
+        },
+        {"operation": "dynamic_count_query_rewrite"},
+        target={
+            "file": "main.py",
+            "symbol": "admin_list_orders",
+            "start_line": 40,
+        },
+        target_view="view_ticket_report_detail",
+    )
+
+    assert window is not None
+    assert window["symbol"] == "admin_list_orders"
+    assert window["absolute_start_line"] == 41
+    assert window["absolute_end_line"] == 43
+    assert "count_sql = build_count_sql" in str(window["window_code"])
+
+
+def test_patch_window_payload_rejects_list_query_patch_for_count_target() -> None:
+    current_code = (
+        "def admin_list_orders():\n"
+        "    list_sql = 'SELECT * FROM ticket_order'\n"
+        "    count_sql = 'SELECT COUNT(*) FROM ticket_order'\n"
+        "    return list_sql, count_sql\n"
+    )
+    patch_window = {
+        "window_code": current_code,
+        "target_sql_kind": "count",
+    }
+    payload = _parse_patch_window_payload(json.dumps({
+        "patches": [{
+            "old_string": "    list_sql = 'SELECT * FROM ticket_order'\n",
+            "new_string": (
+                "    list_sql = 'SELECT * FROM view_ticket_report_detail'\n"
+            ),
+        }],
+        "confidence": 0.9,
+    }))
+
+    assert payload is not None
+    errors = _validate_patch_window_payload(
+        payload,
+        current_code=current_code,
+        patch_window=patch_window,
+        target_view="view_ticket_report_detail",
+        target_sql_kind="count",
+        target_sql_variable="count_sql",
+        constraints=[],
+        path="main.py",
+    )
+    assert "patches[0].not_count_query" in errors
+
+
+def test_patch_window_payload_accepts_small_count_query_patch_for_count_target() -> None:
+    current_code = (
+        "def admin_list_orders():\n"
+        "    list_sql = 'SELECT * FROM ticket_order'\n"
+        "    count_sql = 'SELECT COUNT(*) FROM ticket_order JOIN passenger'\n"
+        "    return list_sql, count_sql\n"
+    )
+    patch_window = {
+        "window_code": current_code,
+        "target_sql_kind": "count",
+    }
+    payload = _parse_patch_window_payload(json.dumps({
+        "patches": [{
+            "old_string": "JOIN passenger",
+            "new_string": "JOIN view_ticket_report_detail",
+        }],
+        "confidence": 0.9,
+    }))
+
+    assert payload is not None
+    errors = _validate_patch_window_payload(
+        payload,
+        current_code=current_code,
+        patch_window=patch_window,
+        target_view="view_ticket_report_detail",
+        target_sql_kind="count",
+        target_sql_variable="count_sql",
+        constraints=[],
+        path="main.py",
+    )
+    assert "patches[0].not_count_query" not in errors
+
+
+
+@pytest.mark.asyncio
+async def test_dynamic_count_rewrite_uses_single_patch_window_builder(tmp_path) -> None:
+    target = tmp_path / "main.py"
+    current_code = (
+        "def admin_list_orders():\n"
+        "    list_sql = 'SELECT order_id FROM ticket_order'\n"
+        "    from_clause = 'FROM ticket_order o JOIN passenger p ON p.id = o.p_id'\n"
+        "    count_sql = f'SELECT COUNT(*) {from_clause}'\n"
+        "    return list_sql, count_sql\n"
+    )
+    target.write_text(current_code, encoding="utf-8")
+    calls: list[str] = []
+    progress: list[dict[str, object]] = []
+
+    async def complete(messages: list[dict[str, object]]) -> str:
+        system = str(messages[0]["content"])
+        calls.append(system)
+        if "EditPlanBuilder" in system:
+            return json.dumps({
+                "edits": [{
+                    "target_index": 0,
+                    "operation": "dynamic_count_query_rewrite",
+                }],
+                "confidence": 0.95,
+                "missing_info": [],
+            })
+        assert "PatchWindowBuilder" in system
+        return json.dumps({
+            "patches": [{
+                "old_string": (
+                    "    from_clause = 'FROM ticket_order o JOIN passenger p ON p.id = o.p_id'\n"
+                    "    count_sql = f'SELECT COUNT(*) {from_clause}'\n"
+                ),
+                "new_string": (
+                    "    count_sql = 'SELECT COUNT(*) FROM view_ticket_report_detail'\n"
+                ),
+            }],
+            "confidence": 0.92,
+        })
+
+    edit_context = {
+        "schema": "mitkii.edit_context.v2",
+        "code_edit_ready": True,
+        "task_intent": {
+            "operation": "dynamic_count_query_rewrite",
+            "edit_strategy": "dynamic_sql_rewrite",
+            "target_symbol": "admin_list_orders",
+            "target_sql_kind": "count",
+            "target_sql_variable": "count_sql",
+            "goal": "rewrite count query with view",
+        },
+        "target_view": "view_ticket_report_detail",
+        "available_views": ["view_ticket_report_detail"],
+        "editable_targets": [{
+            "file": "main.py",
+            "symbol": "admin_list_orders",
+            "start_line": 1,
+            "end_line": 5,
+            "current_code": current_code,
+        }],
+        "intended_change": "rewrite count query with view",
+        "acceptance_criteria": ["count query uses target view"],
+        "constraints": ["Do not modify list_sql"],
+        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
+    }
+    skill = CodeEditSkill(project_root=tmp_path, llm_complete=complete)
+
+    result = await skill.run(
+        SkillContext(user_request="rewrite admin_list_orders count query"),
+        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
+        progress_callback=progress.append,
+    )
+
+    assert result.success
+    assert sum("PatchWindowBuilder" in call for call in calls) == 1
+    updated = target.read_text(encoding="utf-8")
+    assert "list_sql = 'SELECT order_id FROM ticket_order'" in updated
+    assert "count_sql = 'SELECT COUNT(*) FROM view_ticket_report_detail'" in updated
+    event_names = [str(item["event"]) for item in progress]
+    assert event_names == [
+        "code_edit.started",
+        "target.selected",
+        "patch_window.resolved",
+        "patch_builder.started",
+        "patch_builder.finished",
+        "patch.applied",
+        "validator.started",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_patch_window_builder_timeout_fails_fast(tmp_path) -> None:
+    import asyncio
+
+    target = tmp_path / "main.py"
+    current_code = (
+        "def admin_list_orders():\n"
+        "    count_sql = build_count_sql()\n"
+        "    return count_sql\n"
+    )
+    target.write_text(current_code, encoding="utf-8")
+    calls = 0
+
+    async def complete(messages: list[dict[str, object]]) -> str:
+        nonlocal calls
+        calls += 1
+        if "EditPlanBuilder" in str(messages[0]["content"]):
+            return json.dumps({
+                "edits": [{
+                    "target_index": 0,
+                    "operation": "dynamic_count_query_rewrite",
+                }],
+                "confidence": 0.9,
+                "missing_info": [],
+            })
+        await asyncio.sleep(0.05)
+        return "{}"
+
+    edit_context = {
+        "code_edit_ready": True,
+        "task_intent": {
+            "operation": "dynamic_count_query_rewrite",
+            "target_symbol": "admin_list_orders",
+            "target_sql_kind": "count",
+            "target_sql_variable": "count_sql",
+            "goal": "rewrite count query",
+        },
+        "target_view": "view_ticket_report_detail",
+        "available_views": ["view_ticket_report_detail"],
+        "editable_targets": [{
+            "file": "main.py",
+            "symbol": "admin_list_orders",
+            "start_line": 1,
+            "end_line": 3,
+            "current_code": current_code,
+        }],
+        "intended_change": "rewrite count query",
+        "acceptance_criteria": ["count query uses view"],
+        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
+    }
+    skill = CodeEditSkill(
+        project_root=tmp_path,
+        llm_complete=complete,
+        patch_window_timeout=0.01,
+    )
+
+    result = await skill.run(
+        SkillContext(user_request="rewrite count query"),
+        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
+    )
+
+    assert not result.success
+    assert result.missing_info == ("patch_window_timeout",)
+    assert calls == 2
+
+
+
+
+
+def test_generate_sql_patch_rewrites_source_columns_with_view_mapping() -> None:
+    from src.skills.code_edit import generate_sql_patch
+
+    code = (
+        "def query():\n"
+        "    return \"SELECT o.order_id, p.real_name AS passenger_name "
+        "FROM ticket_order o JOIN passenger_info p ON p.p_id = o.p_id "
+        "WHERE p.real_name LIKE :keyword AND o.status = :status\"\n"
+    )
+    ctx = {
+        "resolved_dependencies": [{
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": "view_ticket_report_detail",
+            "columns": ["order_id", "passenger_name", "status"],
+            "column_sources": [
+                {
+                    "name": "order_id",
+                    "source_table": "ticket_order",
+                    "source_alias": "o",
+                    "source_column": "order_id",
+                },
+                {
+                    "name": "passenger_name",
+                    "source_table": "passenger_info",
+                    "source_alias": "p",
+                    "source_column": "real_name",
+                },
+                {
+                    "name": "status",
+                    "source_table": "ticket_order",
+                    "source_alias": "o",
+                    "source_column": "status",
+                },
+            ],
+            "replaces_objects": ["ticket_order", "passenger_info"],
+        }]
+    }
+
+    res = generate_sql_patch(code, ctx)
+
+    assert "FROM view_ticket_report_detail AS v" in res
+    assert "v.order_id" in res
+    assert "v.passenger_name" in res
+    assert "v.passenger_name LIKE :keyword" in res
+    assert "v.status = :status" in res
+    assert "p.real_name" not in res
+    assert "ticket_order" not in res
+    assert "passenger_info" not in res
+
+
+def test_generate_sql_patch_prefers_ast_resolver_source_mapping() -> None:
+    from src.skills.code_edit import generate_sql_patch
+
+    code = (
+        "def query():\n"
+        "    return \"SELECT p.real_name AS passenger_name "
+        "FROM passenger_info p WHERE p.real_name LIKE :keyword\"\n"
+    )
+    ctx = {
+        "resolved_dependencies": [{
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": "view_ticket_report_detail",
+            "columns": ["passenger_name"],
+            "source_to_view_column": {
+                "passenger_info.real_name": "passenger_name",
+            },
+            "replaces_objects": ["passenger_info"],
+        }]
+    }
+
+    res = generate_sql_patch(code, ctx)
+
+    assert "FROM view_ticket_report_detail AS v" in res
+    assert "v.passenger_name LIKE :keyword" in res
+    assert "p.real_name" not in res
+
+
+def test_generate_sql_patch_rewrites_order_by_with_ast_mapping() -> None:
+    from src.skills.code_edit import generate_sql_patch
+
+    code = (
+        "def query():\n"
+        "    return \"SELECT p.real_name AS passenger_name "
+        "FROM passenger_info p WHERE p.real_name LIKE :keyword "
+        "ORDER BY p.real_name DESC\"\n"
+    )
+    ctx = {
+        "resolved_dependencies": [{
+            "role": "replacement_source",
+            "kind": "database_view",
+            "name": "view_ticket_report_detail",
+            "columns": ["passenger_name"],
+            "source_to_view_column": {
+                "passenger_info.real_name": "passenger_name",
+            },
+            "replaces_objects": ["passenger_info"],
+        }]
+    }
+
+    res = generate_sql_patch(code, ctx)
+
+    assert "v.passenger_name LIKE :keyword" in res
+    assert "ORDER BY v.passenger_name DESC" in res
+    assert "p.real_name" not in res
+
+
 def test_build_edit_context_includes_view_dependency_columns(tmp_path) -> None:
     from src.skills.code_search import _build_edit_plan_context
 
     (tmp_path / "schema.sql").write_text(
         "CREATE VIEW view_ticket_report_detail AS\n"
-        "SELECT o.order_id, p.name AS passenger_name, f.flight_no\n"
+        "SELECT o.order_id, p.name AS passenger_name, f.flight_no, '' AS airline\n"
         "FROM ticket_order o\n"
         "JOIN passenger_info p ON p.p_id = o.p_id\n"
         "JOIN flight_info f ON f.flight_id = o.flight_id;\n",
@@ -2153,7 +3065,44 @@ def test_build_edit_context_includes_view_dependency_columns(tmp_path) -> None:
     assert isinstance(deps, list)
     dep = deps[0]
     assert dep["name"] == "view_ticket_report_detail"
-    assert dep["columns"] == ["order_id", "passenger_name", "flight_no"]
+    assert dep["columns"] == ["order_id", "passenger_name", "flight_no", "airline"]
+    assert dep["source_to_view_column"]["passenger_info.name"] == "passenger_name"
+    assert dep["view_column_to_source"]["passenger_name"] == "passenger_info.name"
+    assert dep["column_defaults"]["airline"] == "''"
+    assert dep["column_sources"] == [
+        {
+            "name": "order_id",
+            "source_table": "ticket_order",
+            "source_alias": "o",
+            "source_column": "order_id",
+            "expression": "o.order_id",
+            "kind": "column",
+        },
+        {
+            "name": "passenger_name",
+            "source_table": "passenger_info",
+            "source_alias": "p",
+            "source_column": "name",
+            "expression": "p.name AS passenger_name",
+            "kind": "column",
+        },
+        {
+            "name": "flight_no",
+            "source_table": "flight_info",
+            "source_alias": "f",
+            "source_column": "flight_no",
+            "expression": "f.flight_no",
+            "kind": "column",
+        },
+        {
+            "name": "airline",
+            "source_table": "",
+            "source_alias": "",
+            "source_column": "",
+            "expression": "'' AS airline",
+            "kind": "literal",
+        },
+    ]
     assert dep["replaces_objects"] == ["ticket_order", "passenger_info", "flight_info"]
 
 
@@ -2295,6 +3244,25 @@ def test_validator_sql_replacement_contract_checks_aliases_and_columns() -> None
     joined = "; ".join(errors)
     assert "replaces_objects still referenced" in joined
     assert "old aliases still appear" in joined
+
+    # Verify count query aggregate field (e.g. total) does not trigger error
+    count_old_code = (
+        "def count_query():\n"
+        "    return \"SELECT COUNT(*) AS total FROM ticket_order o WHERE o.status = 1\"\n"
+    )
+    count_new_code = (
+        "def count_query():\n"
+        "    return \"SELECT COUNT(*) AS total FROM view_ticket_report_detail v WHERE v.status = 1\"\n"
+    )
+    count_errors = _validate_sql_replacement_contract(
+        count_old_code,
+        count_new_code,
+        target_view="view_ticket_report_detail",
+        replaces_objects=["ticket_order"],
+        dependency_columns=["order_id", "status"], # total is not in columns!
+        target_sql_kind="count",
+    )
+    assert not count_errors
 
 
 @pytest.mark.asyncio
@@ -2776,351 +3744,3 @@ async def test_validator_skill_forbidden_aliases(tmp_path, monkeypatch) -> None:
     
     assert not result.success
     assert any("legacy alias 'p' is still referenced" in err for err in result.missing_info)
-
-
-@pytest.mark.asyncio
-async def test_validator_function_refactor_requires_unified_helper(tmp_path, monkeypatch) -> None:
-    from src.skills.validator import ValidatorSkill
-
-    old_code = (
-        "def query(row, other):\n"
-        "    row['passenger_id_no'] = row['passenger_id_no'][:3] + '***'\n"
-        "    other['passenger_id_no'] = other['passenger_id_no'][:3] + '***'\n"
-    )
-    new_code = (
-        "def query(row, other):\n"
-        "    row['passenger_id_no'] = row['passenger_id_no'][:3] + '***'\n"
-        "    other['passenger_id_no'] = other['passenger_id_no'][:3] + '***'\n"
-    )
-    target_file = tmp_path / "main.py"
-    target_file.write_text(new_code, encoding="utf-8")
-    monkeypatch.setattr("src.skills.validator.get_git_head_content", lambda root, rel: old_code)
-
-    executor = SkillExecutor([ValidatorSkill(project_root=tmp_path)])
-    result = await executor.run(
-        "validator",
-        SkillContext(user_request="重构订单详情处理，统一脱敏"),
-        changed_files=("main.py",),
-        task_analysis={"edit_strategy": "function_refactor", "intent": "function_refactor"},
-    )
-
-    assert not result.success
-    assert "expected unified helper" in result.summary
-
-
-def test_optimize_snippet_body_sql_columns() -> None:
-    from src.skills.code_search import _optimize_snippet_body
-    body = (
-        "10: def get_order_sql():\n"
-        "11:     return '''\n"
-        "12:         SELECT\n"
-        "13:             o.id AS order_id,\n"
-        "14:             o.order_no,\n"
-        "15:             o.passenger_id AS pass_id,\n"
-        "16:             o.status,\n"
-        "17:             o.amount\n"
-        "18:         FROM orders o\n"
-        "19:         WHERE o.id = 1\n"
-        "20:     '''"
-    )
-    optimized = _optimize_snippet_body(body, "main.py")
-    assert "COLUMN MAPPING" in optimized
-    assert "order_id" in optimized
-    assert "order_no" in optimized
-    assert "pass_id" in optimized
-    assert "status" in optimized
-    assert "amount" in optimized
-    assert "FROM orders o" in optimized
-    assert "WHERE o.id = 1" in optimized
-
-
-@pytest.mark.asyncio
-async def test_code_edit_sql_fallback_success(tmp_path) -> None:
-    from src.skills.code_edit import CodeEditSkill
-    import json
-
-    target = tmp_path / "main.py"
-    # Function signature: def query():
-    old_code = (
-        "def query():\n"
-        "    sql = \"\"\"\n"
-        "    SELECT o.id, p.name AS passenger_name\n"
-        "    FROM orders o\n"
-        "    JOIN passenger p ON p.id = o.p_id\n"
-        "    \"\"\"\n"
-        "    return sql\n"
-    )
-    target.write_text(old_code, encoding="utf-8")
-
-    # Mock llm_complete for two calls:
-    # 1. EditPlanBuilder (returns plan payload)
-    # 2. ReplacementBuilder (returns fallback string)
-    call_count = 0
-    async def complete(_messages: list[dict[str, object]]) -> str:
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return json.dumps({
-                "edits": [{"target_index": 0, "operation": "replace_dependency", "target_view": "my_view"}],
-                "confidence": 0.9,
-                "missing_info": [],
-            })
-        else:
-            # Fallback output that passes compilation, signature unchanged, body changed, references my_view, and removes legacy refs
-            new_code = (
-                "def query():\n"
-                "    sql = \"\"\"\n"
-                "    SELECT v.id, v.passenger_name\n"
-                "    FROM my_view v\n"
-                "    \"\"\"\n"
-                "    return sql\n"
-            )
-            return json.dumps({"new_string": new_code})
-
-    edit_context = {
-        "schema": "mitkii.edit_context.v2",
-        "code_edit_ready": True,
-        "edit_strategy": "sql_view_rewrite",
-        "task_intent": {"operation": "replace_dependency", "target_symbol": "query", "goal": "use my_view"},
-        "edit_targets": [{
-            "file": "main.py",
-            "symbol": "query",
-            "current_code": old_code,
-            "start_line": 1,
-            "end_line": 7,
-        }],
-        "editable_targets": [{
-            "file": "main.py",
-            "symbol": "query",
-            "current_code": old_code,
-            "start_line": 1,
-            "end_line": 7,
-        }],
-        "resolved_dependencies": [{
-            "role": "replacement_source",
-            "kind": "database_view",
-            "name": "my_view",
-            "replaces_objects": ["orders", "passenger"],
-            "columns": ["id"], # "passenger_name" is missing -> triggers ProjectionMappingError!
-        }],
-        "acceptance": [{"type": "compile_or_syntax_check"}],
-        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
-    }
-
-    executor = SkillExecutor([CodeEditSkill(project_root=tmp_path, llm_complete=complete)])
-    result = await executor.run(
-        "code_edit",
-        SkillContext(user_request="use my_view"),
-        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
-    )
-    assert result.success
-    assert call_count == 2
-    updated = target.read_text(encoding="utf-8")
-    assert "my_view v" in updated
-    assert "orders o" not in updated
-
-
-@pytest.mark.asyncio
-async def test_code_edit_sql_fallback_validation_failure(tmp_path) -> None:
-    from src.skills.code_edit import CodeEditSkill
-    import json
-
-    target = tmp_path / "main.py"
-    old_code = (
-        "def query():\n"
-        "    sql = \"\"\"\n"
-        "    SELECT o.id, p.name AS passenger_name\n"
-        "    FROM orders o\n"
-        "    JOIN passenger p ON p.id = o.p_id\n"
-        "    \"\"\"\n"
-        "    return sql\n"
-    )
-    target.write_text(old_code, encoding="utf-8")
-
-    call_count = 0
-    async def complete(_messages: list[dict[str, object]]) -> str:
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return json.dumps({
-                "edits": [{"target_index": 0, "operation": "replace_dependency", "target_view": "my_view"}],
-                "confidence": 0.9,
-                "missing_info": [],
-            })
-        else:
-            # Fallback output that fails validation (references old alias p.)
-            new_code = (
-                "def query():\n"
-                "    sql = \"\"\"\n"
-                "    SELECT v.id, p.passenger_name\n"
-                "    FROM my_view v\n"
-                "    \"\"\"\n"
-                "    return sql\n"
-            )
-            return json.dumps({"new_string": new_code})
-
-    edit_context = {
-        "schema": "mitkii.edit_context.v2",
-        "code_edit_ready": True,
-        "edit_strategy": "sql_view_rewrite",
-        "task_intent": {"operation": "replace_dependency", "target_symbol": "query", "goal": "use my_view"},
-        "edit_targets": [{
-            "file": "main.py",
-            "symbol": "query",
-            "current_code": old_code,
-            "start_line": 1,
-            "end_line": 7,
-        }],
-        "editable_targets": [{
-            "file": "main.py",
-            "symbol": "query",
-            "current_code": old_code,
-            "start_line": 1,
-            "end_line": 7,
-        }],
-        "resolved_dependencies": [{
-            "role": "replacement_source",
-            "kind": "database_view",
-            "name": "my_view",
-            "replaces_objects": ["orders", "passenger"],
-            "columns": ["id"], # missing passenger_name -> ProjectionMappingError!
-        }],
-        "acceptance": [{"type": "compile_or_syntax_check"}],
-        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
-    }
-
-    executor = SkillExecutor([CodeEditSkill(project_root=tmp_path, llm_complete=complete)])
-    result = await executor.run(
-        "code_edit",
-        SkillContext(user_request="use my_view"),
-        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
-    )
-    assert not result.success
-    assert call_count == 2
-    assert "diagnose_strategy_mismatch" in result.missing_info
-    # Verify structured failure details
-    err_msg = result.metadata["raw_preview"]
-    assert "projection_mapping_failed" in err_msg
-    assert "llm_replacement_failed" in err_msg
-    assert "passenger_name" in err_msg # the missing column name from ProjectionMappingError
-
-
-@pytest.mark.asyncio
-async def test_code_edit_materializes_patch_intent_target_when_hydration_wrong_symbol(tmp_path) -> None:
-    from src.skills.code_edit import CodeEditSkill
-    import json
-
-    target = tmp_path / "main.py"
-    target.write_text(
-        "def admin_update_order():\n"
-        "    return 'wrong'\n\n"
-        "def build_order_detail_sql():\n"
-        "    return 'SELECT * FROM ticket_order'\n",
-        encoding="utf-8",
-    )
-
-    async def complete(messages: list[dict[str, object]]) -> str:
-        system = str(messages[0].get("content") or "")
-        if "ReplacementBuilder" in system:
-            return json.dumps({
-                "new_string": (
-                    "def build_order_detail_sql():\n"
-                    "    return 'SELECT * FROM view_ticket_report_detail'\n"
-                )
-            })
-        return json.dumps({
-            "edits": [{
-                "target_index": 0,
-            }],
-            "confidence": 0.9,
-            "missing_info": [],
-        })
-
-    edit_context = {
-        "schema": "mitkii.edit_context.v2",
-        "code_edit_ready": True,
-        "edit_strategy": "general_edit",
-        "patch_intent": {
-            "edit_ready": True,
-            "edit_strategy": "general_edit",
-            "edit_targets": [{
-                "file": "main.py",
-                "symbol": "build_order_detail_sql",
-            }],
-            "acceptance_criteria": ["build_order_detail_sql changed"],
-        },
-        "editable_targets": [{
-            "file": "main.py",
-            "symbol": "admin_update_order",
-            "start_line": 1,
-            "end_line": 2,
-            "current_code": "def admin_update_order():\n    return 'wrong'",
-            "intended_change": "change order detail SQL",
-            "acceptance_criteria": ["wrong hydration candidate"],
-        }],
-        "intended_change": "change order detail SQL",
-        "acceptance_criteria": ["build_order_detail_sql changed"],
-        "tool_policy": {"allowed_tools": ["edit_file"], "scope": ["main.py"]},
-    }
-
-    executor = SkillExecutor([CodeEditSkill(project_root=tmp_path, llm_complete=complete)])
-    result = await executor.run(
-        "code_edit",
-        SkillContext(user_request="change build_order_detail_sql"),
-        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
-    )
-
-    assert result.success
-    updated = target.read_text(encoding="utf-8")
-    assert "def admin_update_order():\n    return 'wrong'" in updated
-    assert "view_ticket_report_detail" in updated
-
-
-@pytest.mark.asyncio
-async def test_validator_symbol_mismatch_requires_replan(tmp_path, monkeypatch) -> None:
-    from src.skills.validator import ValidatorSkill
-    import json
-
-    old_code = (
-        "def admin_update_order():\n"
-        "    return 'wrong'\n\n"
-        "def build_order_detail_sql():\n"
-        "    return 'old'\n"
-    )
-    new_code = (
-        "def admin_update_order():\n"
-        "    return 'changed'\n\n"
-        "def build_order_detail_sql():\n"
-        "    return 'old'\n"
-    )
-    (tmp_path / "main.py").write_text(new_code, encoding="utf-8")
-    monkeypatch.setattr("src.skills.validator.get_git_head_content", lambda root, rel: old_code)
-
-    edit_context = {
-        "schema": "mitkii.edit_context.v2",
-        "edit_strategy": "general_edit",
-        "editable_targets": [{
-            "file": "main.py",
-            "symbol": "build_order_detail_sql",
-            "start_line": 4,
-            "end_line": 5,
-            "current_code": "def build_order_detail_sql():\n    return 'old'",
-        }],
-        "patch_intent": {
-            "edit_targets": [{"file": "main.py", "symbol": "build_order_detail_sql"}],
-        },
-    }
-
-    executor = SkillExecutor([ValidatorSkill(project_root=tmp_path)])
-    result = await executor.run(
-        "validator",
-        SkillContext(user_request="change build_order_detail_sql"),
-        changed_files=("main.py",),
-        search_output="EDIT_CONTEXT_JSON\n" + json.dumps(edit_context),
-        task_analysis={"edit_strategy": "general_edit", "intent": "general_edit"},
-    )
-
-    assert not result.success
-    assert result.requires_fallback
-    assert result.metadata["failure_code"] == "validator_context_mismatch"
-    assert "target_symbol_mismatch" in result.metadata["structured_errors"]

@@ -14,7 +14,8 @@ class Embedder:
         model: str = "text-embedding-3-small",
         provider: str = "openai",
     ) -> None:
-        self.model = model
+        from src.llm.client import canonicalize_model_name
+        self.model = canonicalize_model_name(model)
         self.provider = provider
 
     async def embed(self, text: str) -> list[float]:
