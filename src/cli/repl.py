@@ -24,7 +24,7 @@ class AgentLoopProtocol(Protocol):
     """Minimal interface the REPL expects from the agent loop."""
 
     async def run_turn(self, user_input: str) -> list[AgentEvent]: ...
-    async def run_turn_stream(self, user_input: str) -> AsyncIterator[AgentEvent]: ...
+    def run_turn_stream(self, user_input: str) -> AsyncIterator[AgentEvent]: ...
     async def resolve_approval(self, action: str, approved: bool) -> None: ...
     async def list_checkpoints(self) -> list[dict[str, Any]]: ...
     def get_probe_metrics(self) -> dict[str, Any]: ...
@@ -43,7 +43,6 @@ SLASH_COMMANDS: dict[str, str] = {
     "/probe": "Show context probe metrics",
     "/clear": "Clear the terminal screen",
     "/config": "View or modify config values",
-    "/cost": "Show token usage and cost so far",
 }
 
 
@@ -156,19 +155,6 @@ class REPLSession:
             self._console.clear()
             return True
 
-        if cmd == "/cost":
-            state = self._agent.get_state()
-            if hasattr(state, "total_tokens_used"):
-                self._renderer.render_cost({
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": state.total_tokens_used,
-                    "cost": getattr(state, "total_cost", 0.0),
-                })
-            else:
-                self._console.print("[dim]No usage data yet.[/]")
-            return True
-
         if cmd == "/history":
             state = self._agent.get_state()
             msgs = getattr(state, "messages", [])
@@ -186,7 +172,7 @@ class REPLSession:
             self._console.print("[dim]Compressing conversation history...[/]")
             # Delegate to agent loop if it supports compaction
             if hasattr(self._agent, "compact"):
-                await self._agent.compact()  # type: ignore[attr-defined]
+                await self._agent.compact()
                 self._console.print("[green]✓ Conversation compacted.[/]")
             else:
                 self._console.print("[dim]Compact not yet available.[/]")
@@ -246,7 +232,8 @@ class REPLSession:
                     short = model.split("/")[-1] if "/" in model else model
                     self._console.print(
                         f"  {short}: calls={stats.get('calls', 0)} "
-                        f"tokens={stats.get('prompt_tokens', 0) + stats.get('completion_tokens', 0)} "
+                        "tokens="
+                        f"{stats.get('prompt_tokens', 0) + stats.get('completion_tokens', 0)} "
                         f"cost=${stats.get('cost', 0.0):.4f}"
                     )
             phases = summary.get("phases") or []
@@ -296,6 +283,7 @@ class REPLSession:
         spinner_active = False
         executor_spinner_msg = "Thinking..."
         executor_preview_shown = False
+        parallel_llm_tasks: dict[str, str] = {}
 
         def _ensure_spinner(text: str) -> None:
             nonlocal spinner_cm, status, spinner_active, executor_spinner_msg
@@ -311,6 +299,22 @@ class REPLSession:
             if spinner_active and spinner_cm is not None:
                 spinner_cm.__exit__(None, None, None)
                 spinner_active = False
+
+        def _update_parallel_spinner(event: AgentEvent) -> bool:
+            data = event.data or {}
+            task_id = str(data.get("parallel_task_id") or "")
+            if not task_id:
+                return False
+            state = str(data.get("parallel_state") or "running")
+            if state == "done":
+                parallel_llm_tasks.pop(task_id, None)
+            else:
+                parallel_llm_tasks[task_id] = str(event.content or task_id)
+            if parallel_llm_tasks:
+                _ensure_spinner("  |  ".join(parallel_llm_tasks.values()))
+            else:
+                _dismiss_spinner()
+            return True
 
         _ensure_spinner("Thinking...")
 
@@ -369,6 +373,8 @@ class REPLSession:
                     and event.data
                     and event.data.get("spinner_only")
                 ):
+                    if _update_parallel_spinner(event):
+                        continue
                     phase = str(event.data.get("phase") or "")
                     if phase == "executor":
                         _reset_executor_preview()
@@ -385,6 +391,9 @@ class REPLSession:
                     continue
 
                 if event.type == EventType.STREAM_END and phase == "executor":
+                    continue
+
+                if event.type == EventType.COST_UPDATE:
                     continue
 
                 if event.type == EventType.THINKING:

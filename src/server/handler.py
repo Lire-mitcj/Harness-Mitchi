@@ -15,17 +15,16 @@ from src.server.protocol import (
     JsonRpcRequest,
     JsonRpcResponse,
     error_response,
-    format_event,
 )
 
 if TYPE_CHECKING:
-    from src.agent.loop import AgentLoop
+    from src.cli.commands.chat import AgentLoopAdapter
 
 
 class ServerHandler:
     """Routes JSON-RPC requests to agent actions and emits events."""
 
-    def __init__(self, agent_loop: AgentLoop) -> None:
+    def __init__(self, agent_loop: AgentLoopAdapter) -> None:
         self.agent = agent_loop
         self._pending_approval: Any = None
 

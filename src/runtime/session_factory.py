@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.agent.loop import AgentLoop
+from src.agent.cursor_loop import CursorLoop
 from src.config.permissions import PermissionManager
 from src.config.settings import MitKIISettings, get_settings
 from src.context.builder import ContextBuilder
@@ -12,7 +12,6 @@ from src.context.file_tracker import FileTracker
 from src.harness.engine import HarnessEngine
 from src.indexer.repo_map_service import RepoMapService
 from src.llm.client import LLMClient
-from src.orchestrator.orchestrator import OrchestratorLoop
 from src.tools.registry import ToolRegistry, create_default_registry
 
 log = logging.getLogger(__name__)
@@ -31,11 +30,15 @@ class MitKIISession:
     harness: HarnessEngine
     permissions: PermissionManager
     llm: LLMClient
+    cursor_inter_llm: LLMClient
+    cursor_decision_llm: LLMClient
 
-    def create_core_loop(self) -> AgentLoop | OrchestratorLoop:
-        loop_cls = OrchestratorLoop if self.settings.orchestrator_mode else AgentLoop
-        return loop_cls(
-            llm=self.llm,
+    def create_core_loop(self) -> CursorLoop:
+        """Create the default non-/plan runtime used by SDK-style callers."""
+        return CursorLoop(
+            llm=self.cursor_decision_llm,
+            inter_llm=self.cursor_inter_llm,
+            decision_llm=self.cursor_decision_llm,
             tools=self.tools,
             harness=self.harness,
             context=self.context_builder,
@@ -82,13 +85,18 @@ def create_mitkii_session(
     harness = HarnessEngine.create(settings, project_root=root)
     permissions = PermissionManager()
     cache_ttl = "1h" if settings.prompt_cache_ttl.strip().lower() in {"1h", "hour", "60m"} else "5m"
-    llm = LLMClient(
-        model=settings.model,
-        request_timeout=float(settings.llm_request_timeout),
-        prompt_cache_enabled=settings.prompt_cache_enabled,
-        prompt_cache_min_tokens=settings.prompt_cache_min_tokens,
-        prompt_cache_ttl=cache_ttl,  # type: ignore[arg-type]
-    )
+    def create_llm(model: str) -> LLMClient:
+        return LLMClient(
+            model=model,
+            request_timeout=float(settings.llm_request_timeout),
+            prompt_cache_enabled=settings.prompt_cache_enabled,
+            prompt_cache_min_tokens=settings.prompt_cache_min_tokens,
+            prompt_cache_ttl=cache_ttl,  # type: ignore[arg-type]
+        )
+
+    llm = create_llm(settings.model)
+    cursor_inter_llm = create_llm(settings.cursor_inter_model)
+    cursor_decision_llm = create_llm(settings.cursor_decision_model)
 
     return MitKIISession(
         project_root=root,
@@ -100,4 +108,6 @@ def create_mitkii_session(
         harness=harness,
         permissions=permissions,
         llm=llm,
+        cursor_inter_llm=cursor_inter_llm,
+        cursor_decision_llm=cursor_decision_llm,
     )

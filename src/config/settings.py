@@ -14,6 +14,9 @@ _ENV_KEYS_TO_SANITIZE = (
     "MITKII_PLANNER_MODEL",
     "MITKII_FINAL_SUMMARY_MODEL",
     "MITKII_JUDGE_MODEL",
+    "MITKII_CURSOR_INTER_MODEL",
+    "MITKII_CURSOR_DECISION_MODEL",
+    "MITKII_CURSOR_RERANKER_MODEL",
     "ANTHROPIC_API_KEY",
 )
 
@@ -101,6 +104,52 @@ class MitKIISettings(BaseSettings):
     max_turns: int = Field(default=50, ge=1)
     max_retries: int = Field(default=3, ge=0)
     auto_approve_edits: bool = False
+    cursor_max_steps: int = Field(default=3, ge=1, le=12)
+    cursor_state_max_bytes: int = Field(
+        default=8192,
+        ge=512,
+        le=16384,
+        description="Prompt budget for cumulative Cursor recovery state and diff evolution.",
+    )
+    cursor_retrieval_max_files: int = Field(default=12, ge=1, le=50)
+    cursor_retrieval_max_symbols: int = Field(default=12, ge=1, le=50)
+    cursor_retrieval_candidate_symbols: int = Field(default=50, ge=12, le=100)
+    cursor_retrieval_max_queries: int = Field(default=12, ge=1, le=32)
+    cursor_retrieval_fan_out: int = Field(default=4, ge=1, le=12)
+    cursor_retrieval_early_stop_candidates: int = Field(default=8, ge=1, le=50)
+    cursor_reranker_enabled: bool = True
+    cursor_reranker_model: str = "Qwen/Qwen3-Reranker-8B"
+    cursor_reranker_top_n: int = Field(default=50, ge=1, le=100)
+    cursor_reranker_timeout: float = Field(default=10.0, ge=0.5, le=60.0)
+    cursor_reranker_api_base: str | None = None
+    cursor_query_bridge_timeout: float = Field(default=30.0, ge=1.0, le=60.0)
+    cursor_graph_bridge_depth: int = Field(default=2, ge=1, le=4)
+    cursor_graph_bridge_max_symbols: int = Field(default=10, ge=1, le=30)
+    cursor_graph_bridge_max_files: int = Field(default=5, ge=1, le=15)
+    cursor_graph_bridge_max_seeds: int = Field(default=8, ge=1, le=20)
+    cursor_graph_bridge_semantic_enabled: bool = True
+    cursor_graph_bridge_semantic_timeout: float = Field(default=15.0, ge=0.1, le=30.0)
+    cursor_graph_bridge_semantic_candidate_cap: int = Field(default=512, ge=16, le=2000)
+    cursor_graph_bridge_semantic_threshold: float = Field(default=0.42, ge=0.0, le=1.0)
+    cursor_graph_bridge_alias_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
+    cursor_retrieval_timeout: float = Field(default=12.0, ge=0.1, le=120.0)
+    cursor_max_context_files: int = Field(default=3, ge=1, le=12)
+    cursor_context_chars_per_file: int = Field(default=12_000, ge=1000, le=50_000)
+    cursor_dependency_affinity_threshold: float = Field(
+        default=0.65,
+        ge=0.65,
+        le=1.0,
+        description="Minimum DDL affinity required before it is emitted as Layer-2 soft evidence.",
+    )
+    cursor_validator_command: list[str] = Field(default_factory=lambda: ["pytest"])
+    cursor_validator_timeout: float = Field(default=120.0, ge=1.0, le=1800.0)
+    cursor_validator_model: str = "openai/deepseek-ai/DeepSeek-V4-Flash"
+    cursor_validator_semantic_timeout: float = Field(default=30.0, ge=1.0, le=120.0)
+    cursor_observation_max_chars: int = Field(default=2000, ge=256, le=20_000)
+    cursor_inter_enabled: bool = True
+    cursor_inter_model: str = "openai/Qwen/Qwen2.5-7B-Instruct"
+    cursor_decision_model: str = "openai/deepseek-ai/DeepSeek-V4-Flash"
+    cursor_semantic_tags_enabled: bool = False
     edit_splice_enabled: bool = Field(
         default=True,
         description=(
@@ -342,6 +391,10 @@ class MitKIISettings(BaseSettings):
     # --- Storage paths --------------------------------------------------------
     data_dir: Path = Field(default_factory=lambda: Path.home() / ".mitkii")
     project_dir: str = ".mitkii"
+    cursor_evaluation_dir: Path = Field(
+        default_factory=lambda: Path(r"D:\eval_json"),
+        description="Directory for Cursor harness evaluation JSONL logs.",
+    )
 
     model_config = {
         "env_prefix": "MITKII_",

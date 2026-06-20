@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from src.agent.cursor_loop import CursorLoop
 from src.config.settings import MitKIISettings
 from src.harness.gates.preflight_probe import assess_preflight
 from src.harness.gates.preflight_slices import resolve_repo_map_line_slices
@@ -9,7 +10,6 @@ from src.indexer.repo_map_service import BuildState, RepoMapService
 from src.orchestrator.isolation import load_context_file_contents
 from src.planner.task_tree import SubTaskKind, SubTaskNode, TaskTree
 from src.runtime.session_factory import create_mitkii_session
-
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "repo_map_sample"
 
@@ -67,6 +67,22 @@ def test_create_mitkii_session_explicit_project_root_overrides_settings(tmp_path
     session = create_mitkii_session(project_root=explicit, settings=settings)
 
     assert session.project_root == explicit.resolve()
+
+
+def test_create_core_loop_uses_cursor_runtime(tmp_path: Path) -> None:
+    settings = MitKIISettings(
+        data_dir=tmp_path / ".mitkii",
+        repo_map_enabled=False,
+    )
+    session = create_mitkii_session(project_root=tmp_path, settings=settings)
+
+    loop = session.create_core_loop()
+
+    assert isinstance(loop, CursorLoop)
+    assert session.cursor_inter_llm.model == settings.cursor_inter_model
+    assert session.cursor_decision_llm.model == settings.cursor_decision_model
+    assert loop.inter_llm is session.cursor_inter_llm
+    assert loop.decision_llm is session.cursor_decision_llm
 
 
 def test_preflight_repo_map_slices(tmp_path: Path) -> None:

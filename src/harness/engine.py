@@ -6,15 +6,22 @@ from typing import TYPE_CHECKING, Any
 
 import litellm
 
+from src.agent.types import Message
+
 if TYPE_CHECKING:
     from src.config.settings import MitKIISettings
 
-from src.harness.checkpoint.store import CheckpointStore
 from src.harness.checkpoint.rollback import RollbackManager
+from src.harness.checkpoint.store import CheckpointStore
+from src.harness.cursor.retrieval_guardrail import CursorRetrievalGuardrail
+from src.harness.gates.phase_metrics import PhaseMetrics
 from src.harness.pipeline.definition import PipelineDefinition
 from src.harness.pipeline.executor import PipelineExecutor
-from src.harness.gates.phase_metrics import PhaseMetrics
 from src.harness.probe.interceptor import ContextProbe
+from src.harness.sandbox.executor import SandboxExecutor
+from src.harness.sandbox.file_guard import FileGuard
+from src.harness.sandbox.resource_limit import ResourceLimiter
+from src.harness.scorer.engine import ScoringEngine
 from src.harness.subtask.context_pipeline import (
     ContextPipelineResult,
     ExecutorContextConfig,
@@ -23,11 +30,6 @@ from src.harness.subtask.context_pipeline import (
 )
 from src.harness.subtask.handoff import SubtaskHandoffBundle, prepare_executor_handoff
 from src.harness.subtask.session_memory import ExploreSessionMemory
-from src.agent.types import Message
-from src.harness.sandbox.executor import SandboxExecutor
-from src.harness.sandbox.file_guard import FileGuard
-from src.harness.sandbox.resource_limit import ResourceLimiter
-from src.harness.scorer.engine import ScoringEngine
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +52,12 @@ class HarnessEngine:
             budget_ratio=settings.context_budget_ratio,
         )
         self.phase_metrics = PhaseMetrics()
+        self.cursor_retrieval_guardrail = CursorRetrievalGuardrail(
+            query_cap=settings.cursor_retrieval_max_queries,
+            fan_out=settings.cursor_retrieval_fan_out,
+            timeout=settings.cursor_retrieval_timeout,
+            early_stop_candidates=settings.cursor_retrieval_early_stop_candidates,
+        )
 
         # --- Checkpoint ---
         checkpoint_dir = settings.data_dir / "checkpoints"
@@ -165,7 +173,10 @@ class HarnessEngine:
         except Exception as exc:
             log.warning("Judge LLM call failed: %s", exc)
             # Fail-safe: return invalid JSON so judge marks this as fail.
-            return "{\"verdict\":\"fail\",\"results\":[],\"blockers\":[\"Judge LLM call failed\"],\"warnings\":[]}"
+            return (
+                '{"verdict":"fail","results":[],"blockers":'
+                '["Judge LLM call failed"],"warnings":[]}'
+            )
 
     # ------------------------------------------------------------------
     # Factory

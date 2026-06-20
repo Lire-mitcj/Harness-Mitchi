@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import ast
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+from src.agent.cursor_sql_parser import UniversalSqlParser
 from src.indexer.ctags import CtagsIndexResult, CtagsSymbol, index_project
 from src.indexer.graph import build_reference_edges
 from src.indexer.pagerank import pagerank
+from src.indexer.scanner import ProjectScanner
 
 
 @dataclass(frozen=True)
@@ -20,12 +24,22 @@ class RankedSymbol:
     signature: str
     score: float
     symbol_id: str
+    tables_referenced: tuple[str, ...] = ()
+    parent_symbol: str = ""
+    parent_symbol_id: str = ""
 
     @property
     def location(self) -> str:
         if self.start_line == self.end_line:
             return f"{self.file_path}:{self.start_line}"
         return f"{self.file_path}:{self.start_line}-{self.end_line}"
+
+
+@dataclass(frozen=True)
+class SymbolCandidate:
+    symbol: RankedSymbol
+    score_hint: float
+    reasons: tuple[str, ...] = ()
 
 
 @dataclass
@@ -58,6 +72,81 @@ class RepoMap:
         ]
         hits.sort(key=lambda s: s.score, reverse=True)
         return hits[:limit]
+
+    def lookup_candidates(
+        self,
+        expanded_terms: list[str] | tuple[str, ...],
+        *,
+        domain: str = "",
+        constraints: dict[str, list[str]] | None = None,
+        limit: int = 40,
+    ) -> list[SymbolCandidate]:
+        """Locate symbol candidates from already-expanded query terms."""
+        pool = self.all_symbols or self.symbols
+        if not pool:
+            return []
+        constraints = constraints or {}
+        terms = _lookup_terms(expanded_terms, domain, constraints)
+        candidates: list[SymbolCandidate] = []
+        by_id = {sym.symbol_id: sym for sym in pool}
+        for sym in pool:
+            haystacks = {
+                "name": sym.name.casefold(),
+                "file": sym.file_path.casefold(),
+                "signature": sym.signature.casefold(),
+                "kind": sym.kind.casefold(),
+            }
+            score = 0.0
+            reasons: set[str] = set()
+            name_tokens = set(_split_identifier(sym.name))
+            file_tokens = set(_split_identifier(sym.file_path))
+            sig_tokens = set(_split_identifier(sym.signature))
+            for term in terms:
+                term_low = term.casefold()
+                term_tokens = set(_split_identifier(term))
+                if not term_low or not term_tokens:
+                    continue
+                if term_low == haystacks["name"]:
+                    score += 1.0
+                    reasons.add("name_exact")
+                elif term_low in haystacks["name"]:
+                    score += 0.72
+                    reasons.add("name_match")
+                elif term_tokens & name_tokens:
+                    score += 0.58
+                    reasons.add("name_token_match")
+                if term_low in haystacks["file"] or term_tokens & file_tokens:
+                    score += 0.34
+                    reasons.add("file_match")
+                if term_low in haystacks["signature"] or term_tokens & sig_tokens:
+                    score += 0.22
+                    reasons.add("signature_match")
+                if term_low == haystacks["kind"]:
+                    score += 0.18
+                    reasons.add("kind_match")
+            if score <= 0.0:
+                continue
+            if sym.kind.startswith("dml_"):
+                score *= 0.35
+            score += min(sym.score, 0.15)
+            candidates.append(
+                SymbolCandidate(
+                    symbol=sym,
+                    score_hint=round(min(score / 2.2, 1.0), 4),
+                    reasons=tuple(sorted(reasons)),
+                )
+            )
+        candidates.extend(_embedded_sql_parent_candidates(candidates, by_id))
+        candidates.sort(
+            key=lambda item: (
+                -item.score_hint,
+                -item.symbol.score,
+                item.symbol.file_path,
+                item.symbol.start_line,
+                item.symbol.name,
+            )
+        )
+        return candidates[:limit]
 
     def expand_symbol_edges(
         self,
@@ -332,6 +421,51 @@ def _split_identifier(text: str) -> list[str]:
     return split or parts
 
 
+def _lookup_terms(
+    expanded_terms: list[str] | tuple[str, ...],
+    domain: str,
+    constraints: dict[str, list[str]],
+) -> tuple[str, ...]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw in (
+        list(expanded_terms)
+        + ([domain] if domain else [])
+        + list(constraints.get("layer_hint", ()))
+    ):
+        term = raw.strip()
+        key = term.casefold()
+        if len(term) < 2 or key in seen:
+            continue
+        seen.add(key)
+        terms.append(term)
+    return tuple(terms)
+
+
+def _embedded_sql_parent_candidates(
+    candidates: list[SymbolCandidate],
+    by_id: dict[str, RankedSymbol],
+) -> list[SymbolCandidate]:
+    existing = {candidate.symbol.symbol_id for candidate in candidates}
+    parents: list[SymbolCandidate] = []
+    for candidate in candidates:
+        parent_id = candidate.symbol.parent_symbol_id
+        if not parent_id or parent_id in existing:
+            continue
+        parent = by_id.get(parent_id)
+        if parent is None:
+            continue
+        existing.add(parent_id)
+        parents.append(
+            SymbolCandidate(
+                symbol=parent,
+                score_hint=max(candidate.score_hint, 0.72),
+                reasons=tuple(sorted((*candidate.reasons, "embedded_sql_parent"))),
+            )
+        )
+    return parents
+
+
 def build_repo_map(
     project_root: Path,
     *,
@@ -343,16 +477,17 @@ def build_repo_map(
     root = project_root.resolve()
     if indexed is None:
         indexed = index_project(root)
+    indexed_symbols = _merge_sql_structural_symbols(root, indexed.symbols)
 
     name_to_ids: dict[str, list[str]] = {}
     file_nodes: dict[str, str] = {}
     symbol_nodes: dict[tuple[str, str, int], str] = {}
     edges: list[tuple[str, str]] = []
 
-    for sym in indexed.symbols:
+    for sym in indexed_symbols:
         symbol_nodes[(sym.file_path, sym.name, sym.start_line)] = _symbol_id(sym)
 
-    for sym in indexed.symbols:
+    for sym in indexed_symbols:
         sid = symbol_nodes[(sym.file_path, sym.name, sym.start_line)]
         name_to_ids.setdefault(sym.name, []).append(sid)
         if sym.file_path not in file_nodes:
@@ -374,7 +509,7 @@ def build_repo_map(
 
     ranked: list[RankedSymbol] = []
     file_score_acc: dict[str, float] = {}
-    for sym in indexed.symbols:
+    for sym in indexed_symbols:
         sid = symbol_nodes[(sym.file_path, sym.name, sym.start_line)]
         score = scores.get(sid, 0.0)
         ranked.append(
@@ -387,14 +522,21 @@ def build_repo_map(
                 signature=sym.signature,
                 score=score,
                 symbol_id=sid,
+                tables_referenced=tuple(getattr(sym, "tables_referenced", ())),
+                parent_symbol=str(getattr(sym, "parent_symbol", "")),
+                parent_symbol_id=str(getattr(sym, "parent_symbol_id", "")),
             )
         )
         file_score_acc[sym.file_path] = file_score_acc.get(sym.file_path, 0.0) + score
 
+    for ranked_symbol in ranked:
+        if ranked_symbol.parent_symbol_id and ranked_symbol.parent_symbol_id in scores:
+            edges.append((ranked_symbol.parent_symbol_id, ranked_symbol.symbol_id))
+
     ranked.sort(key=lambda s: s.score, reverse=True)
     symbols_by_file: dict[str, list[RankedSymbol]] = {}
-    for sym in ranked:
-        symbols_by_file.setdefault(sym.file_path, []).append(sym)
+    for ranked_symbol in ranked:
+        symbols_by_file.setdefault(ranked_symbol.file_path, []).append(ranked_symbol)
     for path in symbols_by_file:
         symbols_by_file[path].sort(key=lambda s: s.start_line)
 
@@ -419,9 +561,141 @@ def build_repo_map(
         reference_edges=edges,
         source=indexed.source,
         build_ms=elapsed,
-        symbol_count=len(indexed.symbols),
+        symbol_count=len(indexed_symbols),
     )
 
 
-def _symbol_id(sym: CtagsSymbol) -> str:
+def _merge_sql_structural_symbols(
+    root: Path,
+    indexed_symbols: list[CtagsSymbol],
+) -> list[Any]:
+    merged: dict[tuple[str, str, int], Any] = {
+        (sym.file_path, sym.name, sym.start_line): sym
+        for sym in indexed_symbols
+    }
+    for symbol in _collect_sql_structural_symbols(root):
+        merged[(symbol.file_path, symbol.name, symbol.start_line)] = symbol
+    return list(merged.values())
+
+
+def _collect_sql_structural_symbols(root: Path) -> tuple[Any, ...]:
+    parser = UniversalSqlParser()
+    symbols: list[Any] = []
+    for path in ProjectScanner(root).scan(max_files=5000).files:
+        suffix = path.suffix.casefold()
+        if suffix not in {".sql", ".py"}:
+            continue
+        try:
+            rel = path.relative_to(root).as_posix()
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+        if suffix == ".sql":
+            symbols.extend(parser.parse_text_block(text, rel, 1))
+        else:
+            symbols.extend(_parse_python_sql_strings(parser, text, rel))
+    return tuple(symbols)
+
+
+def _parse_python_sql_strings(
+    parser: UniversalSqlParser,
+    text: str,
+    rel: str,
+) -> tuple[Any, ...]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return ()
+    symbols: list[Any] = []
+    joined_children = _joined_string_child_ids(tree)
+    for node in ast.walk(tree):
+        if id(node) in joined_children:
+            continue
+        sql_text = _python_sql_literal_text(node)
+        if sql_text is None:
+            continue
+        if not _looks_like_sql(sql_text):
+            continue
+        base_line = int(getattr(node, "lineno", 1))
+        parent = _enclosing_function(tree, node)
+        parsed = parser.parse_text_block(sql_text, rel, base_line)
+        if parent is None:
+            symbols.extend(parsed)
+            continue
+        parent_id = f"{rel}:{parent.name}:{parent.lineno}"
+        for symbol in parsed:
+            symbols.append(
+                type(symbol)(
+                    file_path=symbol.file_path,
+                    name=f"{parent.name}:{symbol.name}",
+                    kind=symbol.kind,
+                    start_line=symbol.start_line,
+                    end_line=symbol.end_line,
+                    signature=f"{parent.name} embeds {symbol.signature}",
+                    tables_referenced=symbol.tables_referenced,
+                    parent_symbol=parent.name,
+                    parent_symbol_id=parent_id,
+                )
+            )
+    return tuple(symbols)
+
+
+def _joined_string_child_ids(tree: ast.AST) -> set[int]:
+    child_ids: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        for child in ast.walk(node):
+            if child is not node:
+                child_ids.add(id(child))
+    return child_ids
+
+
+def _python_sql_literal_text(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                expr = ast.unparse(value.value) if hasattr(ast, "unparse") else "expr"
+                parts.append("{" + expr + "}")
+        return "".join(parts)
+    return None
+
+
+def _enclosing_function(
+    tree: ast.AST,
+    target: ast.AST,
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    target_line = int(getattr(target, "lineno", 0))
+    best: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        start = int(getattr(node, "lineno", 0))
+        end = int(getattr(node, "end_lineno", start))
+        if start <= target_line <= end and (best is None or start >= best.lineno):
+            best = node
+    return best
+
+
+def _looks_like_sql(text: str) -> bool:
+    lowered = text.casefold()
+    return any(
+        token in lowered
+        for token in (
+            "select ",
+            "insert into ",
+            "update ",
+            "create view ",
+            "create or replace view ",
+            "create table ",
+        )
+    )
+
+
+def _symbol_id(sym: Any) -> str:
     return f"{sym.file_path}:{sym.name}:{sym.start_line}"

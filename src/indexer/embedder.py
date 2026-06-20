@@ -14,7 +14,25 @@ class Embedder:
         model: str = "text-embedding-3-small",
         provider: str = "openai",
     ) -> None:
-        self.model = model
+        known_providers = {
+            "openai",
+            "azure",
+            "ollama",
+            "huggingface",
+            "cohere",
+            "bedrock",
+            "voyage",
+            "gemini",
+            "vertex_ai",
+            "replicate",
+        }
+        parts = model.split("/", 1)
+        if len(parts) == 2 and parts[0].lower() in known_providers:
+            self.model = model
+        elif model.lower() in known_providers:
+            self.model = model
+        else:
+            self.model = f"{provider}/{model}"
         self.provider = provider
 
     async def embed(self, text: str) -> list[float]:

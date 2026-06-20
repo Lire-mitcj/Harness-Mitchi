@@ -18,13 +18,11 @@ def run_server(project_path: Path | None = None) -> None:
     settings = get_settings()
     settings.ensure_dirs()
     session = create_mitkii_session(project_root=project_path)
-    core_loop = session.create_core_loop()
-    agent = AgentLoopAdapter(core_loop)
+    agent = AgentLoopAdapter(session)
     handler = ServerHandler(agent)
     transport = StdioTransport(handler)
     log.info(
-        "MitKII server starting (orchestrator=%s, repo_map=%s)",
-        settings.orchestrator_mode,
+        "MitKII server starting (default=cursor, plan_route=orchestrator, repo_map=%s)",
         settings.repo_map_enabled,
     )
     log.info("MitKII project root: %s", session.project_root)
