@@ -77,3 +77,105 @@ def test_fusion_never_marks_ddl_as_focus() -> None:
 
     assert fused.final_context[0].startswith("FOCUS:api.py:passenger_snapshot")
     assert all("FOCUS:schema.sql" not in item for item in fused.final_context)
+
+
+def test_context_coalescing_with_collapsed_placeholder(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text(
+        "import os\n"
+        "import sys\n"
+        "def func1():\n"
+        "    return 1\n"
+        "def func2():\n"
+        "    return 2\n"
+        "def func3():\n"
+        "    return 3\n",
+        encoding="utf-8",
+    )
+    retrieval = RetrievalResult(symbols=(
+        RetrievalSymbol("app.py", "func1", 3, 4, kind="function"),
+        RetrievalSymbol("app.py", "func3", 7, 8, kind="function"),
+    ))
+
+    builder = CursorContextPackBuilder(tmp_path)
+    from src.agent.cursor_contracts import ContextPack, ContextWindow
+    initial_pack = ContextPack(windows=(
+        ContextWindow(file="app.py", start_line=3, end_line=4, content="func1 content", symbols=("func1",)),
+        ContextWindow(file="app.py", start_line=7, end_line=8, content="func3 content", symbols=("func3",)),
+    ))
+    
+    pack = builder.merge_interval_subgraph(initial_pack, retrieval)
+    assert len(pack.windows) == 1
+    window = pack.windows[0]
+    assert window.start_line == 3
+    assert window.end_line == 8
+    
+    assert "INTERVAL_CHUNK RANGE 3-4" in window.content
+    assert "INTERVAL_CHUNK RANGE 7-8" in window.content
+    assert "[PHYSICAL LINE INTERVAL 5-6 COLLAPSED DUE TO PRUNING POLICY]" in window.content
+
+
+def test_context_quota_groupBy_file_preemption_fix(tmp_path: Path) -> None:
+    app_path = tmp_path / "app.py"
+    app_path.write_text("def a(): pass\ndef b(): pass\ndef c(): pass\n", encoding="utf-8")
+    
+    other_path = tmp_path / "other.py"
+    other_path.write_text("def d(): pass\n", encoding="utf-8")
+    
+    retrieval = RetrievalResult(symbols=(
+        RetrievalSymbol("app.py", "a", 1, 1, kind="function"),
+        RetrievalSymbol("app.py", "b", 2, 2, kind="function"),
+        RetrievalSymbol("app.py", "c", 3, 3, kind="function"),
+        RetrievalSymbol("other.py", "d", 1, 1, kind="function"),
+    ))
+    
+    builder = CursorContextPackBuilder(tmp_path, max_files=2)
+    pack = builder.build_context(
+        retrieval,
+        final_context=(
+            "app.py:a:1-1",
+            "app.py:b:2-2",
+            "app.py:c:3-3",
+            "other.py:d:1-1",
+        )
+    )
+    
+    files = [w.file for w in pack.windows]
+    assert "app.py" in files
+    assert "other.py" in files
+    assert len(files) == 2
+
+
+def test_context_coalescing_keeps_ddl_evidence(tmp_path: Path) -> None:
+    app_path = tmp_path / "app.py"
+    app_path.write_text(
+        "def main_func():\n"
+        "    pass\n",
+        encoding="utf-8"
+    )
+    sql_path = tmp_path / "schema.sql"
+    sql_path.write_text(
+        "CREATE TABLE ticket_order (p_id INT);\n",
+        encoding="utf-8"
+    )
+    
+    retrieval = RetrievalResult(symbols=(
+        RetrievalSymbol("app.py", "main_func", 1, 2, kind="function", tables_referenced=("ticket_order",)),
+        RetrievalSymbol("schema.sql", "ticket_order", 1, 1, kind="ddl_table", tables_referenced=("ticket_order",)),
+    ))
+    
+    builder = CursorContextPackBuilder(tmp_path, max_files=2)
+    pack = builder.build_context(
+        retrieval,
+        final_context=(
+            "FOCUS:app.py:main_func:1-2",
+            "schema.sql:ticket_order:1-1",
+        )
+    )
+    
+    assert len(pack.windows) == 1
+    window = pack.windows[0]
+    assert window.file == "app.py"
+    assert "schema.sql" in window.content
+    assert "[SOFT_DEPENDENCY]" in window.content
+    assert "ticket_order" in window.content

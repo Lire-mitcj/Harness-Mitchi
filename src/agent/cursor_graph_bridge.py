@@ -260,9 +260,16 @@ class CursorGraphQueryBridge:
         if not symbols:
             return GraphBridgeResult()
 
-        token_counts: Counter[str] = Counter()
-        for s in symbols:
-            token_counts.update(self._tokens(s.name))
+        if not hasattr(self, "_cached_token_counts"):
+            self._cached_token_counts = None
+
+        if self._cached_token_counts is not None:
+            token_counts = self._cached_token_counts
+        else:
+            token_counts = Counter()
+            for s in symbols:
+                token_counts.update(self._tokens(s.name))
+            self._cached_token_counts = token_counts
 
         bm25_stats = self._prepare_bm25_stats(symbols)
         lexical_dict = {}

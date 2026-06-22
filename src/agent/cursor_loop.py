@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any, cast
@@ -10,14 +11,22 @@ from src.agent.cursor_context_pack_builder import CursorContextPackBuilder
 from src.agent.cursor_contracts import InterHint
 from src.agent.cursor_decision import CursorDecisionLLM, DecisionError
 from src.agent.cursor_evaluator import (
+    CursorEvalHarnessV2,
     CursorEvaluator,
+    RetrievalTestCase,
+    RetrievalTestCaseLoader,
+    RetrievalTrace,
     compute_layer1_metrics,
     format_bi_report,
 )
 from src.agent.cursor_executor import CursorExecutor
 from src.agent.cursor_fusion import CursorFusionEngine
 from src.agent.cursor_graph_bridge import CursorGraphQueryBridge
+from src.agent.cursor_graph_engine import CursorGraphEngine
+from src.agent.cursor_controller import ReactiveController
+from src.agent.cursor_contracts import ControlEvent
 from src.agent.cursor_inter_llm import CursorInterLLM
+
 from src.agent.cursor_patch_applier import CursorPatchApplier
 from src.agent.cursor_query_bridge import CursorQueryBridge
 from src.agent.cursor_repo_map_lookup import CursorRepoMapLookup
@@ -69,8 +78,32 @@ class CursorLoop:
         self.permissions = permissions
         self.settings = settings
         self.file_tracker = getattr(context, "file_tracker", None)
-        self.evaluation_expected_targets = tuple(
+        raw_test_case = getattr(context, "evaluation_test_case", None)
+        if raw_test_case is not None and not isinstance(raw_test_case, RetrievalTestCase):
+            raise TypeError("evaluation_test_case must be a RetrievalTestCase")
+        self.evaluation_unavailable_reason = "no RetrievalTestCase GT is bound"
+        self._evaluation_case_file = settings.cursor_evaluation_case_file
+        self._evaluation_case_name = settings.cursor_evaluation_case_name
+        self._evaluation_case_loaded = raw_test_case is not None
+        if raw_test_case is None and self._evaluation_case_file is not None:
+            self.evaluation_unavailable_reason = "evaluation case pending async load"
+        # Compatibility bridge for callers that have not migrated their test
+        # fixture yet. Runtime production does not invent GT when this is empty.
+        legacy_expected = tuple(
             getattr(context, "evaluation_expected_targets", ()) or ()
+        )
+        if raw_test_case is None and legacy_expected:
+            raw_test_case = RetrievalTestCase(
+                name="legacy-context-targets",
+                ground_truth=legacy_expected,
+            )
+        if raw_test_case is not None:
+            self.evaluation_unavailable_reason = ""
+        self.evaluation_test_case = raw_test_case
+        self.eval_harness = (
+            CursorEvalHarnessV2(raw_test_case)
+            if raw_test_case is not None
+            else None
         )
 
         repo_map = getattr(context, "repo_map_service", None)
@@ -147,9 +180,22 @@ class CursorLoop:
         self.decision = CursorDecisionLLM(self.decision_llm)
         self.inter = CursorInterLLM(self.inter_llm)
         self.semantic_tagger = CursorSemanticTagger()
+        self.graph_engine = CursorGraphEngine(
+            self.repo_map_lookup,
+            self.graph_bridge,
+            self.ast_structure,
+            self.retriever,
+            self.fusion,
+            self.settings,
+            self.harness,
+        )
+        self.controller = ReactiveController(self.graph_engine, self.context_builder, self.state_manager)
+
 
     async def run(self, user_msg: str) -> AsyncIterator[AgentEvent]:
         yield AgentEvent(type=EventType.STREAM_START)
+        if (self._evaluation_case_name or "").casefold() != "auto":
+            await self._ensure_evaluation_case()
         self.harness.phase_metrics.reset_turn()
         self.state = self.state_manager.initial(user_msg, max_steps=self.settings.cursor_max_steps)
 
@@ -192,7 +238,7 @@ class CursorLoop:
             pending[asyncio.create_task(run_inter())] = "inter"
 
         yield self._parallel_status(
-            "Rewriting retrieval query...",
+            "Searching codebase...",
             phase="query_bridge",
             task_id="query_bridge",
             state="running",
@@ -255,7 +301,7 @@ class CursorLoop:
                         },
                     )
                     yield self._parallel_status(
-                        "Retrieval query rewritten",
+                        "Searching codebase...",
                         phase="query_bridge",
                         task_id="query_bridge",
                         state="done",
@@ -278,7 +324,10 @@ class CursorLoop:
                 )
             )
             bridge_result = guarded_bridge.bridge
-        yield self._status("Looking up repo map candidates...", phase="repo_map_lookup")
+        await self._ensure_evaluation_case(
+            query_terms=(user_msg, *bridge_result.search_terms(limit=32)),
+        )
+        yield self._status("Searching codebase...", phase="repo_map_lookup")
         pm.start("cursor_repo_map_lookup")
         candidate_symbols = await asyncio.to_thread(
             self.repo_map_lookup.lookup,
@@ -291,7 +340,11 @@ class CursorLoop:
             metadata={"candidate_symbols": len(candidate_symbols)},
         )
 
-        yield self._status("Expanding symbol graph...", phase="graph_bridge")
+        hint_files = [f for f in (bridge_result.file_hints or []) if f]
+        if hint_files:
+            yield self._status(f"Searching file: {hint_files[0]}", phase="graph_bridge")
+        else:
+            yield self._status("Searching symbol graph...", phase="graph_bridge")
         yield self._log_status(
             "Graph Bridge: Expanding candidate nodes in symbol graph...",
             phase="graph_bridge",
@@ -329,25 +382,57 @@ class CursorLoop:
             phase="graph_bridge",
         )
 
-        yield self._status("Grounding AST structure...", phase="ast_structure")
         pm.start("cursor_ast_structure")
         ast_candidates = await asyncio.to_thread(
             self.repo_map_lookup.merge_by_ids,
             candidate_symbols,
             graph_result.expanded_symbol_ids,
         )
-        ast_nodes = await asyncio.to_thread(
-            self.ast_structure.ground,
-            ast_candidates,
-            limit=self.settings.cursor_retrieval_candidate_symbols,
-        )
+        first_file = ""
+        if ast_candidates:
+            first_file = str(ast_candidates[0].symbol.file_path).replace("\\", "/").lstrip("./")
+        if first_file:
+            yield self._status(f"Reading file: {first_file}", phase="ast_structure")
+        else:
+            yield self._status("Grounding AST structure...", phase="ast_structure")
+
+        # Ground ast candidates incrementally and yield active file progress
+        ast_nodes_list = []
+        seen_symbols = set()
+        limit = self.settings.cursor_retrieval_candidate_symbols
+        for candidate in ast_candidates:
+            symbol = candidate.symbol
+            symbol_id = str(
+                getattr(
+                    symbol,
+                    "symbol_id",
+                    f"{getattr(symbol, 'file_path', None) or getattr(symbol, 'file', 'unknown')}:{symbol.name}:{symbol.start_line}",
+                )
+            )
+            if symbol_id in seen_symbols:
+                continue
+            seen_symbols.add(symbol_id)
+
+            rel = str(symbol.file_path).replace("\\", "/").lstrip("./")
+            yield self._status(f"Reading file: {rel}", phase="ast_structure")
+
+            node = await asyncio.to_thread(self.ast_structure._node, symbol)
+            if node is not None:
+                ast_nodes_list.append(node)
+            if len(ast_nodes_list) >= limit:
+                break
+        ast_nodes = tuple(ast_nodes_list)
+
         self._end_phase(
             "cursor_ast_structure",
             verdict="ok" if ast_nodes else "empty",
             metadata={"ast_nodes": len(ast_nodes)},
         )
 
-        yield self._status("Retrieving code candidates...", phase="retrieval")
+        if ast_nodes:
+            yield self._status(f"Retrieving file: {ast_nodes[0].file}", phase="retrieval")
+        else:
+            yield self._status("Retrieving code candidates...", phase="retrieval")
         yield self._log_status(
             "Retriever: Running local similarity scoring on candidates...",
             phase="retrieval",
@@ -355,7 +440,12 @@ class CursorLoop:
         pm = self.harness.phase_metrics
         pm.start("cursor_retrieval")
         if self.retriever.repo_map is not None:
-            raw_retrieval = self.retriever.score_candidates(
+            if ast_nodes:
+                yield self._status(f"Scoring file: {ast_nodes[0].file}", phase="retrieval")
+            else:
+                yield self._status("Scoring retrieval candidates...", phase="retrieval")
+            raw_retrieval = await asyncio.to_thread(
+                self.retriever.score_candidates,
                 ast_nodes=ast_nodes,
                 candidates=ast_candidates,
                 bridge=bridge_result,
@@ -381,17 +471,28 @@ class CursorLoop:
                 "timed_out": guarded.timed_out if guarded is not None else False,
             },
         )
-        retrieval_files_str = "\n".join(f" - {f}" for f in raw_retrieval.files)
+        top_files = raw_retrieval.files[:10]
+        retrieval_files_str = "\n".join(f" - {f}" for f in top_files)
+        if len(raw_retrieval.files) > 10:
+            retrieval_files_str += f"\n - ... and {len(raw_retrieval.files) - 10} more files"
+
+        top_symbols = raw_retrieval.symbols[:10]
         retrieval_syms_str = "\n".join(
             f" - {sym.name} ({sym.file}:{sym.start_line}-{sym.end_line}) [score={sym.score:.4f}, reasons={list(sym.reasons)}]"
-            for sym in raw_retrieval.symbols
+            for sym in top_symbols
         )
+        if len(raw_retrieval.symbols) > 10:
+            retrieval_syms_str += f"\n - ... and {len(raw_retrieval.symbols) - 10} more symbols"
+
         yield self._log_status(
             f"[Retriever v2] Scored files:\n{retrieval_files_str or 'None'}\n[Retriever v2] Scored symbols:\n{retrieval_syms_str or 'None'}",
             phase="retrieval",
         )
 
-        yield self._status("Fusing and ranking context...", phase="fusion")
+        if raw_retrieval.files:
+            yield self._status(f"Fusing file: {raw_retrieval.files[0]}", phase="fusion")
+        else:
+            yield self._status("Fusing and ranking context...", phase="fusion")
         yield self._log_status(
             "Fusion Engine: Ranking, capping, and selecting final context slices...",
             phase="fusion",
@@ -439,38 +540,6 @@ class CursorLoop:
             "\n".join(f" - {item}" for item in fusion_result.final_context),
             phase="fusion",
         )
-        layer1_metrics = compute_layer1_metrics(
-            tuple(fusion_result.final_context),
-            self.evaluation_expected_targets,
-        )
-        layer1_note = (
-            "oracle unavailable"
-            if not self.evaluation_expected_targets
-            else f"{len(layer1_metrics.hits)}/{len(layer1_metrics.expected)}"
-        )
-        yield self._log_status(
-            "[Evaluation] Layer 1 retrieval metrics:\n"
-            f" - Precision: {layer1_metrics.precision:.4f} "
-            f"({len(layer1_metrics.hits)}/{len(layer1_metrics.retrieved)})\n"
-            f" - Recall   : {layer1_metrics.recall:.4f} ({layer1_note})\n"
-            f" - F1-Score : {layer1_metrics.f1_score:.4f}\n"
-            f" - Hits     : {list(layer1_metrics.hits)}\n"
-            f" - Misses   : {list(layer1_metrics.misses)}",
-            phase="fusion",
-        )
-        if self.evaluation_expected_targets and layer1_metrics.recall < 1.0:
-            self.state = self.state_manager.failed(
-                self.state,
-                "Layer 1 retrieval recall below CI threshold",
-            )
-            yield self._log_status(
-                "[Evaluation Gate] Layer 1 recall below 1.0; blocking DecisionLLM.",
-                phase="fusion",
-            )
-            yield final_answer_event("Layer 1 retrieval recall below CI threshold")
-            yield AgentEvent(type=EventType.STREAM_END)
-            return
-
         if not retrieval.files and not retrieval.symbols:
             self.state = self.state_manager.failed(
                 self.state,
@@ -505,6 +574,47 @@ class CursorLoop:
                 "files": list(context_pack.candidate_files),
             },
         )
+
+        if self.eval_harness is None:
+            layer1_metrics = compute_layer1_metrics((), ())
+            yield self._log_status(
+                "[Evaluation] Layer 1 unavailable: "
+                f"{self.evaluation_unavailable_reason}. "
+                "Set MITKII_CURSOR_EVALUATION_CASE_FILE to a JSON case with ground_truth; "
+                "precision/recall are not scored without an oracle.",
+                phase="fusion",
+            )
+        else:
+            self.eval_harness.add_trace(RetrievalTrace(
+                step=self.state.current_step,
+                retrieved=context_pack.candidate_files,
+                fused_files=fusion_result.final_files,
+            ))
+            layer1_metrics = await asyncio.to_thread(self.eval_harness.evaluate)
+            yield self._log_status(
+                "[Evaluation] Layer 1 retrieval metrics (GT-bound cumulative trace):\n"
+                f" - Test case : {self.eval_harness.test_case.name}\n"
+                f" - Precision: {layer1_metrics.precision:.4f} "
+                f"({len(layer1_metrics.hits)}/{len(layer1_metrics.retrieved)})\n"
+                f" - Recall   : {layer1_metrics.recall:.4f} "
+                f"({len(layer1_metrics.hits)}/{len(layer1_metrics.expected)})\n"
+                f" - F1-Score : {layer1_metrics.f1_score:.4f}\n"
+                f" - Hits     : {list(layer1_metrics.hits)}\n"
+                f" - Misses   : {list(layer1_metrics.misses)}",
+                phase="fusion",
+            )
+            if layer1_metrics.recall < 1.0:
+                self.state = self.state_manager.failed(
+                    self.state,
+                    "Layer 1 retrieval recall below CI threshold",
+                )
+                yield self._log_status(
+                    "[Evaluation Gate] Layer 1 recall below CI threshold; blocking DecisionLLM.",
+                    phase="fusion",
+                )
+                yield final_answer_event("Layer 1 retrieval recall below CI threshold")
+                yield AgentEvent(type=EventType.STREAM_END)
+                return
 
         for step in range(1, self.settings.cursor_max_steps + 1):
             yield self._status(
@@ -596,20 +706,33 @@ class CursorLoop:
 
             if decision.action == "ask_clarify":
                 if can_answer:
-                    self.state = self.state_manager.mark_retry(self.state)
-                    yield self._log_status(
-                        "[Decision] ask_clarify recorded as a loop retry because "
-                        "grounded context is available.",
-                        phase="decision",
-                    )
-                    continue
-                self.state = self.state_manager.failed(
-                    self.state,
-                    decision.clarification,
-                )
-                yield final_answer_event(decision.clarification)
-                yield AgentEvent(type=EventType.STREAM_END)
-                return
+                    # 发现无理提问逃逸，立刻包装为统一事件送进总线调度
+                    event_stream = [ControlEvent(
+                        type="clarify_escape",
+                        payload={"clarification": decision.clarification},
+                        severity=0.7
+                    )]
+                    should_skip_step = False
+                    for event in event_stream:
+                        context_pack, self.state, handler_skip = await self.controller.handle(
+                            event=event,
+                            context_pack=context_pack,
+                            state=self.state
+                        )
+                        should_skip_step |= handler_skip
+                        if self.state.entropy_score > 4.0:
+                            yield self._log_status(
+                                f"[Entropy Terminate] Terminal state reached. Entropy too high ({self.state.entropy_score:.2f}).",
+                                phase="decision",
+                            )
+                            break
+                    if should_skip_step:
+                        continue
+                else:
+                    self.state = self.state_manager.failed(self.state, decision.clarification)
+                    yield final_answer_event(decision.clarification)
+                    yield AgentEvent(type=EventType.STREAM_END)
+                    return
 
             if decision.action == "answer":
                 self.state = self.state_manager.succeeded(self.state)
@@ -634,7 +757,7 @@ class CursorLoop:
                 layer1=layer1_metrics,
                 user_intent=user_msg,
             )
-            self.evaluator.record(pipeline_metrics)
+            await asyncio.to_thread(self.evaluator.record, pipeline_metrics)
             yield self._log_status(
                 format_bi_report(pipeline_metrics),
                 phase="evaluation",
@@ -652,6 +775,8 @@ class CursorLoop:
                     ),
                 },
             )
+
+            # Sandbox physical execution feedback logs
             if not execution.success:
                 yield self._log_status(
                     f"[Sandbox] Patch application failed: {execution.error or 'Unknown error'}",
@@ -661,39 +786,104 @@ class CursorLoop:
                     f"[Sandbox] Transaction rolled back for target file '{decision.target_file}'.",
                     phase="executor",
                 )
+            else:
+                yield self._log_status(
+                    f"[Sandbox] Patch successfully applied to '{decision.target_file}'. Proceeding to validation check...",
+                    phase="executor",
+                )
+                self._end_phase(
+                    "cursor_validator",
+                    subtask_id=str(step),
+                    verdict="pass" if validation.success else "fail",
+                )
+                if validation.success:
+                    yield self._log_status(
+                        f"[Sandbox] Validation passed. Transaction committed for target file '{decision.target_file}'.",
+                        phase="executor",
+                    )
+                else:
+                    yield self._log_status(
+                        f"[Sandbox] Validation failed! Error:\n{validation.error or 'Unknown validation error'}",
+                        phase="executor",
+                    )
+                    yield self._log_status(
+                        f"[Sandbox] Transaction rolled back for target file '{decision.target_file}'.",
+                        phase="executor",
+                    )
+
+            # 🚀 1. 零防御事件构建区（Event Production Phase）与优先级过滤
+            event_stream: list[ControlEvent] = []
+            
+            if not execution.success:
+                event_stream.append(ControlEvent(
+                    type="runtime_error",
+                    payload={"file": decision.target_file, "error": execution.error or "Patch application failed"},
+                    severity=0.5,
+                ))
+            elif not validation.success:
+                val_err = str(validation.error or "validation failed")
+                if "symbol_missing" in val_err:
+                    missing_symbol = val_err.split("symbol_missing:")[-1].strip()
+                    event_stream.append(ControlEvent(type="missing_info", payload={"symbol_name": missing_symbol}, severity=0.6))
+                else:
+                    event_stream.append(ControlEvent(
+                        type="runtime_error",
+                        payload={"file": decision.target_file, "error": val_err},
+                        severity=0.5,
+                    ))
+            elif decision.action == "edit" and decision.suggested_completion < 0.50:
+                event_stream.append(ControlEvent(
+                    type="low_confidence",
+                    payload={"patch": decision.patch, "file": decision.target_file},
+                    severity=0.4,
+                ))
+            else:
+                event_stream.append(ControlEvent(type="execution_success", payload={"file": decision.target_file}))
+
+
+            # Deduplication filter: Keep only the highest priority event in a single step
+            if event_stream:
+                priority = {"missing_info": 4, "runtime_error": 3, "low_confidence": 2, "execution_success": 1}
+                selected_event = max(event_stream, key=lambda e: priority.get(e.type, 0))
+                event_stream = [selected_event]
+
+            # 🚀 2. 反应式中央事件分发控制（Control Plane Event Handle Loop）
+            should_skip_step = False
+            for event in event_stream:
+                context_pack, self.state, handler_skip = await self.controller.handle(
+                    event=event,
+                    context_pack=context_pack,
+                    state=self.state
+                )
+                should_skip_step |= handler_skip
+                
+                # 🚨 时序高压状态熵物理硬熔断拦截
+                if self.state.entropy_score > 4.0:
+                    yield self._log_status(
+                        f"[Entropy Terminate] Terminal state reached. Entropy too high ({self.state.entropy_score:.2f}).",
+                        phase="decision",
+                    )
+                    break
+
+            # 🚀 3. 根据事件流控制面的调度决定是否增量跳过当前timestep of 剩余物理动作
+            if should_skip_step and not validation.success:
                 self.state = self.state_manager.after_execution(
                     self.state,
                     decision.target_file,
                     decision.patch,
                     execution,
                 )
+                self.state = self.state_manager.after_validation(
+                    self.state,
+                    validation,
+                    suggested_completion=decision.suggested_completion,
+                    patch=decision.patch,
+                    execution=execution,
+                )
                 continue
 
-            yield self._log_status(
-                f"[Sandbox] Patch successfully applied to '{decision.target_file}'. Proceeding to validation check...",
-                phase="executor",
-            )
 
-            self._end_phase(
-                "cursor_validator",
-                subtask_id=str(step),
-                verdict="pass" if validation.success else "fail",
-            )
-            if validation.success:
-                yield self._log_status(
-                    f"[Sandbox] Validation passed. Transaction committed for target file '{decision.target_file}'.",
-                    phase="executor",
-                )
-            else:
-                yield self._log_status(
-                    f"[Sandbox] Validation failed! Error:\n{validation.error or 'Unknown validation error'}",
-                    phase="executor",
-                )
-                yield self._log_status(
-                    f"[Sandbox] Transaction rolled back for target file '{decision.target_file}'.",
-                    phase="executor",
-                )
-
+            # 🚀 4. 如果没有跳过，常规提交盘子状态并持久化世界记录
             self.state = self.state_manager.after_execution(
                 self.state,
                 decision.target_file,
@@ -707,8 +897,6 @@ class CursorLoop:
                 patch=decision.patch,
                 execution=execution,
             )
-            if not validation.success:
-                continue
 
             if self.file_tracker is not None:
                 self.file_tracker.record_edit(decision.target_file)
@@ -721,12 +909,45 @@ class CursorLoop:
                 yield AgentEvent(type=EventType.STREAM_END)
                 return
 
+
         self.state = self.state_manager.failed(
             self.state,
             self.state.last_observation or "Cursor loop exhausted its step limit.",
         )
         yield error_event(self.state.last_observation)
         yield AgentEvent(type=EventType.STREAM_END)
+
+    async def _ensure_evaluation_case(
+        self,
+        *,
+        query_terms: tuple[str, ...] = (),
+    ) -> None:
+        if self._evaluation_case_loaded or self._evaluation_case_file is None:
+            return
+        case_name = (self._evaluation_case_name or "").strip()
+        if case_name.casefold() == "auto" and not query_terms:
+            return
+        try:
+            if case_name.casefold() == "auto":
+                test_case = await asyncio.to_thread(
+                    RetrievalTestCaseLoader.select_case,
+                    self._evaluation_case_file,
+                    query_terms,
+                )
+            else:
+                test_case = await asyncio.to_thread(
+                    RetrievalTestCaseLoader.load_case,
+                    self._evaluation_case_file,
+                    case_name or None,
+                )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self.evaluation_unavailable_reason = f"failed to load evaluation case: {exc}"
+            self._evaluation_case_loaded = True
+            return
+        self._evaluation_case_loaded = True
+        self.evaluation_test_case = test_case
+        self.eval_harness = CursorEvalHarnessV2(test_case)
+        self.evaluation_unavailable_reason = ""
 
     def _cost_event(self, response: Any) -> AgentEvent:
         record = self.harness.probe.metrics.last_record

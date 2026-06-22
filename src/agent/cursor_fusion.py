@@ -15,6 +15,11 @@ class FusionResult:
     retrieval: RetrievalResult
     rerank: dict[str, object] = field(default_factory=dict)
 
+    @property
+    def final_files(self) -> tuple[str, ...]:
+        """Actual file set retained by Fusion after scoring and caps."""
+        return self.retrieval.candidate_files
+
 
 class CursorReranker(Protocol):
     async def rerank(

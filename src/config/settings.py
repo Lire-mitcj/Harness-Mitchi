@@ -392,8 +392,22 @@ class MitKIISettings(BaseSettings):
     data_dir: Path = Field(default_factory=lambda: Path.home() / ".mitkii")
     project_dir: str = ".mitkii"
     cursor_evaluation_dir: Path = Field(
-        default_factory=lambda: Path(r"D:\eval_json"),
+        default_factory=lambda: Path(r"D:\eval_json\metrics"),
         description="Directory for Cursor harness evaluation JSONL logs.",
+    )
+    cursor_evaluation_case_file: Path | None = Field(
+        default=None,
+        description=(
+            "Optional retrieval evaluation JSON with non-empty ground_truth. "
+            "Without it, Layer 1 precision/recall are unavailable rather than scored."
+        ),
+    )
+    cursor_evaluation_case_name: str | None = Field(
+        default=None,
+        description=(
+            "Required case name when the retrieval evaluation fixture "
+            "contains multiple cases."
+        ),
     )
 
     model_config = {

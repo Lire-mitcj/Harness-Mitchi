@@ -14,7 +14,23 @@ from src.agent.cursor_contracts import (
 )
 
 
+def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not intervals:
+        return []
+    intervals.sort(key=lambda x: x[0])
+    merged = [intervals[0]]
+    for current in intervals[1:]:
+        prev_start, prev_end = merged[-1]
+        curr_start, curr_end = current
+        if curr_start <= prev_end + 1:
+            merged[-1] = (prev_start, max(prev_end, curr_end))
+        else:
+            merged.append(current)
+    return merged
+
+
 class CursorContextPackBuilder:
+
     """Compile retrieval output into a three-layer, evidence-labelled context IR."""
 
     def __init__(
@@ -64,67 +80,179 @@ class CursorContextPackBuilder:
             route for item in final_context
             if (route := _parse_context_route(item)) is not None
         )
-        core_routes = _select_core_routes(routes, symbol_index, result.symbols)
-        # Retrieval can occasionally provide only file paths or DDL.  Keep a
-        # bounded fallback rather than forcing Decision into ask_clarify, but
-        # do not manufacture an arbitrary header/line slice.
-        if not core_routes:
-            for route in routes:
-                if route.is_file:
-                    path = self._safe_file(route.file)
-                    if path is None:
-                        continue
-                    line_count = len(
-                        path.read_text(encoding="utf-8", errors="replace").splitlines()
-                    )
-                    core_routes.append((
-                        _ContextRoute(
-                            route.file, "FILE_FALLBACK", 1, max(1, line_count), False, False,
-                        ),
-                        None,
-                    ))
-                else:
-                    core_routes.append((
-                        route,
-                        symbol_index.get(
-                            (route.file, route.name, route.start_line, route.end_line)
-                        ),
-                    ))
-                if len(core_routes) >= self.max_files:
-                    break
+
+        # Hash GroupBy File (Vulnerability 2 Fix: prevent multi-file quota preemption)
+        from collections import defaultdict
+        routes_by_file = defaultdict(list)
+        file_order = []
+        for route in routes:
+            if route.file not in routes_by_file:
+                file_order.append(route.file)
+            routes_by_file[route.file].append(route)
+
+        resolved_by_file = {}
+        evidence_by_file = defaultdict(list)
+        for file_rel in file_order:
+            file_routes = routes_by_file[file_rel]
+            core_res, evidence_res = _select_file_core_routes(
+                self.project_root, file_rel, file_routes, symbol_index, result.symbols
+            )
+            if core_res:
+                resolved_by_file[file_rel] = core_res
+            if evidence_res:
+                evidence_by_file[file_rel].extend(evidence_res)
+
+        # Fallback check globally across all files if no core routes are resolved anywhere
+        if not resolved_by_file:
+            for file_rel in file_order:
+                file_routes = routes_by_file[file_rel]
+                fallback_res = []
+                for r in file_routes:
+                    if r.is_file:
+                        path = self._safe_file(r.file)
+                        if path is not None:
+                            try:
+                                line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+                                fallback_res.append((
+                                    _ContextRoute(
+                                        r.file, "FILE_FALLBACK", 1, max(1, line_count), False, False
+                                    ),
+                                    None
+                                ))
+                            except Exception:
+                                pass
+                    else:
+                        fallback_res.append((
+                            r,
+                            symbol_index.get((r.file, r.name, r.start_line, r.end_line))
+                        ))
+                if fallback_res:
+                    resolved_by_file[file_rel] = fallback_res
+                    if len(resolved_by_file) >= self.max_files:
+                        break
+
+        active_files = [f for f in file_order if f in resolved_by_file]
+        selected_files = active_files[: self.max_files]
+
         windows: list[ContextWindow] = []
-        for route, core_symbol in core_routes[: self.max_files]:
-            path = self._safe_file(route.file)
+        for file_rel in selected_files:
+            routes_with_symbols = resolved_by_file[file_rel]
+            path = self._safe_file(file_rel)
             if path is None:
                 continue
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except Exception:
+                continue
             if not lines:
                 continue
-            start = max(1, min(route.start_line, len(lines)))
-            end = max(start, min(route.end_line, len(lines)))
-            core = _numbered_lines(lines, start, end)
-            header = _semantic_header(path, lines, start, end)
-            skeleton = _global_skeleton(path, lines)
-            soft = self._soft_dependencies(
-                core_symbol, result.symbols, lines[start - 1:end], symbol_index,
-            )
-            content = "\n\n".join(part for part in (
+
+            # Singleton AST parsing per file (Vulnerability 3 Fix: avoid AST re-parsing cost)
+            tree = _parse_file_ast(path, lines)
+
+            # Collect ranges to merge
+            intervals = []
+            for route, _ in routes_with_symbols:
+                start = max(1, min(route.start_line, len(lines)))
+                end = max(start, min(route.end_line, len(lines)))
+                intervals.append((start, end))
+
+            merged_ranges = merge_intervals(intervals)
+            if not merged_ranges:
+                continue
+
+            # Layer 1 (Vulnerability 1 Fix: physical line interval collapse marker)
+            spans = []
+            symbols_set = set()
+            for route, _ in routes_with_symbols:
+                symbols_set.add(route.name)
+            symbols_str = ", ".join(sorted(list(symbols_set)))
+
+            for i, (start, end) in enumerate(merged_ranges):
+                if i > 0:
+                    prev_end = merged_ranges[i - 1][1]
+                    collapsed_start = prev_end + 1
+                    collapsed_end = start - 1
+                    if collapsed_start <= collapsed_end:
+                        spans.append(
+                            f"... 🚨 [PHYSICAL LINE INTERVAL {collapsed_start}-{collapsed_end} COLLAPSED DUE TO PRUNING POLICY] ..."
+                        )
+                core = _numbered_lines(lines, start, end)
+                spans.append(
+                    f"[INTERVAL_CHUNK RANGE {start}-{end}]\n{core}"
+                )
+
+            layer1_content = (
                 "[LAYER_1_CORE_SYMBOL]\n"
-                f"file: {route.file}\nlines: {start}-{end}\n"
-                f"symbol: {route.name}\n{core}",
+                f"file: {file_rel}\n"
+                f"symbol: {symbols_str}\n\n"
+                + "\n".join(spans)
+            )
+
+            # Layer 2: semantic header & soft dependencies
+            header = _merged_semantic_header(path, tree, lines, merged_ranges)
+
+            soft_blocks = []
+            for route, core_symbol in routes_with_symbols:
+                if core_symbol is not None:
+                    r_start = max(1, min(route.start_line, len(lines)))
+                    r_end = max(r_start, min(route.end_line, len(lines)))
+                    soft_str = self._soft_dependencies(
+                        core_symbol, result.symbols, lines[r_start - 1 : r_end], symbol_index
+                    )
+                    if soft_str:
+                        soft_blocks.append(soft_str)
+
+            # Format and merge resolved evidence routes from other files under Layer 2
+            for ev_file, ev_list in evidence_by_file.items():
+                for ev_route, ev_symbol in ev_list:
+                    ev_path = self._safe_file(ev_route.file)
+                    if ev_path is not None:
+                        try:
+                            ev_lines = ev_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                            ev_start = max(1, min(ev_route.start_line, len(ev_lines)))
+                            ev_end = max(ev_start, min(ev_route.end_line, len(ev_lines)))
+                            ev_body = _numbered_lines(ev_lines, ev_start, ev_end)
+                            ev_str = (
+                                "[SOFT_DEPENDENCY]\n"
+                                "kind: direct_evidence\n"
+                                f"file: {ev_route.file}\nlines: {ev_start}-{ev_end}\n"
+                                f"symbol: {ev_route.name}\n{ev_body}"
+                            )
+                            soft_blocks.append(ev_str)
+                        except Exception:
+                            pass
+
+            unique_soft_blocks = []
+            for block in soft_blocks:
+                for sub_block in block.split("\n\n"):
+                    if sub_block.strip() and sub_block not in unique_soft_blocks:
+                        unique_soft_blocks.append(sub_block)
+            soft_content = "\n\n".join(unique_soft_blocks)
+
+            layer2_content = (
                 "[LAYER_2_DEPENDENCY_EVIDENCE]\n"
                 + (header or "[SEMANTIC_HEADER] none")
-                + ("\n\n" + soft if soft else ""),
-                "[LAYER_3_GLOBAL_SKELETON]\n" + skeleton,
-            ) if part)
+                + ("\n\n" + soft_content if soft_content else "")
+            )
+
+            # Layer 3: global skeleton
+            skeleton = _global_skeleton(path, lines)
+            layer3_content = "[LAYER_3_GLOBAL_SKELETON]\n" + skeleton
+
+            # Combined content
+            content = "\n\n".join(
+                part for part in (layer1_content, layer2_content, layer3_content) if part
+            )
             content = _clip(content, self.max_chars_per_file)
+
             windows.append(ContextWindow(
-                file=route.file,
-                start_line=start,
-                end_line=end,
+                file=file_rel,
+                start_line=min(start for start, end in merged_ranges),
+                end_line=max(end for start, end in merged_ranges),
                 content=content,
-                symbols=(route.name,),
-                semantic_tags=annotations.tags_by_file.get(route.file, ()),
+                symbols=tuple(sorted(list(symbols_set))),
+                semantic_tags=annotations.tags_by_file.get(file_rel, ()),
             ))
         return ContextPack(windows=tuple(windows))
 
@@ -303,7 +431,113 @@ class CursorContextPackBuilder:
             for window in pack.windows
         ))
 
+    def merge_interval_subgraph(
+        self,
+        context_pack: ContextPack,
+        raw_retrieval: RetrievalResult,
+    ) -> ContextPack:
+        from collections import defaultdict
+        file_intervals = defaultdict(list)
+        file_symbols = defaultdict(set)
+        file_tags = defaultdict(set)
+        
+        for w in context_pack.windows:
+            file_intervals[w.file].append((w.start_line, w.end_line))
+            file_symbols[w.file].update(w.symbols)
+            file_tags[w.file].update(w.semantic_tags)
+            
+        for sym in raw_retrieval.symbols:
+            file_intervals[sym.file].append((sym.start_line, sym.end_line))
+            file_symbols[sym.file].add(sym.name)
+            
+        for f in raw_retrieval.files:
+            if f not in file_intervals:
+                path = self._safe_file(f)
+                if path is not None:
+                    try:
+                        line_count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+                        file_intervals[f].append((1, max(1, line_count)))
+                    except Exception:
+                        pass
+
+        merged_windows = []
+        for file_rel, intervals in file_intervals.items():
+            if not intervals:
+                continue
+            
+            path = self._safe_file(file_rel)
+            if path is None:
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except Exception:
+                continue
+            if not lines:
+                continue
+                
+            merged_ranges = merge_intervals(intervals)
+            if not merged_ranges:
+                continue
+
+            # Singleton AST parsing per file (Vulnerability 3 Fix: avoid AST re-parsing cost)
+            tree = _parse_file_ast(path, lines)
+
+            # Layer 1 (Vulnerability 1 Fix: physical line interval collapse marker)
+            spans = []
+            symbols_str = ", ".join(sorted(file_symbols[file_rel])) or "merged"
+            for i, (start, end) in enumerate(merged_ranges):
+                start = max(1, min(start, len(lines)))
+                end = max(start, min(end, len(lines)))
+                
+                if i > 0:
+                    prev_end = merged_ranges[i - 1][1]
+                    collapsed_start = prev_end + 1
+                    collapsed_end = start - 1
+                    if collapsed_start <= collapsed_end:
+                        spans.append(
+                            f"... 🚨 [PHYSICAL LINE INTERVAL {collapsed_start}-{collapsed_end} COLLAPSED DUE TO PRUNING POLICY] ..."
+                        )
+                core = _numbered_lines(lines, start, end)
+                spans.append(
+                    f"[INTERVAL_CHUNK RANGE {start}-{end}]\n{core}"
+                )
+
+            layer1_content = (
+                "[LAYER_1_CORE_SYMBOL]\n"
+                f"file: {file_rel}\n"
+                f"symbol: {symbols_str}\n\n"
+                + "\n".join(spans)
+            )
+
+            # Layer 2: semantic header
+            header = _merged_semantic_header(path, tree, lines, merged_ranges)
+            layer2_content = (
+                "[LAYER_2_DEPENDENCY_EVIDENCE]\n"
+                + (header or "[SEMANTIC_HEADER] none")
+            )
+
+            # Layer 3: global skeleton
+            skeleton = _global_skeleton(path, lines)
+            layer3_content = "[LAYER_3_GLOBAL_SKELETON]\n" + skeleton
+
+            # Combined content
+            content = "\n\n".join(
+                part for part in (layer1_content, layer2_content, layer3_content) if part
+            )
+            content = _clip(content, self.max_chars_per_file)
+
+            merged_windows.append(ContextWindow(
+                file=file_rel,
+                start_line=min(start for start, end in merged_ranges),
+                end_line=max(end for start, end in merged_ranges),
+                content=content,
+                symbols=tuple(sorted(file_symbols[file_rel])),
+                semantic_tags=tuple(sorted(file_tags[file_rel])),
+            ))
+        return ContextPack(windows=tuple(merged_windows))
+
     def _safe_file(self, file_rel: str) -> Path | None:
+
         try:
             path = (self.project_root / file_rel).resolve()
             path.relative_to(self.project_root)
@@ -607,7 +841,36 @@ def _routes_from_result(result: RetrievalResult) -> tuple[str, ...]:
     return tuple(f"{file}:FILE:0-0" for file in result.files)
 
 
+def _find_enclosing_range_in_file(project_root: Path, file_rel: str, line_no: int) -> tuple[str, int, int] | None:
+    try:
+        path = (project_root / file_rel).resolve()
+        path.relative_to(project_root.resolve())
+        if not path.is_file() or path.suffix.casefold() != ".py":
+            return None
+        content = path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(content)
+        enclosing_node = None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                start = node.lineno
+                end = getattr(node, "end_lineno", start)
+                if start <= line_no <= end:
+                    if enclosing_node is None:
+                        enclosing_node = node
+                    else:
+                        curr_start = enclosing_node.lineno
+                        curr_end = getattr(enclosing_node, "end_lineno", curr_start)
+                        if (end - start) < (curr_end - curr_start):
+                            enclosing_node = node
+        if enclosing_node:
+            return enclosing_node.name, enclosing_node.lineno, getattr(enclosing_node, "end_lineno", enclosing_node.lineno)
+    except Exception:
+        pass
+    return None
+
+
 def _select_core_routes(
+    project_root: Path,
     routes: tuple[_ContextRoute, ...],
     index: dict[tuple[str, str, int, int], RetrievalSymbol],
     symbols: tuple[RetrievalSymbol, ...],
@@ -615,7 +878,7 @@ def _select_core_routes(
     """Pick at most two editable code anchors; DDL remains Layer-2 evidence."""
     selected: list[tuple[_ContextRoute, RetrievalSymbol | None]] = []
     seen_files: set[str] = set()
-    focus_files = {route.file for route in routes if route.exclusive and not route.is_file}
+    focus_files = dict.fromkeys(route.file for route in routes if route.exclusive and not route.is_file)
 
     def add(route: _ContextRoute, symbol: RetrievalSymbol | None) -> None:
         if route.file in seen_files or route.is_file or _is_soft_only(symbol, route):
@@ -623,8 +886,6 @@ def _select_core_routes(
         seen_files.add(route.file)
         selected.append((route, symbol))
 
-    # A focused embedded SQL statement should promote its enclosing function,
-    # not turn the statement itself into the editable core block.
     for file in focus_files:
         focused = [route for route in routes if route.file == file and route.exclusive]
         for route in focused:
@@ -644,9 +905,36 @@ def _select_core_routes(
                     is_file=False,
                 ), enclosing)
                 break
+            else:
+                res = _find_enclosing_range_in_file(project_root, route.file, route.start_line)
+                if res is not None:
+                    enc_name, enc_start, enc_end = res
+                    add(_ContextRoute(
+                        file=file,
+                        name=enc_name,
+                        start_line=enc_start,
+                        end_line=enc_end,
+                        exclusive=True,
+                        is_file=False,
+                    ), None)
+                    break
 
     for route in routes:
         symbol = index.get((route.file, route.name, route.start_line, route.end_line))
+        if symbol is None or _is_soft_only(symbol, route):
+            res = _find_enclosing_range_in_file(project_root, route.file, route.start_line)
+            if res is not None:
+                enc_name, enc_start, enc_end = res
+                promoted_route = _ContextRoute(
+                    file=route.file,
+                    name=enc_name,
+                    start_line=enc_start,
+                    end_line=enc_end,
+                    exclusive=route.exclusive,
+                    is_file=False,
+                )
+                add(promoted_route, None)
+                continue
         add(route, symbol)
     return selected
 
@@ -791,7 +1079,7 @@ def _parse_context_route(item: str) -> _ContextRoute | None:
     item, evidence = _split_evidence(item)
     try:
         file_and_name, line_range = item.rsplit(":", 1)
-        file_rel, name = file_and_name.rsplit(":", 1)
+        file_rel, name = file_and_name.split(":", 1)
         start_text, end_text = line_range.split("-", 1)
         start_line = int(start_text)
         end_line = int(end_text)
@@ -814,3 +1102,156 @@ def _split_evidence(item: str) -> tuple[str, str]:
             coordinate, evidence = item.split(marker, 1)
             return coordinate, f"{marker.strip()}{evidence}"
     return item, ""
+
+
+def _parse_file_ast(path: Path, lines: list[str]) -> ast.AST | None:
+    if path.suffix.casefold() != ".py":
+        return None
+    try:
+        return ast.parse("\n".join(lines))
+    except SyntaxError:
+        return None
+
+
+def _merged_semantic_header(
+    path: Path,
+    tree: ast.AST | None,
+    lines: list[str],
+    ranges: list[tuple[int, int]],
+) -> str:
+    """Return only imports whose bound names occur in target functions/classes spanning the merged ranges."""
+    if path.suffix.casefold() != ".py":
+        return "[SEMANTIC_HEADER] unavailable (non-Python source)"
+    if tree is None:
+        return "[SEMANTIC_HEADER] unavailable (parse error)"
+
+    target_starts = {start for start, end in ranges}
+    targets = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            if node.lineno in target_starts:
+                targets.append(node)
+
+    if not targets:
+        return "[SEMANTIC_HEADER] none"
+
+    used = set()
+    for target in targets:
+        used.update(node.id for node in ast.walk(target) if isinstance(node, ast.Name))
+
+    imports: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            bound = {alias.asname or alias.name.split(".", 1)[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            bound = {alias.asname or alias.name for alias in node.names}
+        else:
+            continue
+        if bound & used:
+            imports.append(f"{node.lineno}: {lines[node.lineno - 1]}")
+
+    return "[SEMANTIC_HEADER]\n" + ("\n".join(imports) or "none")
+
+
+def _resolve_route(
+    project_root: Path,
+    file_rel: str,
+    r: _ContextRoute,
+    index: dict[tuple[str, str, int, int], RetrievalSymbol],
+    symbols: tuple[RetrievalSymbol, ...],
+) -> tuple[str, _ContextRoute, RetrievalSymbol | None] | None:
+    if r.is_file:
+        return None
+
+    if r.exclusive:
+        # Check if enclosing symbol in symbols (not soft-only)
+        enclosing = next((
+            symbol for symbol in symbols
+            if symbol.file == file_rel
+            and not _is_soft_only(symbol, None)
+            and symbol.start_line <= r.start_line <= symbol.end_line
+        ), None)
+        if enclosing is not None:
+            return (
+                "core",
+                _ContextRoute(
+                    file=file_rel,
+                    name=enclosing.name,
+                    start_line=enclosing.start_line,
+                    end_line=enclosing.end_line,
+                    exclusive=True,
+                    is_file=False,
+                ),
+                enclosing
+            )
+        else:
+            # Check AST
+            res = _find_enclosing_range_in_file(project_root, file_rel, r.start_line)
+            if res is not None:
+                enc_name, enc_start, enc_end = res
+                return (
+                    "core",
+                    _ContextRoute(
+                        file=file_rel,
+                        name=enc_name,
+                        start_line=enc_start,
+                        end_line=enc_end,
+                        exclusive=True,
+                        is_file=False,
+                    ),
+                    None
+                )
+            else:
+                # Exclusive route that is soft-only or not in a Python file -> evidence
+                return ("evidence", r, None)
+    else:
+        # Non-exclusive route
+        sym = index.get((r.file, r.name, r.start_line, r.end_line))
+        if sym is None or _is_soft_only(sym, r):
+            res = _find_enclosing_range_in_file(project_root, r.file, r.start_line)
+            if res is not None:
+                enc_name, enc_start, enc_end = res
+                return (
+                    "core",
+                    _ContextRoute(
+                        file=r.file,
+                        name=enc_name,
+                        start_line=enc_start,
+                        end_line=enc_end,
+                        exclusive=r.exclusive,
+                        is_file=False,
+                    ),
+                    None
+                )
+            else:
+                # Soft-only or query route not in a Python file -> evidence
+                return ("evidence", r, sym)
+        else:
+            return ("core", r, sym)
+
+
+def _select_file_core_routes(
+    project_root: Path,
+    file_rel: str,
+    routes: list[_ContextRoute],
+    index: dict[tuple[str, str, int, int], RetrievalSymbol],
+    symbols: tuple[RetrievalSymbol, ...],
+) -> tuple[list[tuple[_ContextRoute, RetrievalSymbol | None]], list[tuple[_ContextRoute, RetrievalSymbol | None]]]:
+    """Pick core and evidence routes and symbols within a single file, processing all routes sequentially."""
+    core_resolved: list[tuple[_ContextRoute, RetrievalSymbol | None]] = []
+    evidence_resolved: list[tuple[_ContextRoute, RetrievalSymbol | None]] = []
+    seen_keys: set[tuple[str, str, int, int]] = set()
+
+    for r in routes:
+        res = _resolve_route(project_root, file_rel, r, index, symbols)
+        if res is not None:
+            kind, resolved_route, resolved_symbol = res
+            key = (resolved_route.file, resolved_route.name, resolved_route.start_line, resolved_route.end_line)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                if kind == "core":
+                    core_resolved.append((resolved_route, resolved_symbol))
+                else:
+                    evidence_resolved.append((resolved_route, resolved_symbol))
+                
+    return core_resolved, evidence_resolved

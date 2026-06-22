@@ -419,6 +419,9 @@ class REPLSession:
 
                 self._display_gate.render(self._renderer, event)
 
+                if not spinner_active and event.type not in {EventType.STREAM_END, EventType.FINAL_ANSWER}:
+                    _ensure_spinner(executor_spinner_msg)
+
             if not had_event:
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:

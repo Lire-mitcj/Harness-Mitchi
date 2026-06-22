@@ -40,6 +40,8 @@ class CursorState:
     decision_signatures: tuple[str, ...] = field(default_factory=tuple)
     retry_bias: int = 0
     decision_cost_total: float = 0.0
+    entropy_score: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+

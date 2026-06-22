@@ -1,10 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Literal, Any
 
 DecisionAction = Literal["edit", "answer", "ask_clarify"]
 ValidationDecision = Literal["commit", "rollback", "retry"]
+EventType = Literal["missing_info", "low_confidence", "runtime_error", "clarify_escape", "execution_success"]
+
+
+@dataclass(frozen=True, slots=True)
+class ControlEvent:
+    type: EventType
+    payload: dict[str, Any] = field(default_factory=dict)
+    severity: float = 0.0
+
 
 
 @dataclass(frozen=True, slots=True)

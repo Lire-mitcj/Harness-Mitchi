@@ -432,14 +432,73 @@ def _missing_patch_scope_symbols(
 
 
 def _patch_sql_fragments(patch_blocks: tuple[tuple[str, str], ...]) -> tuple[str, ...]:
+    import io
+    import textwrap
+    import tokenize
+
     fragments: list[str] = []
     for _search, replace in patch_blocks:
-        for match in _TRIPLE_STRING_RE.finditer(replace):
-            body = match.group("body")
-            if _SQL_RE.search(body):
-                fragments.append(body)
-        if not fragments and _SQL_RE.search(replace):
-            fragments.append(replace)
+        dedented = textwrap.dedent(replace)
+        try:
+            tree = ast.parse(dedented)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    if _SQL_RE.search(node.value):
+                        fragments.append(node.value)
+        except SyntaxError:
+            pass
+
+        if not fragments:
+            try:
+                tokens = []
+                gen = tokenize.generate_tokens(io.StringIO(dedented).readline)
+                while True:
+                    try:
+                        tok = next(gen)
+                        tokens.append(tok)
+                    except StopIteration:
+                        break
+                    except tokenize.TokenError:
+                        break
+                for tok in tokens:
+                    if tok.type in (tokenize.STRING, getattr(tokenize, "FSTRING_MIDDLE", -1)):
+                        val = tok.string
+                        if tok.type == getattr(tokenize, "FSTRING_MIDDLE", -1):
+                            if _SQL_RE.search(val):
+                                fragments.append(val)
+                        else:
+                            try:
+                                val_eval = ast.literal_eval(val)
+                                if isinstance(val_eval, str):
+                                    if _SQL_RE.search(val_eval):
+                                        fragments.append(val_eval)
+                            except Exception:
+                                match = re.search(r"['\"]", val)
+                                if match:
+                                    start_idx = match.start()
+                                    quote_char = val[start_idx]
+                                    if val[start_idx:].startswith(quote_char * 3):
+                                        body = val[start_idx + 3 : -3]
+                                    else:
+                                        body = val[start_idx + 1 : -1]
+                                    if _SQL_RE.search(body):
+                                        fragments.append(body)
+            except Exception:
+                pass
+
+        if not fragments:
+            for match in _TRIPLE_STRING_RE.finditer(replace):
+                body = match.group("body")
+                if _SQL_RE.search(body):
+                    fragments.append(body)
+            if not fragments:
+                string_re = re.compile(r'(?P<quote>[\'"])(?P<body>.*?)(?P=quote)', re.DOTALL)
+                for match in string_re.finditer(replace):
+                    body = match.group("body")
+                    if _SQL_RE.search(body):
+                        fragments.append(body)
+            if not fragments and _SQL_RE.search(replace):
+                fragments.append(replace)
     return tuple(fragments)
 
 
@@ -714,19 +773,27 @@ def _validation_error(
 ) -> str:
     if decision == "commit":
         return ""
-    if decision == "rollback":
+    if not ast_result.get("pass"):
         raw_issues = ast_result.get("issues", [])
         issues = raw_issues if isinstance(raw_issues, list) else []
         return "AST validation failed: " + ", ".join(
             str(item) for item in issues
         )
     if not semantic_result.get("pass"):
+        details = semantic_result.get("details", {})
+        schema_issues = details.get("schema", {}).get("issues", [])
+        issues = schema_issues if isinstance(schema_issues, list) else []
+        if issues:
+            return "Schema validation failed: " + ", ".join(str(item) for item in issues)
         return "Schema validation failed: " + json.dumps(
-            semantic_result.get("details", {}),
+            details,
             ensure_ascii=False,
             sort_keys=True,
         )
-    return ""
+    if not execution_result.get("pass"):
+        err = execution_result.get("error", "test suite failed")
+        return f"Execution validation failed: {err}"
+    return "Validation failed"
 
 
 def _execution_status(output: str, returncode: int) -> str:

@@ -24,7 +24,9 @@ class CursorStateManager:
             current_step=1,
             max_steps=max_steps,
             stage_completion=0.0,
+            entropy_score=0.0,
         ))
+
 
     def after_execution(
         self,
@@ -163,14 +165,60 @@ class CursorStateManager:
             status="running",
         ))
 
-    def mark_retry(self, state: CursorState) -> CursorState:
+    def mark_retry(self, state: CursorState, clarification: str = "") -> CursorState:
         """Advance a loop-only retry without converting clarify into edit."""
         next_step = state.current_step + 1
+        observation = state.last_observation
+        if clarification:
+            observation = (
+                f"Clarification requested: '{clarification}'. "
+                f"However, since grounded context is already available, "
+                f"please use the 'research' action to search for missing symbols, "
+                f"or perform 'edit' on the current context."
+            )
         return self._bounded(replace(
             state,
+            last_observation=observation,
             current_step=next_step,
             status="failed" if next_step > state.max_steps else "running",
         ))
+
+    def observe_failure_signature(
+        self,
+        state: CursorState,
+        action: str,
+        file: str,
+        error_type: str,
+    ) -> CursorState:
+        increase = 1.0
+        if error_type == "missing_info_signal":
+            increase = 0.8
+        elif "syntax" in str(error_type).lower():
+            increase = 1.5
+
+        from src.agent.cursor_state import ExecutionTrace
+        traces = state.execution_traces + (ExecutionTrace(
+            step=state.current_step,
+            target_file=file,
+            exception_type=error_type,
+            error_msg=f"Failure observed: {action} on {file} with type {error_type}",
+        ),)
+
+        observation = f"Failure signature observed - action: {action}, file: {file}, error: {error_type}."
+        return self._bounded(replace(
+            state,
+            entropy_score=round(state.entropy_score + increase, 4),
+            last_observation=observation,
+            execution_traces=traces,
+        ))
+
+    def apply_time_decay(self, state: CursorState) -> CursorState:
+        decayed_entropy = round(state.entropy_score * 0.9, 4)
+        return self._bounded(replace(
+            state,
+            entropy_score=decayed_entropy,
+        ))
+
 
     def succeeded(self, state: CursorState, observation: str = "answered") -> CursorState:
         return self._bounded(replace(
@@ -223,7 +271,9 @@ class CursorStateManager:
             f"Loop Progress: Step {state.current_step} / {state.max_steps}\n"
             f"Completion   : {int(state.stage_completion * 100)}%\n"
             f"Decision Stats: retry_bias={state.retry_bias}, "
-            f"soft_cost={state.decision_cost_total:.1f}\n"
+            f"soft_cost={state.decision_cost_total:.1f}, "
+            f"entropy={state.entropy_score:.2f}\n"
+
             f"Prior Patch  : {patch_summary}\n"
             "--- LAST RUNTIME OBSERVATION ---\n"
             f"{obs_trimmed.strip()}\n"

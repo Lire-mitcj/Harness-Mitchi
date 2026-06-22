@@ -66,19 +66,26 @@ class CursorRetriever:
     ) -> RetrievalResult:
         import math
         from collections import Counter
-        token_counts: Counter[str] = Counter()
-        if self.repo_map is not None:
-            try:
-                rm = getattr(self.repo_map, "map", None)
-                if rm is not None:
-                    rm_symbols = list(
-                        getattr(rm, "all_symbols", None)
-                        or getattr(rm, "symbols", [])
-                    )
-                    for sym in rm_symbols:
-                        token_counts.update(_tokens(sym.name))
-            except Exception:
-                pass
+        if not hasattr(self, "_cached_token_counts"):
+            self._cached_token_counts = None
+
+        if self._cached_token_counts is not None:
+            token_counts = self._cached_token_counts
+        else:
+            token_counts = Counter()
+            if self.repo_map is not None:
+                try:
+                    rm = getattr(self.repo_map, "map", None)
+                    if rm is not None:
+                        rm_symbols = list(
+                            getattr(rm, "all_symbols", None)
+                            or getattr(rm, "symbols", [])
+                        )
+                        for sym in rm_symbols:
+                            token_counts.update(_tokens(sym.name))
+                        self._cached_token_counts = token_counts
+                except Exception:
+                    pass
 
         candidate_by_id = {
             self._symbol_id(candidate.symbol): candidate

@@ -47,6 +47,7 @@ def _settings(tmp_path: Path, **overrides: object) -> MitKIISettings:
     values: dict[str, object] = {
         "data_dir": tmp_path / ".mitkii",
         "cursor_evaluation_dir": tmp_path / "eval_json",
+        "cursor_evaluation_case_file": None,
         "cursor_inter_enabled": False,
         "cursor_semantic_tags_enabled": False,
         "cursor_max_steps": 3,
@@ -132,8 +133,9 @@ def test_state_manager_is_bounded_and_cumulative() -> None:
     assert set(state.to_dict()) == {
         "task", "current_file", "last_patch", "last_observation", "status",
         "current_step", "max_steps", "stage_completion", "execution_traces", "patch_memory",
-        "decision_signatures", "retry_bias", "decision_cost_total",
+        "decision_signatures", "retry_bias", "decision_cost_total", "entropy_score",
     }
+
     assert len(state.patch_memory) == 20
     assert len(state.execution_traces) == 20
 
@@ -842,7 +844,7 @@ async def test_loop_applies_patch_and_validates(tmp_path: Path) -> None:
     assert payload["layer2"]["code_diff_correctness"] == 1.0
     assert payload["layer2"]["task_passed"] is True
     event_text = "\n".join(str(event.content or "") for event in events)
-    assert "[Evaluation] Layer 1 retrieval metrics" in event_text
+    assert "[Evaluation] Layer 1 unavailable: no RetrievalTestCase GT is bound." in event_text
     assert "LAYER 2: TASK SUCCESS METRICS" in event_text
     assert "Patch Correctness" in event_text
 
@@ -896,6 +898,64 @@ async def test_loop_blocks_decision_when_layer1_recall_is_incomplete(
         and event.content == "Layer 1 retrieval recall below CI threshold"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_loop_binds_gt_and_records_real_fusion_trace(tmp_path: Path) -> None:
+    from src.agent.cursor_evaluator import RetrievalTestCase
+
+    (tmp_path / "sample.py").write_text("value = 1\n", encoding="utf-8")
+    loop = _loop_with_context(
+        tmp_path,
+        SimpleNamespace(
+            file_tracker=None,
+            repo_map_service=None,
+            evaluation_test_case=RetrievalTestCase(
+                name="sample-retrieval",
+                ground_truth=("sample.py",),
+            ),
+        ),
+        cursor_reranker_enabled=False,
+    )
+    loop.retriever.retrieve = AsyncMock(
+        return_value=RetrievalResult(files=("sample.py",))
+    )
+    loop.llm.chat = AsyncMock(
+        return_value=_decision_response(Decision(action="answer", answer="done"))
+    )
+
+    events = [event async for event in loop.run("explain sample")]
+
+    assert loop.eval_harness is not None
+    assert len(loop.eval_harness.traces) == 1
+    trace = loop.eval_harness.traces[0]
+    assert trace.retrieved == ("sample.py",)
+    assert trace.fused_files == ("sample.py",)
+    assert loop.eval_harness.evaluate().recall == 1.0
+    assert any("GT-bound cumulative trace" in str(event.content) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_loop_loads_evaluation_case_from_settings(tmp_path: Path) -> None:
+    case_file = tmp_path / "retrieval_test_case.json"
+    case_file.write_text(
+        '{"name":"other-case","ground_truth":["other.py"]}\n'
+        '{"name":"configured-case","ground_truth":["sample.py"]}\n',
+        encoding="utf-8",
+    )
+
+    loop = _loop(
+        tmp_path,
+        cursor_evaluation_case_file=case_file,
+        cursor_evaluation_case_name="configured-case",
+    )
+
+    assert loop.eval_harness is None
+    await loop._ensure_evaluation_case()
+
+    assert loop.eval_harness is not None
+    assert loop.eval_harness.test_case.name == "configured-case"
+    assert loop.eval_harness.test_case.ground_truth == ("sample.py",)
 
 
 @pytest.mark.asyncio
@@ -1765,11 +1825,14 @@ def test_context_builder_uses_focus_highlight_and_semantic_windows(
     assert len(pack.windows) == 1
     focus_window = pack.windows[0]
     assert focus_window.start_line == 30
-    assert focus_window.end_line == 31
+    assert focus_window.end_line == 52
     assert "[LAYER_1_CORE_SYMBOL]" in focus_window.content
     assert "31:     return 'focus'" in focus_window.content
-    assert "secret_body" not in focus_window.content
+    assert "secret_body" in focus_window.content
     assert "50: def secondary():" in focus_window.content
+    assert focus_window.content.count("[LAYER_3_GLOBAL_SKELETON]") == 1
+    assert focus_window.content.count("[LAYER_1_CORE_SYMBOL]") == 1
+    assert focus_window.content.count("INTERVAL_CHUNK RANGE") == 2
 
 
 def test_context_builder_merges_ast_neighborhood_ranges(tmp_path: Path) -> None:
@@ -2461,3 +2524,112 @@ def test_dynamic_context_budget() -> None:
     assert builder.max_chars_per_file == 16 * 1024
     builder.adjust_budget(None)
     assert builder.max_chars_per_file == 16 * 1024
+
+
+def test_patch_sql_fragments_escaped_quotes_and_comments() -> None:
+    from src.agent.cursor_validator import _patch_sql_fragments
+
+    # Test case 1: single quotes with comments and other python single quotes
+    replace_1 = """
+        # Let's run it
+        res = conn.execute(
+            text('SELECT COUNT(*) AS cnt FROM ticket_order WHERE name = \\'John\\'')
+        )
+        passenger.mappings()
+    """
+    fragments_1 = _patch_sql_fragments((("", replace_1),))
+    assert len(fragments_1) == 1
+    assert fragments_1[0] == "SELECT COUNT(*) AS cnt FROM ticket_order WHERE name = 'John'"
+
+    # Test case 2: double quotes with method calls
+    replace_2 = """
+        res = conn.execute(
+            text("SELECT COUNT(*) AS cnt FROM ticket_order ")
+        )
+        passenger.mappings()
+    """
+    fragments_2 = _patch_sql_fragments((("", replace_2),))
+    assert len(fragments_2) == 1
+    assert fragments_2[0] == "SELECT COUNT(*) AS cnt FROM ticket_order "
+
+    # Test case 3: f-string SQL parts
+    replace_3 = """
+        query = f"SELECT * FROM passenger WHERE id = {passenger_id}"
+    """
+    fragments_3 = _patch_sql_fragments((("", replace_3),))
+    assert len(fragments_3) == 1
+    assert "SELECT * FROM passenger WHERE id = " in fragments_3[0]
+
+
+def test_parse_context_route_nested_colons_and_enclosing_range(tmp_path: Path) -> None:
+    from src.agent.cursor_context_pack_builder import _parse_context_route, _select_core_routes
+    from src.agent.cursor_contracts import RetrievalSymbol
+    import sys
+
+    # Create dummy files
+    service_dir = tmp_path / "service"
+    service_dir.mkdir()
+    (service_dir / "boarding.py").write_text(
+        "def query_boarding_pass():\n"
+        "    return fetch_ticket()\n",
+        encoding="utf-8",
+    )
+
+    # Test route parsing with nested colons
+    item = "FOCUS:service/boarding.py:query_boarding_pass:SELECT:ticket_order:1-2"
+    route = _parse_context_route(item)
+    assert route is not None
+    assert route.file == "service/boarding.py"
+    assert route.name == "query_boarding_pass:SELECT:ticket_order"
+    assert route.start_line == 1
+    assert route.end_line == 2
+
+    # Test enclosing range promotion fallback using AST
+    symbols = ()
+    index = {}
+    routes = (route,)
+    core_routes = _select_core_routes(tmp_path, routes, index, symbols)
+    assert len(core_routes) == 1
+    promoted_route, enclosing_sym = core_routes[0]
+    assert promoted_route.file == "service/boarding.py"
+    assert promoted_route.name == "query_boarding_pass"
+    assert promoted_route.start_line == 1
+    assert promoted_route.end_line == 2
+
+
+@pytest.mark.asyncio
+async def test_clarify_escape_dynamic_seed_extraction() -> None:
+    from src.agent.cursor_controller import ReactiveController
+    from types import SimpleNamespace
+
+    # Mock GraphEngine compile dependency subgraph
+    called_seed = None
+    async def mock_compile(seed, depth=2):
+        nonlocal called_seed
+        called_seed = seed
+        return SimpleNamespace(retrieval=SimpleNamespace(symbols=[], files=[]))
+
+    controller = ReactiveController(
+        graph_engine=SimpleNamespace(compile_dependency_subgraph=mock_compile),
+        context_builder=SimpleNamespace(merge_interval_subgraph=lambda cp, r: cp),
+        state_manager=SimpleNamespace(
+            observe_failure_signature=lambda s, **kw: s,
+            mark_retry=lambda s, c: s,
+            apply_time_decay=lambda s: s
+        )
+    )
+
+    # Payload has clarification asking for archive_passenger
+    payload = {"clarification": "Please provide the complete code for archive_passenger function."}
+    state = SimpleNamespace(task="并发优化 archive_passenger 接口")
+
+    updated_cp, next_state, handler_skip = await controller._handle_clarify_escape(
+        payload=payload,
+        severity=0.7,
+        context_pack="mock_cp",
+        state=state
+    )
+
+    # Inferred seed should be extracted from clarification text/task
+    assert called_seed == "archive_passenger"
+    assert handler_skip is True

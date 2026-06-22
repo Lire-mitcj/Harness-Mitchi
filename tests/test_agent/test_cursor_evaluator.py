@@ -6,7 +6,17 @@ from pathlib import Path
 import pytest
 
 from src.agent.cursor_contracts import ValidationResult
-from src.agent.cursor_evaluator import CursorEvaluator, compute_layer1_metrics
+from src.agent.cursor_evaluator import (
+    CursorEvalHarnessV2,
+    CursorEvaluator,
+    FullPipelineMetrics,
+    RetrievalTestCase,
+    RetrievalTestCaseLoader,
+    RetrievalTrace,
+    compute_layer1_metrics,
+    format_bi_report,
+    resolve_cursor_eval_path,
+)
 from src.agent.cursor_executor import CursorExecutor
 from src.agent.cursor_patch_applier import CursorPatchApplier
 from src.agent.cursor_validator import CursorValidator
@@ -137,7 +147,103 @@ async def test_executor_metrics_success_commits_and_evaluator_persists(
 def test_layer1_metrics_without_oracle_records_retrieved_only() -> None:
     metrics = compute_layer1_metrics(("a.py:foo:1-2",))
 
+    assert metrics.available is False
     assert metrics.precision == 0.0
     assert metrics.recall == 0.0
     assert metrics.retrieved == ("a.py:foo:1-2",)
     assert metrics.expected == ()
+
+
+def test_cursor_evaluator_maps_windows_output_path_under_wsl() -> None:
+    assert resolve_cursor_eval_path(Path(r"D:\eval_json")) == Path("/mnt/d/eval_json")
+    assert resolve_cursor_eval_path(Path(r"D:\eval_json\cases.jsonl")) == Path(
+        "/mnt/d/eval_json/cases.jsonl"
+    )
+    assert resolve_cursor_eval_path("D:eval_jsonretrieval_test_cases.jsonl") == Path(
+        "/mnt/d/eval_json/cases/retrieval_test_cases.jsonl"
+    )
+
+
+def test_bi_report_marks_layer1_unavailable_without_ground_truth() -> None:
+    metrics = FullPipelineMetrics(step=1, target_file="sample.py")
+
+    report = format_bi_report(metrics)
+
+    assert "Precision : N/A (ground truth unavailable)" in report
+    assert "Recall    : N/A (ground truth unavailable)" in report
+
+
+def test_v2_evaluator_uses_bound_gt_and_cumulative_fusion_trace() -> None:
+    harness = CursorEvalHarnessV2(RetrievalTestCase(
+        name="passenger-n-plus-one",
+        ground_truth=("api/list.py", "db/schema.sql"),
+    ))
+    harness.add_trace(RetrievalTrace(
+        step=1,
+        retrieved=("api/list.py",),
+        fused_files=("api/list.py", "noise.py"),
+    ))
+    harness.add_trace(RetrievalTrace(
+        step=2,
+        retrieved=("db/schema.sql",),
+        fused_files=("db/schema.sql",),
+    ))
+
+    metrics = harness.evaluate()
+
+    assert metrics.expected == ("api/list.py", "db/schema.sql")
+    assert metrics.retrieved == ("api/list.py", "noise.py", "db/schema.sql")
+    assert metrics.hits == ("api/list.py", "db/schema.sql")
+    assert metrics.precision == 0.6667
+    assert metrics.recall == 1.0
+    assert metrics.f1_score == 0.8
+
+
+def test_v2_evaluator_rejects_empty_ground_truth() -> None:
+    with pytest.raises(ValueError, match="GT cannot be empty"):
+        CursorEvalHarnessV2(RetrievalTestCase(name="invalid", ground_truth=()))
+
+
+def test_v2_test_case_loader_requires_explicit_ground_truth(tmp_path: Path) -> None:
+    path = tmp_path / "case.json"
+    path.write_text(
+        '{"name":"case","ground_truth":["api.py"],"description":"fixture"}',
+        encoding="utf-8",
+    )
+
+    case = RetrievalTestCaseLoader.load_json(path)
+
+    assert case.name == "case"
+    assert case.ground_truth == ("api.py",)
+
+
+def test_v2_test_case_loader_selects_named_case_from_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "cases.jsonl"
+    path.write_text(
+        '{"name":"first","ground_truth":["first.py"]}\n'
+        '{"name":"second","ground_truth":["second.py","schema.sql"]}\n',
+        encoding="utf-8",
+    )
+
+    case = RetrievalTestCaseLoader.load_case(path, "second")
+
+    assert case.name == "second"
+    assert case.ground_truth == ("second.py", "schema.sql")
+    with pytest.raises(ValueError, match="set case_name"):
+        RetrievalTestCaseLoader.load_case(path)
+
+
+def test_v2_test_case_loader_auto_selects_unique_name_match(tmp_path: Path) -> None:
+    path = tmp_path / "cases.jsonl"
+    path.write_text(
+        '{"name":"passenger-list-sensitive-fields","ground_truth":["list.py"]}\n'
+        '{"name":"order-view-migration","ground_truth":["main.py"]}\n',
+        encoding="utf-8",
+    )
+
+    case = RetrievalTestCaseLoader.select_case(
+        path,
+        ("passenger", "list", "sensitive", "fields"),
+    )
+
+    assert case.name == "passenger-list-sensitive-fields"
