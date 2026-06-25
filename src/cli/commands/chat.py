@@ -14,7 +14,6 @@ from src.cli.renderer import CLIRenderer
 from src.cli.repl import REPLSession
 from src.cli.theme import get_theme
 from src.config.settings import get_settings
-from src.orchestrator.orchestrator import OrchestratorLoop
 from src.runtime.session_factory import MitKIISession, create_mitkii_session
 
 
@@ -22,14 +21,8 @@ class AgentLoopAdapter:
     """Adapter exposing run_turn/get_state expected by REPLSession."""
 
     def __init__(self, session: MitKIISession) -> None:
-        self._orchestrator_loop = OrchestratorLoop(
-            llm=session.llm,
-            tools=session.tools,
-            harness=session.harness,
-            context=session.context_builder,
-            permissions=session.permissions,
-            settings=session.settings,
-        )
+        self.session = session
+        self.settings = session.settings
         self._cursor_loop = CursorLoop(
             llm=session.cursor_decision_llm,
             inter_llm=session.cursor_inter_llm,
@@ -40,15 +33,21 @@ class AgentLoopAdapter:
             permissions=session.permissions,
             settings=session.settings,
         )
-        self._current_loop: CursorLoop | OrchestratorLoop = self._cursor_loop
-
-    async def run_turn_stream(self, user_input: str) -> AsyncIterator[AgentEvent]:
-        stripped = user_input.strip().lower()
-        if stripped.startswith("/plan ") or stripped.startswith("/plan:"):
-            self._current_loop = self._orchestrator_loop
+        if self.settings.mitkii_mode == "assembled":
+            from src.agent.state_assembled_loop import StateAssembledLoop
+            self._assembled_loop = StateAssembledLoop(
+                llm=session.llm,
+                tools=session.tools,
+                harness=session.harness,
+                context=session.context_builder,
+                permissions=session.permissions,
+                settings=session.settings,
+            )
+            self._current_loop = self._assembled_loop
         else:
             self._current_loop = self._cursor_loop
 
+    async def run_turn_stream(self, user_input: str) -> AsyncIterator[AgentEvent]:
         async for event in self._current_loop.run(user_input):
             yield event
 
@@ -87,17 +86,17 @@ def run_chat(session_id: str | None = None, project_path: Path | None = None) ->
     if session.repo_map_service is not None:
         console.print("[dim]Repo map building in background (ctags/parser + PageRank)...[/]")
 
-    mode_label = "CursorLoop (/plan -> Orchestrator)"
+    mode_label = f"Mode: {settings.mitkii_mode}"
     console.print(f"[dim]MitKII mode: {mode_label}[/]")
     console.print(f"[dim]Project root: {session.project_root}[/]")
-    if settings.orchestrator_mode:
+    if settings.mitkii_mode == "assembled":
         console.print(
-            f"[dim]Planner: {settings.effective_planner_model} | "
-            f"Executor: {settings.model}[/]"
+            f"[dim]Coordinating LLM: {settings.model} | "
+            f"Decision LLM: {settings.cursor_decision_model}[/]"
         )
         console.print(
-            "[dim]Tip: /plan skips Scout; Planner picks subtask kinds - "
-            "read/grep happen inside each step[/]"
+            "[dim]Tip: codebase_retrieve and decision_edit will run dynamically "
+            "based on coordinate state.[/]"
         )
 
     agent_loop = AgentLoopAdapter(session)

@@ -70,7 +70,7 @@ class ContextSearchTool(Tool):
             search_query=query,
             search_paths=tuple(paths),
         )
-        output = result.metadata.get("search_output", result.summary)
+        output = result.metadata.get("search_summary", result.metadata.get("search_output", result.summary))
         if not result.success:
             return ToolResult(success=False, output=output, error=result.summary)
         return ToolResult(success=True, output=output)

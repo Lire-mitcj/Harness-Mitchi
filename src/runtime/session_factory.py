@@ -33,8 +33,18 @@ class MitKIISession:
     cursor_inter_llm: LLMClient
     cursor_decision_llm: LLMClient
 
-    def create_core_loop(self) -> CursorLoop:
-        """Create the default non-/plan runtime used by SDK-style callers."""
+    def create_core_loop(self) -> Any:
+        """Create the core loop driver based on the configured mitkii_mode."""
+        if self.settings.mitkii_mode == "assembled":
+            from src.agent.state_assembled_loop import StateAssembledLoop
+            return StateAssembledLoop(
+                llm=self.llm,
+                tools=self.tools,
+                harness=self.harness,
+                context=self.context_builder,
+                permissions=self.permissions,
+                settings=self.settings,
+            )
         return CursorLoop(
             llm=self.cursor_decision_llm,
             inter_llm=self.cursor_inter_llm,
@@ -97,6 +107,29 @@ def create_mitkii_session(
     llm = create_llm(settings.model)
     cursor_inter_llm = create_llm(settings.cursor_inter_model)
     cursor_decision_llm = create_llm(settings.cursor_decision_model)
+
+    from src.tools.assembled.codebase_retrieve import CodebaseRetrieveTool
+    from src.tools.assembled.decision_edit import DecisionEditTool
+
+    tools.register(
+        CodebaseRetrieveTool(
+            project_root=root,
+            settings=settings,
+            repo_map=repo_map_service,
+            decision_llm=cursor_decision_llm,
+            inter_llm=cursor_inter_llm,
+            harness=harness,
+            tools=tools,
+        )
+    )
+    tools.register(
+        DecisionEditTool(
+            project_root=root,
+            settings=settings,
+            decision_llm=cursor_decision_llm,
+            harness=harness,
+        )
+    )
 
     return MitKIISession(
         project_root=root,

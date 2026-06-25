@@ -110,6 +110,10 @@ class CodeEditSkill:
         instruction = str(kwargs.get("instruction") or context.user_request).strip()
         evidence = str(kwargs.get("search_output") or "").strip()
         if not evidence:
+            # Fallback to in-memory search cache passed in kwargs
+            search_cache = kwargs.get("_search_cache") or {}
+            evidence = search_cache.get("search_output") or ""
+        if not evidence:
             return SkillResult(
                 success=False,
                 summary="code_edit requires search_output evidence.",

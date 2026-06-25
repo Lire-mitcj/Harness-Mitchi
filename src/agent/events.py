@@ -152,3 +152,55 @@ def cost_event(
             "cost": cost,
         },
     )
+
+
+def get_tool_status_text(name: str, arguments: dict[str, Any]) -> str:
+    """Map tool name and arguments to a user-friendly Chinese progress message."""
+    match name:
+        case "codebase_retrieve":
+            query = arguments.get("query", "")
+            return f"正在检索代码库: {query}…" if query else "正在检索代码库…"
+        case "decision_edit":
+            target = arguments.get("target_file", "")
+            return f"正在编辑文件: {target}…" if target else "正在编辑文件…"
+        case "read_file":
+            path = arguments.get("path", "")
+            return f"正在读取文件: {path}…" if path else "正在读取文件…"
+        case "read_files":
+            paths = arguments.get("paths", [])
+            if isinstance(paths, list) and len(paths) == 1:
+                return f"正在读取文件: {paths[0]}…"
+            return "正在读取多个文件…"
+        case "write_file":
+            path = arguments.get("path", "")
+            return f"正在写入文件: {path}…" if path else "正在写入文件…"
+        case "edit_file":
+            path = arguments.get("path", "")
+            return f"正在修改文件: {path}…" if path else "正在修改文件…"
+        case "delete_file":
+            path = arguments.get("path", "")
+            return f"正在删除文件: {path}…" if path else "正在删除文件…"
+        case "grep_search":
+            query = arguments.get("query", "")
+            return f"正在搜索代码: {query}…" if query else "正在搜索代码…"
+        case "glob_files":
+            pattern = arguments.get("pattern", "")
+            return f"正在匹配文件模式: {pattern}…" if pattern else "正在搜索文件…"
+        case "shell_exec":
+            cmd = arguments.get("command", "")
+            if len(cmd) > 40:
+                cmd = cmd[:37] + "..."
+            return f"正在执行命令: {cmd}…" if cmd else "正在执行命令…"
+        case "git_status":
+            return "正在获取 Git 状态…"
+        case "git_commit":
+            return "正在提交 Git 变更…"
+        case "git_stash":
+            return "正在保存 Git 暂存…"
+        case "map_search":
+            return "正在搜索代码图…"
+        case "context_search":
+            return "正在搜索上下文…"
+        case _:
+            return f"正在运行工具 {name}…"
+

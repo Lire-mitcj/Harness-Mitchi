@@ -4,13 +4,10 @@ import re
 from pathlib import Path
 from typing import Any
 
-from src.planner.task_tree import SubTaskNode
-
-
 def normalize_grep_search_args(
     arguments: dict[str, Any],
     *,
-    subtask: SubTaskNode | None = None,
+    subtask: Any = None,
     hint_text: str = "",
 ) -> dict[str, Any]:
     """Fill missing grep_search.pattern so small models cannot brick the tool call."""

@@ -22,14 +22,7 @@ from src.harness.sandbox.executor import SandboxExecutor
 from src.harness.sandbox.file_guard import FileGuard
 from src.harness.sandbox.resource_limit import ResourceLimiter
 from src.harness.scorer.engine import ScoringEngine
-from src.harness.subtask.context_pipeline import (
-    ContextPipelineResult,
-    ExecutorContextConfig,
-    ExecutorContextSession,
-    ExecutorRuntimeState,
-)
-from src.harness.subtask.handoff import SubtaskHandoffBundle, prepare_executor_handoff
-from src.harness.subtask.session_memory import ExploreSessionMemory
+
 
 log = logging.getLogger(__name__)
 
@@ -90,41 +83,7 @@ class HarnessEngine:
     async def before_llm_call(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return await self.probe.before_call(messages)
 
-    async def before_executor_llm_call(
-        self,
-        session: ExecutorContextSession,
-        messages: list[Message],
-        error_trace: list[str],
-    ) -> tuple[list[dict[str, Any]], ContextPipelineResult]:
-        """Unified context pipeline: digest compact/fold, then probe trim."""
-        cp = session.prepare_before_llm(messages, error_trace)
-        msg_dicts = [m.to_dict() for m in cp.messages]
-        if cp.token_est is not None and cp.token_est <= self.probe.budget:
-            return msg_dicts, cp
-        trimmed = await self.probe.before_call(msg_dicts)
-        return trimmed, cp
 
-    async def after_executor_tool_round(
-        self,
-        session: ExecutorContextSession,
-        messages: list[Message],
-        error_trace: list[str],
-        *,
-        explore_used: bool,
-        explore_ok: bool,
-    ) -> ContextPipelineResult:
-        import asyncio
-        import functools
-
-        return await asyncio.to_thread(
-            functools.partial(
-                session.after_tool_round,
-                messages,
-                error_trace,
-                explore_used=explore_used,
-                explore_ok=explore_ok,
-            )
-        )
 
     async def after_llm_call(self, response: Any, usage: Any) -> None:
         await self.probe.after_call(response, usage)

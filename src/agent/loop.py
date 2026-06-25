@@ -16,6 +16,7 @@ from src.agent.events import (
     thinking_event,
     tool_call_event,
     tool_result_event,
+    get_tool_status_text,
 )
 from src.agent.framework_guard import (
     blocked_framework_browse,
@@ -152,13 +153,18 @@ class AgentLoop:
                 },
             )
 
-            async for chunk in self._stream_llm(trimmed, tool_schemas):
-                if chunk.get("type") == "content":
-                    delta = chunk.get("content", "")
-                    response_text += delta
-                    yield thinking_event(delta)
-                elif chunk.get("type") == "response":
-                    response = chunk["response"]
+            self.harness.phase_metrics.start("core_llm", subtask_id=str(self.state.turn_count))
+            try:
+                async for chunk in self._stream_llm(trimmed, tool_schemas):
+                    if chunk.get("type") == "content":
+                        delta = chunk.get("content", "")
+                        response_text += delta
+                        yield thinking_event(delta)
+                    elif chunk.get("type") == "response":
+                        response = chunk["response"]
+            finally:
+                verdict = "ok" if response is not None and response.model != "error" else "error"
+                self.harness.phase_metrics.end("core_llm", subtask_id=str(self.state.turn_count), verdict=verdict)
 
             if response is None:
                 yield error_event("LLM returned no response")
@@ -445,7 +451,41 @@ class AgentLoop:
                     )
                     continue
 
-            result = await self.tools.call(tc.name, tc.arguments)
+            # Yield dynamic thinking / loading status for this tool
+            yield AgentEvent(
+                type=EventType.STATUS,
+                content=get_tool_status_text(tc.name, tc.arguments),
+                data={"spinner_only": True, "phase": "executor"},
+            )
+
+            tool_args = dict(tc.arguments)
+            if hasattr(self.state, "search_cache") and self.state.search_cache:
+                tool_args["_search_cache"] = self.state.search_cache
+
+            self.harness.phase_metrics.start(f"tool_{tc.name}", subtask_id=str(self.state.turn_count))
+            success = False
+            try:
+                result = await self.tools.call(tc.name, tool_args)
+                success = result.success
+            except Exception as exc:
+                success = False
+                raise
+            finally:
+                self.harness.phase_metrics.end(
+                    f"tool_{tc.name}",
+                    subtask_id=str(self.state.turn_count),
+                    verdict="success" if success else "fail",
+                )
+
+            if result.success and result.metadata and hasattr(self.state, "search_cache"):
+                merged_cache = dict(self.state.search_cache)
+                if "search_output" in result.metadata:
+                    merged_cache["search_output"] = result.metadata["search_output"]
+                if "edit_context" in result.metadata:
+                    merged_cache["edit_context"] = result.metadata["edit_context"]
+                if "snippets" in result.metadata:
+                    merged_cache["snippets"] = result.metadata["snippets"]
+                self.state.search_cache = merged_cache
 
             if tc.name == "shell_exec":
                 cmd = tc.arguments.get("command")

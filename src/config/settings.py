@@ -4,6 +4,14 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import load_dotenv
+# Load package-level fallback env first
+package_env = Path(__file__).resolve().parent.parent.parent / ".env"
+if package_env.exists():
+    load_dotenv(dotenv_path=package_env)
+# Load current working directory env overriding package env
+load_dotenv(override=True)
+
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
@@ -165,11 +173,19 @@ class MitKIISettings(BaseSettings):
     )
 
     # --- Orchestrator (Planner-driven ReAct) ----------------------------------
+    mitkii_mode: str = Field(
+        default="cursor",
+        validation_alias="mitkii_mode",
+        description=(
+            "Mode of operation: 'cursor' (legacy loop), 'orchestrator' (DAG planner), "
+            "or 'assembled' (new state-assembled loop)."
+        ),
+    )
     orchestrator_mode: bool = Field(
         default=True,
         description=(
             "Use Planner → Executor orchestrator (recommended). "
-            "Set false for legacy ReAct."
+            "Set false for legacy ReAct. Deprecated: use mitkii_mode instead."
         ),
     )
     orchestrator_executor_max_turns: int = Field(default=5, ge=1, le=15)
@@ -412,7 +428,7 @@ class MitKIISettings(BaseSettings):
 
     model_config = {
         "env_prefix": "MITKII_",
-        "env_file": ".env",
+        "env_file": (str(Path(__file__).resolve().parent.parent.parent / ".env"), ".env"),
         "env_file_encoding": "utf-8",
         "extra": "ignore",
     }

@@ -35,15 +35,22 @@ class _FakeCursor(_FakeLoop):
     pass
 
 
-class _FakeOrchestrator(_FakeLoop):
+class _FakeAssembled(_FakeLoop):
     pass
 
 
 @pytest.mark.asyncio
-async def test_adapter_routes_default_to_cursor_and_plan_to_orchestrator(monkeypatch) -> None:
+async def test_adapter_routes_by_mode(monkeypatch) -> None:
     monkeypatch.setattr(chat, "CursorLoop", _FakeCursor)
-    monkeypatch.setattr(chat, "OrchestratorLoop", _FakeOrchestrator)
-    session = SimpleNamespace(
+    
+    # Mock StateAssembledLoop within src.agent.state_assembled_loop
+    import sys
+    mock_module = MagicMock()
+    mock_module.StateAssembledLoop = _FakeAssembled
+    sys.modules["src.agent.state_assembled_loop"] = mock_module
+
+    # Test cursor mode
+    session_cursor = SimpleNamespace(
         llm=MagicMock(),
         cursor_inter_llm=MagicMock(),
         cursor_decision_llm=MagicMock(),
@@ -51,14 +58,23 @@ async def test_adapter_routes_default_to_cursor_and_plan_to_orchestrator(monkeyp
         harness=MagicMock(),
         context_builder=MagicMock(),
         permissions=MagicMock(),
-        settings=MagicMock(),
+        settings=SimpleNamespace(mitkii_mode="cursor"),
     )
-    adapter = chat.AgentLoopAdapter(session)
+    adapter_cursor = chat.AgentLoopAdapter(session_cursor)
+    _ = [event async for event in adapter_cursor.run_turn_stream("fix validator")]
+    assert isinstance(adapter_cursor._current_loop, _FakeCursor)
 
-    _ = [event async for event in adapter.run_turn_stream("fix validator")]
-    assert isinstance(adapter._current_loop, _FakeCursor)
-    assert adapter._cursor_loop.inputs == ["fix validator"]
-
-    _ = [event async for event in adapter.run_turn_stream("/plan refactor validator")]
-    assert isinstance(adapter._current_loop, _FakeOrchestrator)
-    assert adapter._orchestrator_loop.inputs == ["/plan refactor validator"]
+    # Test assembled mode
+    session_assembled = SimpleNamespace(
+        llm=MagicMock(),
+        cursor_inter_llm=MagicMock(),
+        cursor_decision_llm=MagicMock(),
+        tools=MagicMock(),
+        harness=MagicMock(),
+        context_builder=MagicMock(),
+        permissions=MagicMock(),
+        settings=SimpleNamespace(mitkii_mode="assembled"),
+    )
+    adapter_assembled = chat.AgentLoopAdapter(session_assembled)
+    _ = [event async for event in adapter_assembled.run_turn_stream("fix validator")]
+    assert isinstance(adapter_assembled._current_loop, _FakeAssembled)

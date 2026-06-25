@@ -81,6 +81,9 @@ class CodeSearchSkill:
             )
         else:
             edit_context_json = ""
+
+        search_summary = _build_search_summary(hydrated, search_query)
+
         if errors and not outputs:
             return SkillResult(
                 success=False,
@@ -88,6 +91,7 @@ class CodeSearchSkill:
                 missing_info=tuple(errors),
                 metadata={
                     "search_output": search_output,
+                    "search_summary": search_summary,
                     "edit_context_targets": str(_edit_context_target_count(hydrated.edit_context)),
                     "hydration_root": str(self.project_root),
                     "hydration_hits": str(hydrated.hit_count),
@@ -102,6 +106,7 @@ class CodeSearchSkill:
             summary=f"code_search completed {len(calls)} batched call(s).",
             metadata={
                 "search_output": search_output,
+                "search_summary": search_summary,
                 "edit_context_targets": str(_edit_context_target_count(hydrated.edit_context)),
                 "hydration_root": str(self.project_root),
                 "hydration_hits": str(hydrated.hit_count),
@@ -372,6 +377,60 @@ class _HydratedSearch:
         self.hit_count = hit_count
         self.failures = failures
         self.hit_paths = hit_paths
+
+
+def _build_search_summary(hydrated: _HydratedSearch, query: str) -> str:
+    lines = [
+        "### 🔍 Code Search Summary",
+        f"**Query**: `{query}`",
+        f"**Status**: Found {hydrated.hit_count} file(s) with matching symbols.",
+        ""
+    ]
+    
+    if hydrated.hit_paths:
+        lines.append("**Matched References & Line Ranges**:")
+        for path in hydrated.hit_paths[:10]:
+            lines.append(f"- `{path}`")
+        if len(hydrated.hit_paths) > 10:
+            lines.append(f"- ... and {len(hydrated.hit_paths) - 10} more matches.")
+        lines.append("")
+        
+    if hydrated.edit_context and "edit_targets" in hydrated.edit_context:
+        targets = hydrated.edit_context["edit_targets"]
+        if isinstance(targets, list) and targets:
+            lines.append("**Potential Edit Targets** (Use these for the `edit_file` tool):")
+            for i, target in enumerate(targets):
+                if isinstance(target, dict):
+                    lines.append(
+                        f"  {i}. File: `{target.get('file')}` | "
+                        f"Symbol: `{target.get('symbol')}` | "
+                        f"Lines: `{target.get('start_line')}-{target.get('end_line')}`"
+                    )
+            lines.append("")
+            
+    if hydrated.edit_context and "resolved_dependencies" in hydrated.edit_context:
+        deps = hydrated.edit_context["resolved_dependencies"]
+        if isinstance(deps, list) and deps:
+            lines.append("**Resolved Schema Dependencies**:")
+            for dep in deps:
+                if isinstance(dep, dict):
+                    lines.append(
+                        f"- View: `{dep.get('name')}` | "
+                        f"Replaces: `{', '.join(dep.get('replaces_objects', []))}`"
+                    )
+            lines.append("")
+            
+    if hydrated.failures:
+        lines.append("**Search Diagnostics/Warnings**:")
+        for fail in hydrated.failures[:4]:
+            lines.append(f"- *Warning*: {fail}")
+        lines.append("")
+        
+    lines.append("> [!NOTE]")
+    lines.append("> The top 10 fused code snippets and edit contexts have been successfully cached in the loop state.")
+    lines.append("> Subsequent edit/validation tools will read this cache automatically. You can proceed with editing directly.")
+    
+    return "\n".join(lines)
 
 
 def _merge_ranges(ranges: list[tuple[int, int]], gap: int = 20, max_lines: int = 140) -> list[tuple[int, int]]:

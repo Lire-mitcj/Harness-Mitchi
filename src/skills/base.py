@@ -4,7 +4,16 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from src.context.pack import ContextPack
-from src.planner.patch_plan import PatchPlan
+
+@dataclass
+class PatchPlan:
+    files_to_edit: list[str] = field(default_factory=list)
+    target_symbols: list[str] = field(default_factory=list)
+    edits: list[Any] = field(default_factory=list)
+    missing_info: list[str] = field(default_factory=list)
+
+    def is_executable(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True)

@@ -122,6 +122,7 @@ class AgentState:
     turn_count: int = 0
     total_tokens_used: int = 0
     total_cost: float = 0.0
+    search_cache: dict[str, Any] = field(default_factory=dict)
 
     def record_usage(self, usage: TokenUsage, cost: float) -> None:
         """Accumulate token / cost counters after an LLM call."""

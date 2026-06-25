@@ -256,12 +256,16 @@ class ValidatorSkill:
             except Exception:
                 pass
 
-        # Extract target symbols and target view from EDIT_CONTEXT_JSON if present, else fallback
         evidence = str(kwargs.get("search_output") or kwargs.get("evidence") or "").strip()
         if not evidence and context:
             evidence = getattr(context, "search_output", "") or ""
             if not evidence and hasattr(context, "context_pack") and context.context_pack:
                 evidence = getattr(context.context_pack, "evidence", "") or ""
+
+        if not evidence:
+            # Fallback to in-memory search cache passed in kwargs
+            search_cache = kwargs.get("_search_cache") or {}
+            evidence = search_cache.get("search_output") or ""
 
         edit_context = _extract_marker_json(evidence, "EDIT_CONTEXT_JSON")
         target_view = ""
