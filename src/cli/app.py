@@ -108,6 +108,37 @@ def config_cmd(
 
 def main() -> None:
     """CLI entry point (referenced by pyproject.toml ``[project.scripts]``)."""
+    import sys
+    from pathlib import Path
+
+    cwd_env = Path.cwd() / ".env"
+    pkg_env = Path(__file__).resolve().parent.parent.parent / ".env"
+
+    if not cwd_env.exists() and not pkg_env.exists():
+        if sys.stdout.isatty() and len(sys.argv) > 1 and sys.argv[1] in ("chat", "serve"):
+            _console.print("[yellow]⚠️  No .env configuration file found.[/]")
+            confirm = typer.confirm("Would you like to configure your API keys now?", default=True)
+            if confirm:
+                api_key = typer.prompt("Enter your OPENAI_API_KEY", hide_input=True)
+                api_base = typer.prompt("Enter your OPENAI_API_BASE", default="https://api.siliconflow.cn/v1")
+
+                env_content = (
+                    f"# LLM API Keys\n"
+                    f"OPENAI_API_KEY={api_key}\n"
+                    f"OPENAI_API_BASE={api_base}\n\n"
+                    f"# Models\n"
+                    f"MITKII_MODEL=openai/deepseek-ai/DeepSeek-V4-Flash\n"
+                    f"MITKII_CURSOR_DECISION_MODEL=openai/deepseek-ai/DeepSeek-V4-Flash\n"
+                    f"MITKII_CURSOR_VALIDATOR_MODEL=none\n"
+                )
+                try:
+                    cwd_env.write_text(env_content, encoding="utf-8")
+                    _console.print("[green]✓ Created .env file successfully in current directory![/]\n")
+                    from dotenv import load_dotenv
+                    load_dotenv(dotenv_path=cwd_env, override=True)
+                except Exception as e:
+                    _console.print(f"[red]Failed to write .env file: {e}[/]")
+
     try:
         app()
     except KeyboardInterrupt:
