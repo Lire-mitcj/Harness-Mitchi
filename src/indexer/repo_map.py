@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from src.agent.cursor_sql_parser import UniversalSqlParser
+from src.agent.sql_parser import UniversalSqlParser
 from src.indexer.ctags import CtagsIndexResult, CtagsSymbol, index_project
 from src.indexer.graph import build_reference_edges
 from src.indexer.pagerank import pagerank
@@ -193,7 +193,9 @@ class RepoMap:
         top_symbols: int = 40,
         top_files: int = 15,
         max_chars: int = 12_000,
+        exclude_symbols: set[str] | None = None,
     ) -> str:
+        exclude = exclude_symbols or set()
         header = [
             f'<repo_map source="{self.source}" symbols="{self.symbol_count}" '
             f'build_ms="{self.build_ms}">',
@@ -207,12 +209,13 @@ class RepoMap:
         )[:top_files]
         file_lines = []
         for path, score in ranked_files:
-            syms = self.symbols_by_file.get(path, [])[:5]
+            syms = [s for s in self.symbols_by_file.get(path, []) if s.name not in exclude][:5]
             preview = ", ".join(s.name for s in syms) if syms else "(no symbols)"
             file_lines.append(f"- {path}  score={score:.4f}  — {preview}")
 
         symbol_lines = []
-        for sym in self.symbols[:top_symbols]:
+        filtered_top_symbols = [sym for sym in self.symbols if sym.name not in exclude]
+        for sym in filtered_top_symbols[:top_symbols]:
             sig = sym.signature.replace("\n", " ")[:100]
             sig_part = f"  {sig}" if sig else ""
             symbol_lines.append(
@@ -223,16 +226,22 @@ class RepoMap:
         skeleton_lines: list[str] = []
         for path, _ in ranked_files:
             file_syms = self.symbols_by_file.get(path, [])
-            if not file_syms:
+            filtered_file_syms = [s for s in file_syms if s.name not in exclude]
+            if not filtered_file_syms:
                 continue
             skeleton_lines.append(f"{path}")
-            for s in file_syms[:12]:
+            for s in filtered_file_syms[:12]:
                 sig = s.signature[:80] if s.signature else s.kind
                 skeleton_lines.append(f"  L{s.start_line}-{s.end_line}  {s.name}  {sig}")
 
+        # Construct filtered symbols map for search modules building
+        filtered_symbols_by_file = {}
+        for path, syms in self.symbols_by_file.items():
+            filtered_symbols_by_file[path] = [s for s in syms if s.name not in exclude]
+
         search_modules = _build_search_modules(
             ranked_files,
-            self.symbols_by_file,
+            filtered_symbols_by_file,
         )
 
         return _truncate_skeleton_sections(
@@ -244,8 +253,8 @@ class RepoMap:
             max_chars=max_chars,
         )
 
-    def to_planner_context(self, *, max_chars: int = 12_000) -> str:
-        return self.to_skeleton_block(max_chars=max_chars)
+    def to_planner_context(self, *, max_chars: int = 12_000, exclude_symbols: set[str] | None = None) -> str:
+        return self.to_skeleton_block(max_chars=max_chars, exclude_symbols=exclude_symbols)
 
 
 def _truncate_skeleton_sections(

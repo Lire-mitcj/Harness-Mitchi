@@ -3,11 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from rich.console import Console
 
-from src.agent.cursor_loop import CursorLoop
 from src.agent.events import AgentEvent
 from src.cli.permissions import CLIPermissionHandler
 from src.cli.renderer import CLIRenderer
@@ -15,6 +14,7 @@ from src.cli.repl import REPLSession
 from src.cli.theme import get_theme
 from src.config.settings import get_settings
 from src.runtime.session_factory import MitKIISession, create_mitkii_session
+from src.agent.state_assembled_loop import StateAssembledLoop
 
 
 class AgentLoopAdapter:
@@ -23,29 +23,15 @@ class AgentLoopAdapter:
     def __init__(self, session: MitKIISession) -> None:
         self.session = session
         self.settings = session.settings
-        self._cursor_loop = CursorLoop(
-            llm=session.cursor_decision_llm,
-            inter_llm=session.cursor_inter_llm,
-            decision_llm=session.cursor_decision_llm,
+        self._assembled_loop = StateAssembledLoop(
+            llm=session.llm,
             tools=session.tools,
             harness=session.harness,
             context=session.context_builder,
             permissions=session.permissions,
             settings=session.settings,
         )
-        if self.settings.mitkii_mode == "assembled":
-            from src.agent.state_assembled_loop import StateAssembledLoop
-            self._assembled_loop = StateAssembledLoop(
-                llm=session.llm,
-                tools=session.tools,
-                harness=session.harness,
-                context=session.context_builder,
-                permissions=session.permissions,
-                settings=session.settings,
-            )
-            self._current_loop = self._assembled_loop
-        else:
-            self._current_loop = self._cursor_loop
+        self._current_loop = self._assembled_loop
 
     async def run_turn_stream(self, user_input: str) -> AsyncIterator[AgentEvent]:
         async for event in self._current_loop.run(user_input):
@@ -70,8 +56,18 @@ class AgentLoopAdapter:
         return await self._current_loop.run_score_now()
 
     def get_state(self) -> Any:
+        return self._current_loop.agent_telemetry
+
+    def get_run_state(self) -> Any:
+        """Expose the reducer-owned flow state without mixing it with telemetry."""
+        return self._current_loop.state.run_state
+
+    def get_context_records(self) -> list[dict[str, Any]]:
+        getter = getattr(self._current_loop, "get_context_records", None)
+        if getter is not None:
+            return cast(list[dict[str, Any]], getter())
         state = self._current_loop.state
-        return state.agent_state if hasattr(state, "agent_state") else state
+        return list(getattr(state, "core_context_history", ()))
 
 
 def run_chat(session_id: str | None = None, project_path: Path | None = None) -> None:

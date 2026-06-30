@@ -31,6 +31,7 @@ from src.agent.types import (
     tool_message,
     user_message,
 )
+from src.context.prompt_resources import load_internal_prompt
 from src.harness.discovery.manifest import (
     DiagnosticsManifest,
     discovery_display_summary,
@@ -53,21 +54,13 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_SCOUT_PROMPT_PATH = (
-    Path(__file__).resolve().parent.parent.parent.parent / "prompts" / "scout_prompt.md"
-)
-
-
 _SCOUT_FALLBACK = (
     "You are MitKII Scout — read-only pre-Planner probe. Output discovery JSON only."
 )
 
 
 def load_scout_system_prompt() -> str:
-    if _SCOUT_PROMPT_PATH.is_file():
-        return _SCOUT_PROMPT_PATH.read_text(encoding="utf-8").strip()
-    log.warning("scout_prompt.md missing, using embedded fallback")
-    return _SCOUT_FALLBACK
+    return load_internal_prompt("scout_prompt.md", fallback=_SCOUT_FALLBACK)
 
 
 SCOUT_TOOLS = frozenset({
@@ -386,7 +379,10 @@ class ScoutAgent:
             usage = response.usage
             yield cost_event(usage.prompt_tokens, usage.completion_tokens, cost)
         elif trimmed:
-            from src.harness.probe.llm_usage import estimate_cost_for_model, estimate_usage_from_text
+            from src.harness.probe.llm_usage import (
+                estimate_cost_for_model,
+                estimate_usage_from_text,
+            )
 
             est = estimate_usage_from_text(
                 trimmed,

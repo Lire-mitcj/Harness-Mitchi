@@ -219,9 +219,9 @@ class RepoMapService:
             return []
         return repo_map.search(query, limit=limit)
 
-    def to_planner_context(self, *, max_chars: int = 12_000) -> str | None:
+    def to_planner_context(self, *, max_chars: int = 12_000, exclude_symbols: set[str] | None = None) -> str | None:
         self.wait_until_ready(timeout=self._settings.repo_map_build_timeout)
         repo_map = self.refresh_if_dirty()
         if repo_map is None:
             return None
-        return repo_map.to_planner_context(max_chars=max_chars)
+        return repo_map.to_planner_context(max_chars=max_chars, exclude_symbols=exclude_symbols)

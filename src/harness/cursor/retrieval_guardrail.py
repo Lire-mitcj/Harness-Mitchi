@@ -8,8 +8,8 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
 
-from src.agent.cursor_contracts import RetrievalResult, RetrievalSymbol
-from src.agent.cursor_query_bridge import QueryBridgeResult
+from src.agent.contracts import RetrievalResult, RetrievalSymbol
+from src.tools.assembled.query_bridge import QueryBridgeResult
 
 log = logging.getLogger(__name__)
 

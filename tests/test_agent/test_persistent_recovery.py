@@ -3,10 +3,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.agent.cursor_decision import CursorDecisionLLM
-from src.agent.cursor_executor import CursorExecutor
-from src.agent.cursor_patch_applier import CursorPatchApplier
-from src.agent.cursor_validator import CursorValidator
+from src.agent.decision import CursorDecisionLLM
+from src.agent.executor import CursorExecutor
+from src.agent.patch_applier import CursorPatchApplier
+from src.agent.validator import CursorValidator
 from src.harness.cursor.manager import CursorStateManager
 
 

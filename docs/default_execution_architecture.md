@@ -54,8 +54,8 @@ Max Steps Exhausted ──► 标记失败并结束
 
 ### 2.1 初始化与多模态准备组件
 
-*   **`CursorLoop`** ([cursor_loop.py](file:///home/csh/harness-mitkii/src/agent/cursor_loop.py))
-    *   **职责**：主控运行环境。负责调度并发意图分类与 Query 生成、调用符号图扩展与检索器、并在 Step 循环中驱动 Decision -> Execution -> Validation 的状态转移。
+*   **`StateAssembledLoop`** ([state_assembled_loop.py](file:///home/csh/harness-mitkii/src/agent/state_assembled_loop.py))
+    *   **职责**：主控运行环境。采用状态装配（State Assembly）模式驱动任务的逐步迭代。负责调度并运行 codebase_retrieve 和 decision_edit 工具，并在 Step 循环中驱动决策、执行与验证的状态转移。
 *   **`CursorInterLLM`** ([cursor_inter_llm.py](file:///home/csh/harness-mitkii/src/agent/cursor_inter_llm.py))
     *   **职责**：轻量级意图分类器。将用户请求快速分类为 `modify`、`explain` 或 `debug`，并输出置信度作为后续 Decision 决策的 hint，不影响控制流决策。
 *   **`CursorQueryBridge`** ([cursor_query_bridge.py](file:///home/csh/harness-mitkii/src/agent/cursor_query_bridge.py))

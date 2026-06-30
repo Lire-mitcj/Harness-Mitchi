@@ -4,13 +4,13 @@ import asyncio
 from unittest.mock import MagicMock
 from src.indexer.ctags import CtagsSymbol
 from src.indexer.repo_map import RepoMap, RankedSymbol
-from src.agent.cursor_retriever import CursorRetriever
-from src.agent.cursor_context_pack_builder import CursorContextPackBuilder, _comment_prefix
-from src.agent.cursor_contracts import RetrievalResult, RetrievalSymbol
-from src.agent.cursor_state import CursorState
+from src.tools.assembled.retriever import CursorRetriever
+from src.tools.assembled.context_pack_builder import CursorContextPackBuilder, _comment_prefix
+from src.agent.contracts import RetrievalResult, RetrievalSymbol
+from src.agent.state import CursorState
 from src.harness.cursor.manager import CursorStateManager
-from src.agent.cursor_graph_bridge import CursorGraphQueryBridge, GraphNode, GraphEdge
-from src.agent.cursor_repo_map_lookup import CandidateSymbol
+from src.tools.assembled.graph_bridge import CursorGraphQueryBridge, GraphNode, GraphEdge
+from src.tools.assembled.repo_map_lookup import CandidateSymbol
 
 
 class _RepoMapService:
@@ -34,7 +34,7 @@ def _symbol(file_path: str, name: str, start_line: int, score: float = 0.0) -> R
 
 
 def test_sql_anchor_integrity(tmp_path: Path) -> None:
-    from src.agent.cursor_sql_parser import UniversalSqlParser
+    from src.agent.sql_parser import UniversalSqlParser
 
     sql_lines = [f"/* line {i} */" for i in range(1, 150)]
     sql_lines.append("CREATE VIEW v_order_detail AS SELECT * FROM orders;")
@@ -60,7 +60,7 @@ def test_sql_anchor_integrity(tmp_path: Path) -> None:
 
 
 def test_sql_view_signature_contains_clean_alias_outline() -> None:
-    from src.agent.cursor_sql_parser import UniversalSqlParser
+    from src.agent.sql_parser import UniversalSqlParser
 
     sql = (
         "CREATE VIEW view_ticket_report_detail AS\n"

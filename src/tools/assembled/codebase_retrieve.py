@@ -1,31 +1,54 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
 
-from src.agent.cursor_ast_structure import CursorAstStructureLayer
-from src.agent.cursor_context_pack_builder import CursorContextPackBuilder
-from src.agent.cursor_fusion import CursorFusionEngine
-from src.agent.cursor_graph_bridge import CursorGraphQueryBridge
-from src.agent.cursor_inter_llm import CursorInterLLM
-from src.agent.cursor_query_bridge import CursorQueryBridge
-from src.agent.cursor_repo_map_lookup import CursorRepoMapLookup
-from src.agent.cursor_reranker import SiliconFlowReranker
-from src.agent.cursor_retriever import CursorRetriever
-from src.agent.cursor_semantic_tagger import CursorSemanticTagger
+from src.tools.assembled.ast_structure import CursorAstStructureLayer
+from src.tools.assembled.context_pack_builder import CursorContextPackBuilder
+from src.tools.assembled.fusion import CursorFusionEngine
+from src.tools.assembled.graph_bridge import CursorGraphQueryBridge
+from src.tools.assembled.query_bridge import CursorQueryBridge
+from src.tools.assembled.repo_map_lookup import CursorRepoMapLookup
+from src.tools.assembled.reranker import SiliconFlowReranker
+from src.tools.assembled.retriever import CursorRetriever
+from src.tools.assembled.semantic_tagger import CursorSemanticTagger
 from src.agent.types import RiskLevel, ToolResult
 from src.tools.base import Tool
+from src.llm.client import LLMClient
 
 log = logging.getLogger(__name__)
+
+BUILTIN_NOISE_METHODS = {
+    "all",
+    "append",
+    "bool",
+    "dict",
+    "enumerate",
+    "execute",
+    "first",
+    "get",
+    "join",
+    "lower",
+    "mappings",
+    "pop",
+    "split",
+    "strip",
+    "text",
+    "upper",
+}
+
+MAX_EVIDENCE_ITEMS = 4
 
 
 class CodebaseRetrieveTool(Tool):
     name = "codebase_retrieve"
     description = (
-        "Search and retrieve relevant codebase context (files, symbols, code blocks) "
-        "for a given query. This will automatically load retrieved files into the active context."
+        "Search and retrieve relevant codebase context (files, symbols, code blocks, relation graphs) "
+        "for a given query. This returns structured code snippets and summaries, and automatically "
+        "loads them into CURRENT_CONTEXT for the next turn."
     )
     risk_level = RiskLevel.SAFE
     parameters = {
@@ -46,7 +69,7 @@ class CodebaseRetrieveTool(Tool):
         settings: Any,
         repo_map: Any,
         decision_llm: Any,
-        inter_llm: Any,
+        inter_llm: Any = None,
         harness: Any,
         tools: Any,
     ) -> None:
@@ -68,8 +91,15 @@ class CodebaseRetrieveTool(Tool):
             max_queries=settings.cursor_retrieval_max_queries,
             total_timeout=settings.cursor_retrieval_timeout,
         )
+        self.query_bridge_llm = LLMClient(
+            model=settings.cursor_query_bridge_model,
+            request_timeout=float(settings.cursor_query_bridge_timeout),
+            prompt_cache_enabled=settings.prompt_cache_enabled,
+            prompt_cache_min_tokens=settings.prompt_cache_min_tokens,
+            prompt_cache_ttl="5m",
+        )
         self.query_bridge = CursorQueryBridge(
-            self.decision_llm,
+            self.query_bridge_llm,
             timeout=settings.cursor_query_bridge_timeout,
         )
         self.repo_map_lookup = CursorRepoMapLookup(repo_map)
@@ -102,34 +132,24 @@ class CodebaseRetrieveTool(Tool):
         )
         self.ast_structure = CursorAstStructureLayer(self.project_root)
         self.semantic_tagger = CursorSemanticTagger()
-        self.inter = CursorInterLLM(self.inter_llm)
 
     async def execute(self, **params: Any) -> ToolResult:
         validated = self.validate_params(params)
         user_msg = validated["query"]
         paths = validated.get("paths") or []
 
-        hint = None
-        if self.settings.cursor_inter_enabled:
-            try:
-                inter_messages = await self.harness.before_llm_call(
-                    self.inter.build_messages(user_msg)
-                )
-                response = await self.inter_llm.chat(
-                    inter_messages,
-                    tools=None,
-                    stream=False,
-                )
-                hint = self.inter.parse(response.content or "")
-                await self.harness.after_llm_call(response, response.usage)
-            except Exception as exc:
-                log.warning("Cursor Inter call failed inside codebase_retrieve: %s", exc)
-
-        if hint is None:
-            hint = CursorInterLLM.fallback(user_msg)
 
         try:
             bridge_content = await self.query_bridge.generate_raw(user_msg)
+            session_id = getattr(self.harness, "session_id", "default_session")
+            subtask_id = f"step_{getattr(self.harness, 'current_step', 1)}_retrieve_bridge"
+            if hasattr(self.harness, "session_storage"):
+                self.harness.session_storage.append_sidechain_message(
+                    session_id, subtask_id, "user", f"Generate query bridge for: {user_msg}"
+                )
+                self.harness.session_storage.append_sidechain_message(
+                    session_id, subtask_id, "assistant", bridge_content
+                )
         except Exception as exc:
             log.warning("Cursor Query Bridge call failed inside codebase_retrieve: %s", exc)
             bridge_content = "{}"
@@ -218,25 +238,89 @@ class CodebaseRetrieveTool(Tool):
                 annotations,
             )
 
-        summary_blocks = []
-        for window in context_pack.windows:
-            tags = ", ".join(window.semantic_tags) or "none"
-            summary_blocks.append(
-                f"- 找到关联文件: `{window.file}` (行号: {window.start_line}-{window.end_line}, 语义标签: [{tags}])"
-            )
+        top_symbols = list(retrieval.symbols[:MAX_EVIDENCE_ITEMS])
+        # The coordinator receives one deliberately small schema.  A code anchor is
+        # identified by (file, span); only first-hop function anchors accompany it.
+        # RetrievalSymbol carries normalized call edges. AstNode adds grounded
+        # first-hop symbols. Repo-map RankedSymbol is intentionally excluded here:
+        # it has ranking metadata but no ``calls`` field.
+        related_symbol_pool = [*retrieval.symbols, *ast_nodes]
 
-        output_text = (
-            f"检索成功。已经自动将以下相关文件加载进你的活动上下文空间（Active Files）中。\n"
-            f"你可以直接阅读你当前 Prompt 中对应的 `<file>` 块，无需重新检索：\n"
-            + "\n".join(summary_blocks)
-        )
+        def symbol_name(value: Any) -> str:
+            return str(getattr(value, "name", None) or getattr(value, "symbol", ""))
+
+        def symbol_file(value: Any) -> str:
+            return str(getattr(value, "file", None) or getattr(value, "file_path", ""))
+
+        def symbol_span(value: Any) -> list[int]:
+            lines = getattr(value, "lines", None)
+            if lines and len(lines) >= 2:
+                return [int(lines[0]), int(lines[1])]
+            return [int(getattr(value, "start_line", 0)), int(getattr(value, "end_line", 0))]
+
+        symbol_by_name = {
+            symbol_name(symbol): symbol
+            for symbol in related_symbol_pool
+            if symbol_name(symbol) and symbol_name(symbol) not in BUILTIN_NOISE_METHODS
+        }
+        inbound: dict[str, set[str]] = {}
+        for candidate in related_symbol_pool:
+            for called in getattr(candidate, "calls", ()) or ():
+                inbound.setdefault(str(called), set()).add(symbol_name(candidate))
+
+        code_anchors = []
+        for symbol in top_symbols:
+            start_line = max(1, int(getattr(symbol, "start_line", 1)))
+            end_line = max(start_line, int(getattr(symbol, "end_line", start_line)))
+            code_anchors.append({
+                "file": symbol.file,
+                "symbol": symbol.name,
+                "span": [start_line, end_line],
+            })
+
+        compact_json_output = json.dumps(code_anchors, ensure_ascii=False, indent=2)
 
         return ToolResult(
             success=True,
-            output=output_text,
+            output=compact_json_output,
             metadata={
-                "retrieved_files": list(context_pack.candidate_files),  # 供 Loop 捕获并推进 State 的核心元数据
+                "llm_observation": compact_json_output,
+                "retrieved_files": list(context_pack.candidate_files),
                 "context_pack": context_pack,
-                "hint": hint,
+                "search_output": compact_json_output,
+                "raw_evidence_store": code_anchors,
             }
         )
+
+    def _symbol_code_slice(self, symbol: Any, context_pack: Any) -> tuple[str, int, int, bool]:
+        abs_path = (self.project_root / symbol.file).resolve()
+        start_line = max(1, int(symbol.start_line))
+        end_line = max(start_line, int(symbol.end_line))
+        lines: list[str] | None = None
+        if abs_path.is_file():
+            try:
+                lines = abs_path.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                log.warning("Failed to read symbol slice from %s: %s", symbol.file, exc)
+        if lines is None:
+            for window in context_pack.windows:
+                if window.file != symbol.file:
+                    continue
+                lines = window.content.splitlines()
+                start_line = max(1, int(window.start_line))
+                end_line = start_line + len(lines) - 1
+                break
+        if not lines:
+            return "", start_line, end_line, False
+
+        if abs_path.is_file():
+            slice_start = max(0, start_line - 1)
+            slice_end = min(len(lines), end_line)
+            sliced = lines[slice_start:slice_end]
+            actual_start = start_line
+        else:
+            sliced = lines
+            actual_start = start_line
+
+        actual_end = actual_start + len(sliced) - 1 if sliced else actual_start
+        return "\n".join(sliced), actual_start, actual_end, False

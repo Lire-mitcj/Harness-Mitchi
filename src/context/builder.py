@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 
 from src.agent.types import Message, system_message, user_message
 from src.context.file_tracker import FileTracker
+from src.context.prompt_resources import load_internal_prompt
+
 
 def cap_structure_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -15,10 +17,6 @@ def cap_structure_text(text: str, max_chars: int) -> str:
 
 if TYPE_CHECKING:
     from src.indexer.repo_map_service import RepoMapService
-
-
-SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "prompts" / "system_prompt.md"
-
 
 @dataclass(frozen=True, slots=True)
 class ProjectContextSnapshot:
@@ -226,13 +224,14 @@ class ContextBuilder:
         return template.format(project_info=project_info, project_rules=rules)
 
     def _load_prompt_template(self) -> str:
-        if SYSTEM_PROMPT_PATH.exists():
-            return SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
-        return (
+        return load_internal_prompt(
+            "system_prompt.md",
+            fallback=(
             "You are MitKII, an AI coding agent. Help the user with their coding tasks "
             "using the available tools.\n\n"
             "<project_info>\n{project_info}\n</project_info>\n\n"
             "<project_rules>\n{project_rules}\n</project_rules>"
+            ),
         )
 
     def _get_project_info(self) -> str:

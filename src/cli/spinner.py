@@ -15,7 +15,7 @@ def thinking_spinner(
 ) -> Generator[Status, None, None]:
     """Context manager that shows a pulsing spinner while the agent thinks."""
     with console.status(
-        f"[dim cyan]● {message}[/]",
+        message,
         spinner="dots",
         spinner_style="cyan",
     ) as status:

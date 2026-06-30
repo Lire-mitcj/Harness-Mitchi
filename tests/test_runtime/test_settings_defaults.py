@@ -11,4 +11,8 @@ def test_new_architecture_defaults_use_single_executor_agent_without_legacy_fall
     assert not hasattr(settings, "legacy_react_fallback_enabled")
     assert settings.executor_skill_enabled is False
     assert settings.effective_final_summary_model == "openai/deepseek-ai/DeepSeek-V3"
-    assert settings.cursor_query_bridge_timeout == 30.0
+    assert settings.cursor_query_bridge_timeout == 15.0
+    assert settings.cursor_query_bridge_model == "openai/Qwen/Qwen2.5-32B-Instruct"
+    assert settings.llm_request_timeout == 180
+    assert settings.llm_stream_idle_timeout == 60
+    assert settings.ready_final_max_tokens == 1024

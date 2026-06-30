@@ -8,14 +8,29 @@ from typing import Any
 import litellm
 import tiktoken
 
-from src.agent.types import LLMResponse, Message, ToolCall, TokenUsage
+from src.agent.types import LLMResponse, TokenUsage, ToolCall
 from src.llm.dsml import split_dsml_tool_calls
 from src.llm.prompt_cache import CacheTTL, apply_prompt_cache
 
 log = logging.getLogger(__name__)
 
 litellm.drop_params = True
-litellm.set_verbose = False
+setattr(litellm, "set_verbose", False)
+
+
+def _extract_tool_names(tools: list[dict[str, Any]] | None) -> set[str] | None:
+    if not tools:
+        return None
+    names = set()
+    for t in tools:
+        if isinstance(t, dict):
+            if t.get("type") == "function" and "function" in t:
+                name = t["function"].get("name")
+                if name:
+                    names.add(name)
+            elif "name" in t:
+                names.add(t["name"])
+    return names
 
 
 class LLMClient:
@@ -32,6 +47,7 @@ class LLMClient:
         max_tokens: int = 8192,
         *,
         request_timeout: float = 180,
+        stream_idle_timeout: float = 60,
         prompt_cache_enabled: bool = True,
         prompt_cache_min_tokens: int = 1024,
         prompt_cache_ttl: CacheTTL = "5m",
@@ -40,6 +56,7 @@ class LLMClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.request_timeout = request_timeout
+        self.stream_idle_timeout = stream_idle_timeout
         self.prompt_cache_enabled = prompt_cache_enabled
         self.prompt_cache_min_tokens = prompt_cache_min_tokens
         self.prompt_cache_ttl = prompt_cache_ttl
@@ -61,6 +78,10 @@ class LLMClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         stream: bool = True,
+        *,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> LLMResponse | AsyncIterator[str]:
         """Send a chat completion request.
 
@@ -69,7 +90,13 @@ class LLMClient:
         content-delta strings; call ``collect_stream`` to drain the iterator
         and get the final ``LLMResponse``.
         """
-        kwargs = self._build_kwargs(messages, tools)
+        kwargs = self._build_kwargs(
+            messages,
+            tools,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            response_format=response_format,
+        )
 
         if not stream:
             return await self._chat_sync(kwargs)
@@ -92,12 +119,13 @@ class LLMClient:
         """
         import asyncio
 
-        request_timeout = timeout if timeout is not None else self.request_timeout
+        connect_timeout = timeout if timeout is not None else self.request_timeout
+        idle_timeout = self.stream_idle_timeout
         kwargs = self._build_kwargs(
             messages,
             tools,
             max_tokens=max_tokens,
-            timeout=request_timeout,
+            timeout=connect_timeout,
             response_format=response_format,
         )
 
@@ -106,52 +134,69 @@ class LLMClient:
         usage: TokenUsage | None = None
         last_chunk: Any = None
 
+        timeout_stage = "connection/first token"
         try:
-            async with asyncio.timeout(request_timeout):
-                response = await litellm.acompletion(**kwargs, stream=True)
+            # Do not pass a provider-level absolute timeout for streams. Local
+            # guards bound connection/first-event latency and each idle gap.
+            kwargs.pop("timeout", None)
+            response = await asyncio.wait_for(
+                litellm.acompletion(**kwargs, stream=True),
+                timeout=connect_timeout,
+            )
+            iterator = response.__aiter__()
+            first_event = True
+            while True:
+                timeout_stage = "connection/first token" if first_event else "chunk idle"
+                try:
+                    chunk = await asyncio.wait_for(
+                        anext(iterator),
+                        timeout=connect_timeout if first_event else idle_timeout,
+                    )
+                except StopAsyncIteration:
+                    break
+                first_event = False
+                last_chunk = chunk
+                chunk_usage = self._extract_usage(chunk)
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta is None:
+                    continue
 
-                async for chunk in response:
-                    last_chunk = chunk
-                    chunk_usage = self._extract_usage(chunk)
-                    if chunk_usage is not None:
-                        usage = chunk_usage
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta is None:
-                        continue
+                if delta.content:
+                    content_parts.append(delta.content)
+                    yield (delta.content, None)
 
-                    if delta.content:
-                        content_parts.append(delta.content)
-                        yield (delta.content, None)
-
-                    if delta.tool_calls:
-                        for tc_delta in delta.tool_calls:
-                            idx = tc_delta.index
-                            if idx not in tool_calls_raw:
-                                tool_calls_raw[idx] = {
-                                    "id": tc_delta.id or "",
-                                    "name": "",
-                                    "arguments": "",
-                                }
-                            entry = tool_calls_raw[idx]
-                            if tc_delta.id:
-                                entry["id"] = tc_delta.id
-                            if tc_delta.function:
-                                if tc_delta.function.name:
-                                    entry["name"] = tc_delta.function.name
-                                if tc_delta.function.arguments:
-                                    entry["arguments"] += tc_delta.function.arguments
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_raw:
+                            tool_calls_raw[idx] = {
+                                "id": tc_delta.id or "",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        entry = tool_calls_raw[idx]
+                        if tc_delta.id:
+                            entry["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                entry["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                entry["arguments"] += tc_delta.function.arguments
         except TimeoutError:
-            log.error("LLM stream timed out after %.0fs", request_timeout)
+            limit = connect_timeout if timeout_stage == "connection/first token" else idle_timeout
+            log.error("LLM stream %s timed out after %.0fs", timeout_stage, limit)
             yield (
                 "",
                 LLMResponse(
                     content=(
-                        f"LLM request timed out after {int(request_timeout)}s. "
-                        "Try a smaller context or retry."
+                        f"LLM stream {timeout_stage} timed out after {int(limit)}s. "
+                        "Retry without discarding prior streamed progress."
                     ),
                     tool_calls=None,
                     usage=None,
-                    model=self.model,
+                    model="error",
                 ),
             )
             return
@@ -159,7 +204,11 @@ class LLMClient:
         if usage is None and last_chunk is not None:
             usage = self._extract_usage(last_chunk)
         completion_text = "".join(content_parts)
-        cleaned_text, dsml_calls = split_dsml_tool_calls(completion_text)
+        known_tools = _extract_tool_names(tools)
+        cleaned_text, dsml_calls = split_dsml_tool_calls(
+            completion_text,
+            known_tool_names=known_tools,
+        )
         if usage is None:
             from src.harness.probe.llm_usage import estimate_usage_from_text
 
@@ -259,7 +308,10 @@ class LLMClient:
             self._total_usage = self._total_usage + usage
             self._total_cost += cost
 
-        cleaned_text, dsml_calls = split_dsml_tool_calls(choice.message.content)
+        cleaned_text, dsml_calls = split_dsml_tool_calls(
+            choice.message.content,
+            known_tool_names=_extract_tool_names(kwargs.get("tools")),
+        )
         return LLMResponse(
             content=cleaned_text,
             tool_calls=(self._parse_tool_calls(tool_calls_raw) + dsml_calls) or None,

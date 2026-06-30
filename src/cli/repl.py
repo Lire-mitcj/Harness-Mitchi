@@ -10,6 +10,7 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
+from rich.markup import escape
 
 from src.agent.events import AgentEvent, EventType
 from src.cli.display_gate import OrchestratorDisplayGate
@@ -30,6 +31,7 @@ class AgentLoopProtocol(Protocol):
     def get_probe_metrics(self) -> dict[str, Any]: ...
     async def run_score_now(self) -> dict[str, Any] | None: ...
     def get_state(self) -> Any: ...
+    def get_context_records(self) -> list[dict[str, Any]]: ...
 
 
 SLASH_COMMANDS: dict[str, str] = {
@@ -41,6 +43,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/plan": "Direct plan: /plan <task> skips Scout; /plan alone shows plan",
     "/score": "Run quality scoring on recent changes",
     "/probe": "Show context probe metrics",
+    "/context": "Show Core LLM input context: /context [call|all]",
     "/clear": "Clear the terminal screen",
     "/config": "View or modify config values",
 }
@@ -260,6 +263,33 @@ class REPLSession:
                 )
             return True
 
+        if cmd == "/context":
+            records = self._agent.get_context_records()
+            if not records:
+                self._console.print("[dim]No Core LLM context has been recorded yet.[/]")
+                return True
+            selected = records
+            label = "all"
+            if arg.strip().lower() != "all":
+                if arg.strip():
+                    try:
+                        requested_step = int(arg.strip())
+                    except ValueError:
+                        self._console.print("[yellow]Usage: /context [call|all][/]")
+                        return True
+                    selected = [item for item in records if item.get("call") == requested_step]
+                    label = f"call {requested_step}"
+                    if not selected:
+                        self._console.print(f"[dim]No context recorded for call {requested_step}.[/]")
+                        return True
+                else:
+                    selected = [records[-1]]
+                    label = f"latest call {records[-1].get('call')} (step {records[-1].get('step')})"
+            import json
+            self._console.print(f"[bold cyan]Core LLM context — {label}[/]")
+            self._console.print_json(json=json.dumps(selected, ensure_ascii=False, default=str))
+            return True
+
         if cmd in ("/rollback", "/config"):
             self._console.print(f"[dim]{cmd} — coming soon.[/]")
             return True
@@ -284,6 +314,7 @@ class REPLSession:
         executor_spinner_msg = "Thinking..."
         executor_preview_shown = False
         parallel_llm_tasks: dict[str, str] = {}
+        thinking_buffer = ""
 
         def _ensure_spinner(text: str) -> None:
             nonlocal spinner_cm, status, spinner_active, executor_spinner_msg
@@ -292,7 +323,10 @@ class REPLSession:
                 spinner_cm = thinking_spinner(self._console)
                 status = spinner_cm.__enter__()
                 spinner_active = True
-            status.update(f"[dim cyan]● {text}[/]")
+            display_text = f"[dim cyan]{text}[/]"
+            if thinking_buffer:
+                display_text = f"[dim cyan]{text}[/]\n[dim]{escape(thinking_buffer)}[/]"
+            status.update(display_text)
 
         def _dismiss_spinner() -> None:
             nonlocal spinner_active
@@ -382,6 +416,9 @@ class REPLSession:
                     continue
 
                 phase = str((event.data or {}).get("phase") or "")
+                if phase == "executor" or event.type in {EventType.TOOL_CALL, EventType.FINAL_ANSWER}:
+                    thinking_buffer = ""
+
                 if event.type == EventType.STREAM_START and phase == "executor":
                     _reset_executor_preview()
 
@@ -397,6 +434,10 @@ class REPLSession:
                     continue
 
                 if event.type == EventType.THINKING:
+                    phase = str((event.data or {}).get("phase") or "")
+                    if phase != "executor":
+                        thinking_buffer += event.content or ""
+                        _ensure_spinner(executor_spinner_msg)
                     continue
 
                 if event.type == EventType.APPROVAL_REQUEST and event.data:

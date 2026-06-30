@@ -57,6 +57,10 @@ class HarnessEngine:
         self.checkpoint_store = CheckpointStore(checkpoint_dir)
         self.rollback = RollbackManager()
 
+        transcripts_dir = settings.data_dir / "transcripts"
+        from src.harness.checkpoint.session_storage import SessionStorage
+        self.session_storage = SessionStorage(transcripts_dir)
+
         # --- Scorer ---
         self.scorer = ScoringEngine(
             llm_client=self._judge_llm_call if settings.judge_model else None,

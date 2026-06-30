@@ -1,99 +1,240 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import time
-from typing import Any
+import difflib
+from pathlib import Path
 
-from src.agent.types import ToolResult
-from src.tools.base import Tool
-from src.tools.registry import ToolRegistry
+from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
 
-log = logging.getLogger(__name__)
+from src.agent.contracts import ExecutionResult, ValidationDecision, ValidationResult
+from src.agent.evaluator import FullPipelineMetrics, Layer1Metrics, Layer2Metrics
+from src.agent.harness_context import CursorHarnessContext
+from src.agent.patch_applier import CursorPatchApplier
+from src.agent.validator import CursorValidator
 
-DEFAULT_TIMEOUT = 120.0
 
+class CursorExecutor:
+    def __init__(self, project_root: Path, patch_applier: CursorPatchApplier) -> None:
+        self.project_root = project_root
+        self.patch_applier = patch_applier
 
-class ToolExecutor:
-    """Wraps tool execution with error handling, timeout, and logging.
+    def apply_patch(self, file_path: str, patch: str) -> ExecutionResult:
+        success, error = self.patch_applier.apply_patch(file_path, patch)
+        return ExecutionResult(success=success, file=file_path, error=error)
 
-    Sits between the agent loop and the raw :class:`ToolRegistry`, adding
-    consistent timing, structured error messages, and per-call metadata.
-    """
-
-    def __init__(self, timeout: float = DEFAULT_TIMEOUT) -> None:
-        self.timeout = timeout
-
-    async def execute(
+    async def execute_transaction(
         self,
-        tool_name: str,
-        params: dict[str, Any],
-        registry: ToolRegistry,
-        sandbox: Any | None = None,
-    ) -> ToolResult:
-        """Look up and execute a tool with timeout and error wrapping.
+        target_file: str,
+        patch: str,
+        validator: CursorValidator,
+        *,
+        step: int = 1,
+        layer1: Layer1Metrics | None = None,
+        user_intent: str = "",
+    ) -> tuple[ExecutionResult, ValidationResult, FullPipelineMetrics]:
+        layer1 = layer1 or Layer1Metrics()
+        async with CursorHarnessContext(self.project_root, target_file) as harness:
+            target_path = (self.project_root / target_file).resolve()
+            try:
+                original_content = target_path.read_text(encoding="utf-8")
+            except OSError:
+                original_content = ""
 
-        If *sandbox* is provided and supports ``run_in_sandbox``, the tool
-        execution is delegated to it (for dangerous operations).
-        """
-        tool = registry.get(tool_name)
-        if tool is None:
-            available = ", ".join(t[0] for t in registry.list_tools())
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Unknown tool '{tool_name}'. Available: {available}",
+            # 1. Apply patch in a separate thread
+            success, error = await asyncio.to_thread(
+                self.patch_applier.apply_patch, target_file, patch
             )
-
-        try:
-            validated = tool.validate_params(params)
-        except ValueError as exc:
-            return ToolResult(success=False, output="", error=str(exc))
-
-        start = time.monotonic()
-        try:
-            if sandbox is not None and hasattr(sandbox, "run_in_sandbox"):
-                result = await asyncio.wait_for(
-                    sandbox.run_in_sandbox(tool, validated),
-                    timeout=self.timeout,
+            if not success:
+                execution = ExecutionResult(
+                    success=False,
+                    file=target_file,
+                    error=error,
+                    original_content=original_content,
+                    rolled_back=True,
                 )
-            else:
-                result = await asyncio.wait_for(
-                    tool.execute(**validated),
-                    timeout=self.timeout,
+                validation = ValidationResult(
+                    success=False,
+                    error="validation skipped due to patch failure",
                 )
-        except asyncio.TimeoutError:
-            elapsed = time.monotonic() - start
-            log.warning("Tool '%s' timed out after %.1fs", tool_name, elapsed)
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Tool '{tool_name}' timed out after {self.timeout:.0f}s",
+                return (
+                    execution,
+                    validation,
+                    _metrics(
+                        step=step,
+                        target_file=target_file,
+                        layer1=layer1,
+                        patch_correctness=0.0,
+                        execution_success=0.0,
+                        code_diff_correctness=0.0,
+                        task_passed=False,
+                        committed=harness.committed,
+                        observation=error,
+                        validation=_validation_payload(validation),
+                    ),
+                )
+
+            try:
+                patched_content = target_path.read_text(encoding="utf-8")
+            except OSError:
+                patched_content = ""
+
+            # Print diff of the edit in real-time
+            original_lines = original_content.splitlines(keepends=True)
+            patched_lines = patched_content.splitlines(keepends=True)
+            diff_lines = list(difflib.unified_diff(
+                original_lines,
+                patched_lines,
+                fromfile=f"a/{target_file}",
+                tofile=f"b/{target_file}",
+            ))
+            if diff_lines:
+                diff_text = "".join(diff_lines)
+                console = Console()
+                console.print(Panel(
+                    Syntax(diff_text, "diff", theme="monokai", line_numbers=False),
+                    title=f"[bold yellow]⚡ Applying Edit to {target_file}[/]",
+                    title_align="left",
+                    border_style="yellow",
+                ))
+
+            # 2. Run layered validator checks
+            val_result = await validator.validate(
+                target_file=target_file,
+                patch=patch,
+                original_content=original_content,
+                patched_content=patched_content,
+                user_intent=user_intent,
             )
-        except Exception as exc:
-            elapsed = time.monotonic() - start
-            log.exception("Tool '%s' raised after %.2fs", tool_name, elapsed)
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Tool '{tool_name}' failed: {type(exc).__name__}: {exc}",
+            validation_decision = _effective_decision(val_result)
+            if validation_decision != "commit":
+                # Truncate stacktrace output to protect metrics board space limit
+                truncated_error = self._truncate_error(val_result.error)
+                execution = ExecutionResult(
+                    success=True,
+                    file=target_file,
+                    original_content=original_content,
+                    attempted_content=patched_content,
+                    rolled_back=True,
+                )
+                validation = ValidationResult(
+                    success=False,
+                    error=truncated_error,
+                    ast=val_result.ast,
+                    semantic=val_result.semantic,
+                    execution=val_result.execution,
+                    decision=validation_decision,
+                    score=val_result.score,
+                )
+                return (
+                    execution,
+                    validation,
+                    _metrics(
+                        step=step,
+                        target_file=target_file,
+                        layer1=layer1,
+                        patch_correctness=1.0,
+                        execution_success=_execution_score(val_result),
+                        code_diff_correctness=_ast_score(val_result),
+                        task_passed=False,
+                        committed=harness.committed,
+                        observation=truncated_error,
+                        validation=_validation_payload(validation),
+                    ),
+                )
+
+            # 3. Layered validation committed: persist physical disk changes
+            harness.commit()
+            execution = ExecutionResult(
+                success=True,
+                file=target_file,
+                original_content=original_content,
+                attempted_content=patched_content,
+                rolled_back=False,
+            )
+            return (
+                execution,
+                val_result,
+                _metrics(
+                    step=step,
+                    target_file=target_file,
+                    layer1=layer1,
+                    patch_correctness=1.0,
+                    execution_success=_execution_score(val_result),
+                    code_diff_correctness=_ast_score(val_result),
+                    task_passed=True,
+                    committed=harness.committed,
+                    observation="validation decision: commit",
+                    validation=_validation_payload(val_result),
+                ),
             )
 
-        elapsed = time.monotonic() - start
-        log.debug(
-            "Tool '%s' completed in %.2fs (success=%s)",
-            tool_name,
-            elapsed,
-            result.success,
-        )
-        if result.metadata is None:
-            result = ToolResult(
-                success=result.success,
-                output=result.output,
-                error=result.error,
-                metadata={"elapsed_s": round(elapsed, 3)},
-            )
-        else:
-            result.metadata["elapsed_s"] = round(elapsed, 3)
+    @staticmethod
+    def _truncate_error(error: str) -> str:
+        if len(error) <= 800:
+            return error
+        return error[:300] + "\n... [TRUNCATED STACKTRACE] ...\n" + error[-500:]
 
-        return result
+
+def _metrics(
+    *,
+    step: int,
+    target_file: str,
+    layer1: Layer1Metrics,
+    patch_correctness: float,
+    execution_success: float,
+    code_diff_correctness: float,
+    task_passed: bool,
+    committed: bool,
+    observation: str,
+    validation: dict[str, object] | None = None,
+) -> FullPipelineMetrics:
+    return FullPipelineMetrics(
+        step=step,
+        target_file=target_file,
+        layer1=layer1,
+        layer2=Layer2Metrics(
+            patch_correctness=patch_correctness,
+            execution_success=execution_success,
+            code_diff_correctness=code_diff_correctness,
+            task_passed=task_passed,
+            observation=observation,
+            committed=committed,
+            validation=validation or {},
+        ),
+    )
+
+
+def _effective_decision(result: ValidationResult) -> ValidationDecision:
+    has_layered_report = any(
+        part is not None for part in (result.ast, result.semantic, result.execution)
+    )
+    if has_layered_report:
+        return result.decision
+    return "commit" if result.success else "retry"
+
+
+def _execution_score(result: ValidationResult) -> float:
+    if result.execution is None:
+        return 1.0 if result.success else 0.0
+    return 1.0 if bool(result.execution.get("pass")) else 0.0
+
+
+def _ast_score(result: ValidationResult) -> float:
+    if result.ast is None:
+        return 1.0 if result.success else 0.0
+    return 1.0 if bool(result.ast.get("pass")) else 0.0
+
+
+def _validation_payload(result: ValidationResult) -> dict[str, object]:
+    score = result.score
+    if not any(part is not None for part in (result.ast, result.semantic, result.execution)):
+        score = 1.0 if result.success else 0.0
+    return {
+        "ast": result.ast or {"pass": result.success, "issues": []},
+        "semantic": result.semantic or {"score": 1.0 if result.success else 0.0},
+        "execution": result.execution or {"pass": result.success, "error": result.error},
+        "decision": _effective_decision(result),
+        "score": score,
+    }

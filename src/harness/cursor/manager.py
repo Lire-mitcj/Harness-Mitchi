@@ -4,8 +4,8 @@ import difflib
 from dataclasses import replace
 from typing import Literal
 
-from src.agent.cursor_contracts import ExecutionResult, ValidationResult
-from src.agent.cursor_state import CursorState, ExecutionTrace, PatchMemory
+from src.agent.contracts import ExecutionResult, ValidationResult
+from src.agent.state import CursorState, ExecutionTrace, PatchMemory
 
 
 class CursorStateManager:
@@ -196,7 +196,7 @@ class CursorStateManager:
         elif "syntax" in str(error_type).lower():
             increase = 1.5
 
-        from src.agent.cursor_state import ExecutionTrace
+        from src.agent.state import ExecutionTrace
         traces = state.execution_traces + (ExecutionTrace(
             step=state.current_step,
             target_file=file,

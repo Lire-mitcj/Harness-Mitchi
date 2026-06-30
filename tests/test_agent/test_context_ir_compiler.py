@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from src.agent.cursor_context_pack_builder import CursorContextPackBuilder
-from src.agent.cursor_contracts import RetrievalResult, RetrievalSymbol
-from src.agent.cursor_fusion import CursorFusionEngine
-from src.agent.cursor_query_bridge import QueryBridgeResult
+from src.tools.assembled.context_pack_builder import CursorContextPackBuilder
+from src.agent.contracts import RetrievalResult, RetrievalSymbol
+from src.tools.assembled.fusion import CursorFusionEngine
+from src.tools.assembled.query_bridge import QueryBridgeResult
 
 
 def test_three_layer_ir_keeps_core_exact_and_filters_header(tmp_path: Path) -> None:
@@ -98,7 +98,7 @@ def test_context_coalescing_with_collapsed_placeholder(tmp_path: Path) -> None:
     ))
 
     builder = CursorContextPackBuilder(tmp_path)
-    from src.agent.cursor_contracts import ContextPack, ContextWindow
+    from src.agent.contracts import ContextPack, ContextWindow
     initial_pack = ContextPack(windows=(
         ContextWindow(file="app.py", start_line=3, end_line=4, content="func1 content", symbols=("func1",)),
         ContextWindow(file="app.py", start_line=7, end_line=8, content="func3 content", symbols=("func3",)),

@@ -202,5 +202,12 @@ def get_tool_status_text(name: str, arguments: dict[str, Any]) -> str:
         case "context_search":
             return "正在搜索上下文…"
         case _:
-            return f"正在运行工具 {name}…"
+            return f"running tool {name}..."
+
+
+PARALLEL_RETRIEVAL_TOOLS = frozenset({
+    "codebase_retrieve",
+    "view_symbol_code",
+    "grep_search",
+})
 

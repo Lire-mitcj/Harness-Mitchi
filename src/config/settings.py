@@ -23,6 +23,7 @@ _ENV_KEYS_TO_SANITIZE = (
     "MITKII_FINAL_SUMMARY_MODEL",
     "MITKII_JUDGE_MODEL",
     "MITKII_CURSOR_INTER_MODEL",
+    "MITKII_CURSOR_SUMMARIZER_MODEL",
     "MITKII_CURSOR_DECISION_MODEL",
     "MITKII_CURSOR_RERANKER_MODEL",
     "ANTHROPIC_API_KEY",
@@ -130,7 +131,7 @@ class MitKIISettings(BaseSettings):
     cursor_reranker_top_n: int = Field(default=50, ge=1, le=100)
     cursor_reranker_timeout: float = Field(default=10.0, ge=0.5, le=60.0)
     cursor_reranker_api_base: str | None = None
-    cursor_query_bridge_timeout: float = Field(default=30.0, ge=1.0, le=60.0)
+    cursor_query_bridge_timeout: float = Field(default=15.0, ge=1.0, le=60.0)
     cursor_graph_bridge_depth: int = Field(default=2, ge=1, le=4)
     cursor_graph_bridge_max_symbols: int = Field(default=10, ge=1, le=30)
     cursor_graph_bridge_max_files: int = Field(default=5, ge=1, le=15)
@@ -151,12 +152,14 @@ class MitKIISettings(BaseSettings):
     )
     cursor_validator_command: list[str] = Field(default_factory=lambda: ["pytest"])
     cursor_validator_timeout: float = Field(default=120.0, ge=1.0, le=1800.0)
-    cursor_validator_model: str = "openai/deepseek-ai/DeepSeek-V4-Flash"
+    cursor_validator_model: str = "openai/Qwen/Qwen2.5-32B-Instruct"
     cursor_validator_semantic_timeout: float = Field(default=30.0, ge=1.0, le=120.0)
     cursor_observation_max_chars: int = Field(default=2000, ge=256, le=20_000)
     cursor_inter_enabled: bool = True
     cursor_inter_model: str = "openai/Qwen/Qwen2.5-7B-Instruct"
-    cursor_decision_model: str = "openai/deepseek-ai/DeepSeek-V4-Flash"
+    cursor_summarizer_model: str = "openai/Qwen/Qwen2.5-32B-Instruct"
+    cursor_query_bridge_model: str = "openai/Qwen/Qwen2.5-32B-Instruct"
+    cursor_decision_model: str = "openai/Qwen/Qwen2.5-32B-Instruct"
     cursor_semantic_tags_enabled: bool = False
     edit_splice_enabled: bool = Field(
         default=True,
@@ -298,7 +301,19 @@ class MitKIISettings(BaseSettings):
         default=180,
         ge=30,
         le=600,
-        description="Timeout (seconds) for Planner/Scout non-streaming LLM calls.",
+        description="Connection and first-stream-event timeout in seconds.",
+    )
+    llm_stream_idle_timeout: int = Field(
+        default=60,
+        ge=5,
+        le=600,
+        description="Maximum idle seconds between streaming chunks; not a total deadline.",
+    )
+    ready_final_max_tokens: int = Field(
+        default=1024,
+        ge=256,
+        le=4096,
+        description="Completion-token cap for RESPONDING-phase diagnose answers.",
     )
     scout_max_tokens: int = Field(
         default=1024,

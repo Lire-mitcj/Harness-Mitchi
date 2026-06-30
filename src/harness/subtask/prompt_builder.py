@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from src.agent.types import Message, system_message, user_message
+from src.context.prompt_resources import load_internal_prompt
 from src.executor.final_output import parse_executor_final
-from src.harness.subtask.artifacts import build_artifact_store
 from src.harness.gates.types import TruncationPolicy
 from src.harness.probe.token_budget import TokenBudget
+from src.harness.subtask.artifacts import build_artifact_store
 from src.harness.subtask.preload import load_context_file_contents
 from src.planner.context_policy import effective_context_files
 from src.planner.kinds import SubTaskKind
@@ -23,10 +24,6 @@ from src.planner.task_tree import SubTaskNode, TaskTree
 
 log = logging.getLogger(__name__)
 
-_EXECUTOR_PROMPT_PATH = (
-    Path(__file__).resolve().parent.parent.parent.parent / "prompts" / "executor_prompt.md"
-)
-
 _EXECUTOR_FALLBACK = """You are MitKII Executor — complete ONE subtask using only allowed_tools."""
 
 _EXECUTOR_SYSTEM_PROMPT: str | None = None
@@ -37,11 +34,10 @@ def load_executor_system_prompt() -> str:
     global _EXECUTOR_SYSTEM_PROMPT
     if _EXECUTOR_SYSTEM_PROMPT is not None:
         return _EXECUTOR_SYSTEM_PROMPT
-    if _EXECUTOR_PROMPT_PATH.is_file():
-        _EXECUTOR_SYSTEM_PROMPT = _EXECUTOR_PROMPT_PATH.read_text(encoding="utf-8").strip()
-    else:
-        log.warning("executor_prompt.md missing, using embedded fallback")
-        _EXECUTOR_SYSTEM_PROMPT = _EXECUTOR_FALLBACK
+    _EXECUTOR_SYSTEM_PROMPT = load_internal_prompt(
+        "executor_prompt.md",
+        fallback=_EXECUTOR_FALLBACK,
+    )
     return _EXECUTOR_SYSTEM_PROMPT
 
 

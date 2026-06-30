@@ -3,8 +3,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-
-from src.agent.cursor_loop import CursorLoop
 from src.config.permissions import PermissionManager
 from src.config.settings import MitKIISettings, get_settings
 from src.context.builder import ContextBuilder
@@ -34,21 +32,10 @@ class MitKIISession:
     cursor_decision_llm: LLMClient
 
     def create_core_loop(self) -> Any:
-        """Create the core loop driver based on the configured mitkii_mode."""
-        if self.settings.mitkii_mode == "assembled":
-            from src.agent.state_assembled_loop import StateAssembledLoop
-            return StateAssembledLoop(
-                llm=self.llm,
-                tools=self.tools,
-                harness=self.harness,
-                context=self.context_builder,
-                permissions=self.permissions,
-                settings=self.settings,
-            )
-        return CursorLoop(
-            llm=self.cursor_decision_llm,
-            inter_llm=self.cursor_inter_llm,
-            decision_llm=self.cursor_decision_llm,
+        """Create the core loop driver."""
+        from src.agent.state_assembled_loop import StateAssembledLoop
+        return StateAssembledLoop(
+            llm=self.llm,
             tools=self.tools,
             harness=self.harness,
             context=self.context_builder,
@@ -99,6 +86,7 @@ def create_mitkii_session(
         return LLMClient(
             model=model,
             request_timeout=float(settings.llm_request_timeout),
+            stream_idle_timeout=float(settings.llm_stream_idle_timeout),
             prompt_cache_enabled=settings.prompt_cache_enabled,
             prompt_cache_min_tokens=settings.prompt_cache_min_tokens,
             prompt_cache_ttl=cache_ttl,  # type: ignore[arg-type]
@@ -110,6 +98,7 @@ def create_mitkii_session(
 
     from src.tools.assembled.codebase_retrieve import CodebaseRetrieveTool
     from src.tools.assembled.decision_edit import DecisionEditTool
+    from src.tools.assembled.view_symbol_code import ViewSymbolCodeTool
 
     tools.register(
         CodebaseRetrieveTool(
@@ -128,6 +117,12 @@ def create_mitkii_session(
             settings=settings,
             decision_llm=cursor_decision_llm,
             harness=harness,
+        )
+    )
+    tools.register(
+        ViewSymbolCodeTool(
+            project_root=root,
+            settings=settings,
         )
     )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from rich.console import Console
@@ -117,8 +118,7 @@ class CLIRenderer:
         style = self.theme.success if success else self.theme.error
 
         if success and name == "grep_search":
-            lines = [ln for ln in result.splitlines() if ln.strip()]
-            output = f"{len(lines)} match(es)"
+            output = _format_grep_count(result)
         else:
             summary = _format_compact_tool_result(name, result) if success else None
             output = summary if summary is not None else result
@@ -341,14 +341,28 @@ def _format_compact_tool_call(name: str, params: dict[str, Any]) -> str:
 
 def _format_compact_tool_result(name: str, result: str) -> str | None:
     if name == "grep_search":
-        lines = [ln for ln in result.splitlines() if ln.strip()]
-        return f"{len(lines)} match(es)"
+        return _format_grep_count(result)
     if name == "shell_exec":
         lines = result.strip().splitlines()
         if len(lines) > 8:
             head = "\n".join(lines[:4])
             return f"{head}\n  ... ({len(lines)} lines)"
     return None
+
+
+def _format_grep_count(result: str) -> str:
+    try:
+        payload = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        return "grep result"
+    if isinstance(payload, dict):
+        returned = int(payload.get("returned_matches", len(payload.get("matches") or [])))
+        total = int(payload.get("total_matches", returned))
+        suffix = f" of {total}" if total != returned else ""
+        return f"{returned}{suffix} match(es)"
+    if isinstance(payload, list):
+        return f"{len(payload)} match(es)"
+    return "0 match(es)"
 
 
 def _on_thinking(r: CLIRenderer, e: AgentEvent) -> None:

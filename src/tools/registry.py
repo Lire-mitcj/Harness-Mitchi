@@ -87,7 +87,7 @@ def create_default_registry(
     from src.tools.git.stash import GitStashTool
     from src.tools.git.status import GitStatusTool
     from src.tools.search.glob import GlobFilesTool
-    from src.tools.search.grep import GrepSearchTool
+    from src.tools.assembled.grep_search import GrepSearchTool
     from src.tools.search.list_dir import ListDirTool
     from src.tools.search.map_search import MapSearchTool
     from src.tools.shell.executor import ShellExecTool
