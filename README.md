@@ -11,72 +11,50 @@ MitKII 是一款终端驱动的、具备高度自主能力的 AI 编码代理（
 MitKII 的系统架构可以清晰地划分为五大协同层次。以下是系统整体数据流与组件关系拓扑图（可在 GitHub 直接渲染渲染）：
 
 ```mermaid
-graph TD
-    %% Define Classes for Layers
-    classDef surface fill:#E1F5FE,stroke:#03A9F4,stroke-width:2px;
-    classDef core fill:#EDE7F6,stroke:#673AB7,stroke-width:2px;
-    classDef safety fill:#E0F2F1,stroke:#009688,stroke-width:2px;
-    classDef backend fill:#F5F5F5,stroke:#9E9E9E,stroke-width:2px;
-    classDef state fill:#EFEBE9,stroke:#795548,stroke-width:2px;
+flowchart TD
+    %% Styles Definition
+    classDef surface fill:#E1F5FE,stroke:#0288D1,stroke-width:2px,color:#01579B;
+    classDef core fill:#EDE7F6,stroke:#5E35B1,stroke-width:2px,color:#4A148C;
+    classDef state fill:#EFEBE9,stroke:#6D4C41,stroke-width:2px,color:#3E2723;
+    classDef safety fill:#E0F2F1,stroke:#00897B,stroke-width:2px,color:#004D40;
 
-    %% Subgraphs representing the layers
-    subgraph Surface_Layer ["🖥️ Surface Layer (表现层)"]
-        CLI[Interactive CLI <br> repl.py]
-        Render[UI / Render <br> renderer.py]
-        App[Headless CLI <br> app.py]
-        CLI --> Render
-        App --> Render
-    end
+    %% 2x2 Grid Structure
+    Surface_Layer["🖥️ Surface Layer (表现层)
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━
+    • repl.py (终端交互 REPL)
+    • renderer.py (Rich UI 渲染)
+    • app.py (CLI 配置向导)"]
 
-    subgraph Core_Layer ["🧠 Core Layer (核心决策环)"]
-        Loop[Agent Loop <br> state_assembled_loop.py]
-        Compaction[Compaction Pipeline <br> context_assembly.py]
-        Loop <--> Compaction
-    end
+    Core_Layer["🧠 Core Layer (核心决策层)
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━
+    • state_assembled_loop.py (Agent Loop)
+    • context_assembly.py (上下文压缩)"]
 
-    subgraph Safety_Action_Layer ["🛡️ Safety / Action Layer (安全与动作层)"]
-        Permission[Permission System <br> explore_guard.py & framework_guard.py]
-        Hooks[Hook Pipeline <br> before_tool.py & after_tool.py]
-        Tools[Built-in Tools <br> src/tools/]
-        Sandbox[Shell Sandbox <br> shell_guard.py]
-        
-        Permission --> Hooks
-        Hooks --> Tools
-        Tools --> Sandbox
-    end
+    State_Layer["💾 State Layer (状态与记忆层)
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━
+    • run_state.py & state.py (状态跟踪)
+    • manager.py (Checkpoint 恢复)
+    • .mitkii/rules.md (长期记忆库)
+    • session_storage.py (副链录音)"]
 
-    subgraph Backend_Layer ["⚙️ Backend Layer (执行后端层)"]
-        Exec[Execution Backends <br> pytest / python]
-        Resources[External Resources <br> files / git]
-    end
+    Safety_Layer["🛡️ Safety & Backend Layer (安全与动作层)
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━
+    • explore_guard.py (权限分类器)
+    • before_tool.py (拦截管道)
+    • src/tools/ (动作工具集)
+    • pytest / shell (物理沙箱/命令后端)"]
 
-    subgraph State_Layer ["💾 State Layer (状态管理层)"]
-        Context[Context Assembly <br> context_assembly.py]
-        RunState[Runtime State <br> run_state.py & state.py]
-        Persistence[Session Persistence <br> manager.py]
-        Memory[Memory System <br> .mitkii/rules.md]
-        Transcriptions[Sidechain Transcriptions <br> session_storage.py]
-    end
-
-    %% Cross-layer connections
-    Render <-->|submit / progress| Loop
-    Loop -->|tool request| Permission
-    Sandbox -->|shell commands| Exec
-    Sandbox -->|sandboxed execution| Resources
-
-    %% State Layer connections
-    RunState -->|mutate state| Context
-    Context -->|system prompt| Loop
-    Loop -->|transcripts / resume| Persistence
-    Loop -->|memory read/write| Memory
-    Loop -->|sidechain events| Transcriptions
+    %% Pipeline Connections
+    Surface_Layer <-->|用户指令 / 执行进度| Core_Layer
+    Core_Layer <-->|记忆存取 / Prompt 装配| State_Layer
+    Core_Layer -->|工具分发 / 权限请求| Safety_Layer
+    Safety_Layer -->|状态变更 / 结果回传| State_Layer
 
     %% Apply Classes
-    class CLI,Render,App surface;
-    class Loop,Compaction core;
-    class Permission,Hooks,Tools,Sandbox safety;
-    class Exec,Resources backend;
-    class Context,RunState,Persistence,Memory,Transcriptions state;
+    class Surface_Layer surface;
+    class Core_Layer core;
+    class State_Layer state;
+    class Safety_Layer safety;
 ```
 
 ---
