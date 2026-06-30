@@ -12,81 +12,109 @@ MitKII 的系统架构可以清晰地划分为五大协同层次。以下是系�
 
 ```mermaid
 graph TD
-    %% Colors & Styles
-    classDef user fill:#64B5F6,stroke:#1565C0,stroke-width:2px,color:#fff;
-    classDef cli fill:#81C784,stroke:#2E7D32,stroke-width:2px,color:#fff;
-    classDef agent fill:#FFB74D,stroke:#EF6C00,stroke-width:2px,color:#fff;
-    classDef tool fill:#BA68C8,stroke:#6A1B9A,stroke-width:2px,color:#fff;
-    classDef rag fill:#4DD0E1,stroke:#00838F,stroke-width:2px,color:#fff;
-    classDef harness fill:#E57373,stroke:#C62828,stroke-width:2px,color:#fff;
+    %% Define Classes for Layers
+    classDef surface fill:#E1F5FE,stroke:#03A9F4,stroke-width:2px;
+    classDef core fill:#EDE7F6,stroke:#673AB7,stroke-width:2px;
+    classDef safety fill:#E0F2F1,stroke:#009688,stroke-width:2px;
+    classDef backend fill:#F5F5F5,stroke:#9E9E9E,stroke-width:2px;
+    classDef state fill:#EFEBE9,stroke:#795548,stroke-width:2px;
 
-    User([👤 用户 User]) <-->|命令行交互| CLI[🖥️ CLI / REPL 表现层<br>repl.py & renderer.py]
-    
-    subgraph Agent 核心决策环
-        CLI <-->|异步事件流| Loop[🧠 状态装配循环<br>state_assembled_loop.py]
-    end
-    
-    subgraph Tool 工具执行动作层
-        Loop -->|调度运行| Tools[🔧 工具注册中心<br>registry.py]
-        Tools --> Edit[📝 智能编辑决策<br>decision_edit.py]
-        Tools --> Retrieve[🔍 代码检索工具<br>codebase_retrieve.py]
-        Tools --> View[📖 符号读取工具<br>view_symbol_code.py]
-        Tools --> Grep[📂 全局搜索工具<br>grep_search.py]
-    end
-    
-    subgraph RAG 检索引擎
-        Retrieve --> Retriever[Retriever Engine<br>retriever.py]
-        Retriever --> Graph[AST 图谱关联<br>graph_bridge.py]
-        Retriever --> Reranker[双语精排过滤<br>reranker.py]
-        Retriever --> Fusion[检索融合去重<br>fusion.py]
-        Retriever --> Pack[上下文打包压缩<br>context_pack_builder.py]
-    end
-    
-    subgraph Harness 自动化执行与安全沙箱
-        Edit --> Exec[事务化执行器<br>executor.py]
-        Exec --> Val[校验与静态分析门控<br>validator.py]
-        Exec --> Sandbox[独立安全沙箱<br>sandbox/executor.py]
-        Loop --> Checkpoint[版本自动快照<br>checkpoint/store.py]
+    %% Subgraphs representing the layers
+    subgraph Surface_Layer ["🖥️ Surface Layer (表现层)"]
+        CLI[Interactive CLI <br> repl.py]
+        Render[UI / Render <br> renderer.py]
+        App[Headless CLI <br> app.py]
+        CLI --> Render
+        App --> Render
     end
 
-    class User user;
-    class CLI cli;
-    class Loop agent;
-    class Tools,Edit,Retrieve,View,Grep tool;
-    class Retriever,Graph,Reranker,Fusion,Pack rag;
-    class Exec,Val,Sandbox,Checkpoint harness;
+    subgraph Core_Layer ["🧠 Core Layer (核心决策环)"]
+        Loop[Agent Loop <br> state_assembled_loop.py]
+        Compaction[Compaction Pipeline <br> context_assembly.py]
+        Loop <--> Compaction
+    end
+
+    subgraph Safety_Action_Layer ["🛡️ Safety / Action Layer (安全与动作层)"]
+        Permission[Permission System <br> explore_guard.py & framework_guard.py]
+        Hooks[Hook Pipeline <br> before_tool.py & after_tool.py]
+        Tools[Built-in Tools <br> src/tools/]
+        Sandbox[Shell Sandbox <br> shell_guard.py]
+        
+        Permission --> Hooks
+        Hooks --> Tools
+        Tools --> Sandbox
+    end
+
+    subgraph Backend_Layer ["⚙️ Backend Layer (执行后端层)"]
+        Exec[Execution Backends <br> pytest / python]
+        Resources[External Resources <br> files / git]
+    end
+
+    subgraph State_Layer ["💾 State Layer (状态管理层)"]
+        Context[Context Assembly <br> context_assembly.py]
+        RunState[Runtime State <br> run_state.py & state.py]
+        Persistence[Session Persistence <br> manager.py]
+        Memory[Memory System <br> .mitkii/rules.md]
+        Transcriptions[Sidechain Transcriptions <br> session_storage.py]
+    end
+
+    %% Cross-layer connections
+    Render <-->|submit / progress| Loop
+    Loop -->|tool request| Permission
+    Sandbox -->|shell commands| Exec
+    Sandbox -->|sandboxed execution| Resources
+
+    %% State Layer connections
+    RunState -->|mutate state| Context
+    Context -->|system prompt| Loop
+    Loop -->|transcripts / resume| Persistence
+    Loop -->|memory read/write| Memory
+    Loop -->|sidechain events| Transcriptions
+
+    %% Apply Classes
+    class CLI,Render,App surface;
+    class Loop,Compaction core;
+    class Permission,Hooks,Tools,Sandbox safety;
+    class Exec,Resources backend;
+    class Context,RunState,Persistence,Memory,Transcriptions state;
 ```
 
 ---
 
-## 🧩 核心模块详解
+## 🧩 核心模块详解 (5-Layer Modular Breakdown)
 
-### 1. CLI / REPL 表现层 (`src/cli/`)
-- **`repl.py`**: 提供交互式命令 Shell，支持输入历史、多行换行连接、快捷斜杠命令（`/serve` `/history` `/probe` `/score`）。它内部采用 `rich.status` 启动旋转的动态圆点加载动画（Dots Spinner），完美与底层的状态改变事件（Status Event）进行管道互通。
-- **`renderer.py` & `theme.py`**: 基于 Harmonious 暗色和高对比度 HSL 配色方案，将 Agent 执行计划、Tool 调用痕迹、评分结果以极其 premium 的高保真终端视觉呈现。
-- **配置向导**: 首次无 `.env` 启动时，自动触发向导，引导交互式填写 API 密钥及 SiliconFlow 服务商地址，就地生成环境配置，实现开箱即用。
+### 1. Surface Layer (表现层)
+表现层负责与用户或外部程序交互，捕获指令与中断请求，并将 Agent 执行状态以高保真视觉效果渲染出来。
+- **`repl.py` (Interactive CLI)**: 基于 `prompt_toolkit` 提供交互式命令行 Shell，支持命令自动补全、换行连接、多行输入及旋转的圆点加载动画（Dots Spinner）。
+- **`renderer.py` & `theme.py` (UI / Render)**: 负责在终端中以和谐、高保真色彩的 Rich 布局渲染 Agent 计划、执行路径、评估结果。
+- **`app.py` (Headless CLI / Entry)**: CLI 核心入口。内置交互式配置向导，首次启动时引导用户极速配置 API Key 并输出 `.env`。
 
-### 2. 状态装配决策环 (`src/agent/`)
-- **`state_assembled_loop.py`**: Agent 运行的最外层状态机。负责把检索阶段与编辑阶段彻底解耦。
-- **`reallocate_tools.py`**: 动态工具调整 Hook。在检索证据达到饱和（决策重力衰减）或已经形成修改 plan 时，自动缩减工具集为仅 `decision_edit`，以强迫 Agent 收敛到编辑状态，杜绝冗余读取带来的 Token 费用和首字延迟。
-- **`run_state.py`**: 定义了 Reducer 式的状态转换机制，每一次事件输入生成纯净的状态投影。
+### 2. Core Layer (核心决策环)
+核心层是 Agent 大脑，通过状态环不断循环生成计划、挑选工具并进行上下文整理。
+- **`state_assembled_loop.py` (Agent Loop)**: 核心决策环。负责驱动检索（Retrieval）与编辑（Edit）的解耦协同。
+- **`context_assembly.py` (Compaction Pipeline)**: 负责整理和压缩输入上下文，进行冗余空行缩减及 Skeleton AST 结构折叠，保证 Token 预算健康。
 
-### 3. 工具装配层 (`src/tools/`)
-- **`decision_edit.py`**: 负责调用 LLM 将修改意图转化为 `SEARCH/REPLACE` 代码片段，采用 **Stream 流式流出解析器**。在吐出补丁文本的同时实时统计 `+` 和 `-` 行数，通过回调反馈给外层 REPL，使终端的 Loading 转圈能实时刷新出类似 `正在编辑文件: list.py… [+3 -2]` 的进度。
-- **`codebase_retrieve.py`**: 高级代码语义/AST 拓扑/全库索引检索工具。
+### 3. Safety / Action Layer (安全与动作层)
+安全层拦截并过滤危险指令，动作层包含了被调度的各种独立内置工具（包括 RAG 检索引擎）。
+- **`explore_guard.py` & `framework_guard.py` (Permission System)**: 危险操作与白名单安全分类器。
+- **`before_tool.py` & `after_tool.py` (Hook Pipeline)**: 工具运行拦截器。拦截越界调用、强制 Fact Locking 锁定。
+- **`src/tools/` (Built-in Tools)**:
+  - **`decision_edit.py`**: 编辑工具。利用流式 JSON 解析实时向表现层输出新增/删除行数变化进度 `[+A -R]`。
+  - **`codebase_retrieve.py` / `retriever.py`**: 召回主引擎。调度 `graph_bridge.py`（AST 视图拓扑关联）、`reranker.py`（硅基流精排模型）及 `fusion.py`（RRF 融合去重算法）召回最强关联上下文。
+- **`shell_guard.py` (Shell Sandbox)**: 限制并隔离 Shell 命令的执行范围。
 
-### 4. RAG 检索引擎 (`src/tools/assembled/`)
-- **`retriever.py`**: 协调多维度召回核心。
-- **`graph_bridge.py` & `query_bridge.py`**: 利用 Tree-sitter AST 解析和 SQL 视图的元数据图谱（Schema & Tables），建立引用和定义关联。在处理 SQL 复杂嵌套查询时，会自动对表结构与视图别名进行上下文追溯。
-- **`fusion.py`**: 多模检索结果合并，采用互易倒数排名（RRF）融合算法，并智能拦截已经检索过的重复片段。
-- **`reranker.py`**: 支持加载 SiliconFlow 等远程重排模型，筛选出最直接相关的 Top-N 高价值上下文。
-- **`context_pack_builder.py`**: 在保证信息完整性的基础上，自动进行冗余空行折叠、代码骨架化截断（Skeleton Truncation），将拼装好的上下文以最小体积塞入 Core LLM 的 Context Window。
+### 4. Backend Layer (执行后端层)
+后端层是物理层，提供命令执行物理沙箱及文件 IO、Git 存储等外部资源交互。
+- **Execution Backends**: 包括沙箱内的 Python 解释器、运行单元测试的 pytest 引擎。
+- **External Resources**: 文件系统读写读入、Git 版本历史树变更等外部资源。
 
-### 5. Harness 执行沙箱与校验层 (`src/tools/assembled/`)
-- **`executor.py`**: 事务级修改应用器。负责保存被编辑文件的原内容备份，生成临时补丁，并处理可能的物理修改失败。
-- **`validator.py`**: 核心门控校验器。
-  - **动态测试剪枝 (Impact Analysis)**：基于编辑的文件路径，自动去 `tests/` 下寻找对应 `test_<filename>.py` 同名测试文件。如果命中，pytest 只运行该测试子集，将常规的 30s 自动化校验延迟压缩至 2s 内。
-  - **SQL 别名追踪与 Schema 校验**：实现 `mtime` 时间戳缓存的 `_VIEW_SCHEMA_CACHE`。若 SQL 或 py 文件没有发生修改，直接走内存读取解析，使大规模视图关联追踪降至几毫秒。
+### 5. State Layer (状态管理层)
+状态层持久化并跟踪整个生命周期的演进，包括长短期记忆与多线程侧链录音。
+- **`run_state.py` & `state.py` (Runtime State)**: 基于 Reducer 式的流式状态转换。
+- **`context_assembly.py` (Context Assembly)**: 根据最新状态拼装 System Prompt 并投喂给 Core Layer。
+- **`manager.py` (Session Persistence)**: 保存 Patch 记忆、执行痕迹（Execution Trace）并支持 Checkpoint 快照秒级回滚。
+- **`.mitkii/rules.md` (Memory System)**: 储存项目规约和用户指令记忆。
+- **`session_storage.py` (Sidechain Transcriptions)**: 副链日志与大模型多轮 Transcript 事件录音存储。
 
 ---
 
