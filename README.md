@@ -20,34 +20,41 @@ graph TD
     classDef rag fill:#4DD0E1,stroke:#00838F,stroke-width:2px,color:#fff;
     classDef harness fill:#E57373,stroke:#C62828,stroke-width:2px,color:#fff;
 
-    User([👤 用户 User]) :::user <-->|命令行交互| CLI[🖥️ CLI / REPL 表现层<br>repl.py & renderer.py]:::cli
+    User([👤 用户 User]) <-->|命令行交互| CLI[🖥️ CLI / REPL 表现层<br>repl.py & renderer.py]
     
     subgraph Agent 核心决策环
-        CLI <-->|异步事件流| Loop[🧠 状态装配循环<br>state_assembled_loop.py]:::agent
+        CLI <-->|异步事件流| Loop[🧠 状态装配循环<br>state_assembled_loop.py]
     end
     
     subgraph Tool 工具执行动作层
-        Loop -->|调度运行| Tools[🔧 工具注册中心<br>registry.py]:::tool
-        Tools --> Edit[📝 智能编辑决策<br>decision_edit.py]:::tool
-        Tools --> Retrieve[🔍 代码检索工具<br>codebase_retrieve.py]:::tool
-        Tools --> View[📖 符号读取工具<br>view_symbol_code.py]:::tool
-        Tools --> Grep[📂 全局搜索工具<br>grep_search.py]:::tool
+        Loop -->|调度运行| Tools[🔧 工具注册中心<br>registry.py]
+        Tools --> Edit[📝 智能编辑决策<br>decision_edit.py]
+        Tools --> Retrieve[🔍 代码检索工具<br>codebase_retrieve.py]
+        Tools --> View[📖 符号读取工具<br>view_symbol_code.py]
+        Tools --> Grep[📂 全局搜索工具<br>grep_search.py]
     end
     
     subgraph RAG 检索引擎
-        Retrieve --> Retriever[Retriever Engine<br>retriever.py]:::rag
-        Retriever --> Graph[AST 图谱关联<br>graph_bridge.py]:::rag
-        Retriever --> Reranker[双语精排过滤<br>reranker.py]:::rag
-        Retriever --> Fusion[检索融合去重<br>fusion.py]:::rag
-        Retriever --> Pack[上下文打包压缩<br>context_pack_builder.py]:::rag
+        Retrieve --> Retriever[Retriever Engine<br>retriever.py]
+        Retriever --> Graph[AST 图谱关联<br>graph_bridge.py]
+        Retriever --> Reranker[双语精排过滤<br>reranker.py]
+        Retriever --> Fusion[检索融合去重<br>fusion.py]
+        Retriever --> Pack[上下文打包压缩<br>context_pack_builder.py]
     end
     
     subgraph Harness 自动化执行与安全沙箱
-        Edit --> Exec[事务化执行器<br>executor.py]:::harness
-        Exec --> Val[校验与静态分析门控<br>validator.py]:::harness
-        Exec --> Sandbox[独立安全沙箱<br>sandbox/executor.py]:::harness
-        Loop --> Checkpoint[版本自动快照<br>checkpoint/store.py]:::harness
+        Edit --> Exec[事务化执行器<br>executor.py]
+        Exec --> Val[校验与静态分析门控<br>validator.py]
+        Exec --> Sandbox[独立安全沙箱<br>sandbox/executor.py]
+        Loop --> Checkpoint[版本自动快照<br>checkpoint/store.py]
     end
+
+    class User user;
+    class CLI cli;
+    class Loop agent;
+    class Tools,Edit,Retrieve,View,Grep tool;
+    class Retriever,Graph,Reranker,Fusion,Pack rag;
+    class Exec,Val,Sandbox,Checkpoint harness;
 ```
 
 ---
