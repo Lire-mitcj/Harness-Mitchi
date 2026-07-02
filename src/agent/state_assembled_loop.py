@@ -373,11 +373,23 @@ def _enrich_anchor_contract(project_root: Path, item: dict[str, Any]) -> dict[st
 
 
 def _anchor_memory_kind(item: dict[str, Any]) -> str:
-    if item.get("symbol"):
+    code = textwrap.dedent(str(item.get("code") or "")).strip()
+    span = item.get("span") or []
+    span_width = (
+        int(span[1]) - int(span[0]) + 1
+        if len(span) == 2 and all(isinstance(value, int) for value in span)
+        else 0
+    )
+    source_complete = bool(code) and (
+        span_width <= 0 or len(code.splitlines()) >= span_width
+    )
+    if item.get("symbol") and source_complete and not item.get("locator_only"):
         return "symbol"
     file_path = str(item.get("file") or "")
-    code = textwrap.dedent(str(item.get("code") or "")).strip()
-    if file_path.endswith(".sql") or re.match(r"(?is)^CREATE\s+(?:TABLE|VIEW|PROCEDURE|TRIGGER)\b", code):
+    if code and (
+        file_path.endswith(".sql")
+        or re.match(r"(?is)^CREATE\s+(?:TABLE|VIEW|PROCEDURE|TRIGGER)\b", code)
+    ):
         return "schema"
     try:
         tree = ast.parse(code)
@@ -3297,6 +3309,15 @@ class StateAssembledLoop:
         ))
 
     def _merge_raw_evidence(self, project_root: Path, raw_evidence_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        raw_evidence_list = [
+            {
+                **item,
+                "code": item.get("code") or item.get("match_line") or "",
+                "locator_only": bool(item.get("locator_only") or "match_line" in item),
+            }
+            for item in raw_evidence_list
+            if isinstance(item, dict) and item.get("file") and item.get("span")
+        ]
         raw_evidence_list = _dedupe_code_anchors(raw_evidence_list)
         # Retrieval anchors are atomic: (file, span) is their identity.  Combining
         # nearby spans would destroy that identity and its first-hop relations.
@@ -3326,6 +3347,7 @@ class StateAssembledLoop:
                         "file": item["file"],
                         "span": list(item["span"]),
                         "code": item["code"],
+                        "locator_only": bool(item.get("locator_only")),
                         "hash": item.get("hash") or item.get("content_hash") or ""
                     })
                 else:
@@ -3340,6 +3362,7 @@ class StateAssembledLoop:
                             "file": item["file"],
                             "span": list(item["span"]),
                             "code": item["code"],
+                            "locator_only": bool(item.get("locator_only")),
                             "hash": item.get("hash") or item.get("content_hash") or ""
                         })
 

@@ -15,10 +15,15 @@ def apply_post_tool_context_hook(
     if not result.success:
         return result
 
-    # 1. Structure SQL semantic/DDL/DML/JOIN/GRANT queries from output to prevent LLM hallucinations
+    # Parse SQL only from verbatim source. Grep/retrieval outputs are JSON
+    # envelopes and quoted match lines must not be treated as one SQL query.
     structured_output = result.output
-    if result.output:
-        structured_output = _process_sql_structuring(result.output)
+    semantic_source = str((result.metadata or {}).get("verbatim_code") or "")
+    if tool_name == "view_symbol_code" and semantic_source:
+        structured_output = _process_sql_structuring(
+            result.output,
+            semantic_source=semantic_source,
+        )
 
     result = ToolResult(
         success=result.success,
@@ -130,6 +135,19 @@ def apply_post_tool_context_hook(
     target_file = str(arguments.get("target_file") or "").strip()
     if not target_file:
         return result
+
+    # Invalidate validator schema cache for this file
+    try:
+        from src.agent.validator import _VIEW_SCHEMA_CACHE
+        target_norm = target_file.replace("\\", "/").lstrip("./")
+        keys_to_remove = [
+            key for key in _VIEW_SCHEMA_CACHE
+            if key.replace("\\", "/").endswith(target_norm)
+        ]
+        for key in keys_to_remove:
+            _VIEW_SCHEMA_CACHE.pop(key, None)
+    except Exception:
+        pass
 
     metadata["artifact_update"] = {"invalidate_code_files": [target_file]}
     metadata["task_completion"] = {
@@ -244,11 +262,15 @@ def _rank_pending_symbols(
     return [payload for _, payload in ordered[: max(3, min(5, limit))]]
 
 
-def _process_sql_structuring(output_text: str) -> str:
+def _process_sql_structuring(
+    output_text: str,
+    *,
+    semantic_source: str | None = None,
+) -> str:
     if not output_text:
         return output_text
     
-    structs = _parse_and_structure_sql(output_text)
+    structs = _parse_and_structure_sql(semantic_source or output_text)
     if not structs:
         return output_text
         

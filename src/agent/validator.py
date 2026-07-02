@@ -45,6 +45,7 @@ class CursorValidator:
         self.semantic_timeout = semantic_timeout
         self.sql_parser = UniversalSqlParser()
 
+
     async def validate(
         self,
         *,
@@ -169,7 +170,11 @@ class CursorValidator:
         missing_fields: list[str] = []
 
         patch_blocks = _patch_blocks(patch)
-        sql_fragments = _patch_sql_fragments(patch_blocks)
+        suffix = Path(target_file).suffix.casefold()
+        if suffix == ".sql":
+            sql_fragments = tuple(replace for _search, replace in patch_blocks)
+        else:
+            sql_fragments = _patch_sql_fragments(patch_blocks)
         sql_scope = "\n".join(sql_fragments) if sql_fragments else patched_content
 
         if _SQL_RE.search(sql_scope):
@@ -526,7 +531,9 @@ def _has_unbalanced_sql_quotes(content: str) -> bool:
     return bool(single % 2 or double % 2)
 
 
-_VIEW_SCHEMA_CACHE: dict[str, tuple[float, dict[str, dict[str, set[str]]]]] = {}
+_VIEW_SCHEMA_CACHE: dict[
+    str, tuple[tuple[int, int, int], dict[str, dict[str, set[str]]]]
+] = {}
 
 
 def _collect_view_schemas(
@@ -550,17 +557,21 @@ def _collect_view_schemas(
             continue
         path_str = str(path.resolve())
         try:
-            mtime = path.stat().st_mtime
+            stat = path.stat()
+            # st_mtime is commonly rounded by filesystems and test fixtures.  A
+            # size component prevents a rapid schema edit from reusing the old
+            # parsed view definition when the timestamp has not advanced.
+            signature = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
         except OSError:
             continue
         cached_entry = _VIEW_SCHEMA_CACHE.get(path_str)
-        if cached_entry and cached_entry[0] == mtime:
+        if cached_entry and cached_entry[0] == signature:
             view_schemas.update(cached_entry[1])
             continue
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
             file_schemas = _view_schemas_from_content(content)
-            _VIEW_SCHEMA_CACHE[path_str] = (mtime, file_schemas)
+            _VIEW_SCHEMA_CACHE[path_str] = (signature, file_schemas)
             view_schemas.update(file_schemas)
         except OSError:
             continue
@@ -721,9 +732,23 @@ def _select_fields(content: str) -> set[str]:
     if match is None:
         return set()
     fields: set[str] = set()
-    for raw in match.group("fields").split(","):
-        token = raw.strip().split()[-1] if raw.strip() else ""
-        token = re.sub(r"[^a-zA-Z0-9_]", "", token.split(".")[-1])
+    for raw in _split_sql_csv(match.group("fields")):
+        expression = raw.strip()
+        if not expression or expression == "*":
+            continue
+        # A view exposes the alias when one is present; otherwise it exposes
+        # the source column.  Splitting on SQL commas is nesting-aware, unlike
+        # str.split(','), so function arguments do not become phantom fields.
+        alias_match = re.search(
+            r"\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*$",
+            expression,
+            re.IGNORECASE,
+        )
+        if alias_match:
+            token = alias_match.group(1)
+        else:
+            source = expression.rsplit(".", 1)[-1]
+            token = re.sub(r"[^a-zA-Z0-9_]", "", source)
         if token:
             fields.add(token.casefold())
     return fields
@@ -820,10 +845,19 @@ def _validation_error(
         )
     if not semantic_result.get("pass"):
         details = semantic_result.get("details", {})
-        schema_issues = details.get("schema", {}).get("issues", [])
+        schema = details.get("schema", {})
+        schema_issues = schema.get("issues", [])
         issues = schema_issues if isinstance(schema_issues, list) else []
         if issues:
-            return "Schema validation failed: " + ", ".join(str(item) for item in issues)
+            message = "Schema validation failed: " + ", ".join(
+                str(item) for item in issues
+            )
+            missing_fields = schema.get("missing_fields", [])
+            if isinstance(missing_fields, list) and missing_fields:
+                message += "; missing_fields=" + ",".join(
+                    str(item) for item in missing_fields
+                )
+            return message
         return "Schema validation failed: " + json.dumps(
             details,
             ensure_ascii=False,

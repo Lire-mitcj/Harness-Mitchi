@@ -22,6 +22,7 @@ from src.agent.state_assembled_loop import (
     _get_git_state,
     _dedupe_code_anchors,
     _anchor_key,
+    _anchor_memory_kind,
     _enrich_anchor_contract,
     _microcompact_retrieval_payload,
     _repeated_retrieval_message,
@@ -586,6 +587,17 @@ def test_code_anchor_overlap_gate_drops_more_than_ninety_percent_duplicate() -> 
         outer,
         same_span_other_symbol,
     ]
+
+
+def test_grep_symbol_locator_is_not_a_complete_code_anchor() -> None:
+    locator = {
+        "file": "list.py",
+        "symbol": "build_router",
+        "span": [16, 16],
+        "match_line": "def build_router(engine):",
+    }
+
+    assert _anchor_memory_kind(locator) == "fact"
 
 
 def test_anchor_ingestion_splits_symbols_file_facts_and_schema(temp_project: Path) -> None:
@@ -1158,9 +1170,6 @@ async def test_responding_phase_never_executes_repeated_retrieval_calls(
 
     events = [event async for event in loop.run("diagnose function")]
 
-    # Under the new determine_allowed_tools hook, once retrieval completes (after step 1),
-    # subsequent steps are limited to allowed_tools = frozenset() in diagnose mode.
-    # Therefore, both the 2nd and 3rd tool calls are blocked at the allow-list level.
     assert tools.call.await_count == 1
     tool_results = [event for event in events if event.type == EventType.TOOL_RESULT]
     assert len(tool_results) == 3
@@ -1571,6 +1580,34 @@ def test_merge_raw_evidence_fallback_no_disk() -> None:
     assert len(merged) == 1
     assert merged[0]["span"] == [1, 4]
     assert merged[0]["code"] == "line 1\nline 2\nline 3\nline 4"
+
+
+def test_merge_raw_grep_locators_without_code_key(temp_project: Path) -> None:
+    loop = StateAssembledLoop(
+        llm=MagicMock(),
+        tools=MagicMock(),
+        harness=MagicMock(project_root=temp_project),
+        context=MagicMock(),
+        permissions=MagicMock(),
+        settings=MagicMock(max_turns=1),
+    )
+    (temp_project / "list.py").write_text(
+        "def build_router(engine):\n    return engine\n",
+        encoding="utf-8",
+    )
+
+    merged = loop._merge_raw_evidence(
+        temp_project,
+        [{
+            "file": "list.py",
+            "symbol": "build_router",
+            "span": [1, 1],
+            "match_line": "def build_router(engine):",
+        }],
+    )
+
+    assert merged[0]["code"] == "def build_router(engine):"
+    assert merged[0]["locator_only"] is True
 
 
 def test_decision_edit_context_pack_with_layer_1(temp_project: Path) -> None:
@@ -2125,3 +2162,117 @@ async def test_view_symbol_code_tool(temp_project: Path) -> None:
     assert res9.metadata["resolved_file"] == "init.sql"
     assert res9.metadata["file"] == "init.sql"
     assert "CREATE VIEW `view_ticket_report_detail`" in res9.metadata["verbatim_code"]
+
+    # SQL programmable objects respect custom delimiter boundaries.
+    programmable_sql = (
+        "DELIMITER $$\n"
+        "CREATE PROCEDURE `sp_create_ticket_order`(IN p_id INT)\n"
+        "BEGIN\n"
+        "  INSERT INTO ticket_order (p_id) VALUES (p_id);\n"
+        "  SELECT LAST_INSERT_ID();\n"
+        "END$$\n"
+        "CREATE TRIGGER `tg_release_seat` AFTER UPDATE ON ticket_order\n"
+        "FOR EACH ROW\n"
+        "BEGIN\n"
+        "  UPDATE flight_seat SET is_booked = 0 WHERE seat_id = OLD.seat_id;\n"
+        "END$$\n"
+        "DELIMITER ;\n"
+    )
+    (temp_project / "routines.sql").write_text(programmable_sql, encoding="utf-8")
+    procedure = await tool.execute(
+        target_file="routines.sql", symbol="sp_create_ticket_order"
+    )
+    trigger = await tool.execute(target_file="routines.sql", symbol="tg_release_seat")
+    assert procedure.success is True
+    assert "SELECT LAST_INSERT_ID();" in procedure.metadata["verbatim_code"]
+    assert procedure.metadata["verbatim_code"].endswith("END$$")
+    assert trigger.success is True
+    assert "CREATE TRIGGER `tg_release_seat`" in trigger.metadata["verbatim_code"]
+    assert trigger.metadata["verbatim_code"].endswith("END$$")
+
+    # Test case 9: File-level fallback if symbol matches filename or is a wildcard
+    res10 = await tool.execute(target_file="init.sql", symbol="init.sql")
+    assert res10.success is True
+    assert res10.metadata["span"] == [1, 4]
+    assert "CREATE TABLE my_table" in res10.metadata["verbatim_code"]
+
+    res11 = await tool.execute(target_file="init.sql", symbol="*")
+    assert res11.success is True
+    assert res11.metadata["span"] == [1, 4]
+
+
+@pytest.mark.asyncio
+async def test_decision_edit_tool_with_target_file_span(temp_project: Path) -> None:
+    mock_settings = MagicMock()
+    mock_settings.cursor_validator_model = "none"
+    mock_settings.cursor_validator_command = ["pytest"]
+    mock_settings.cursor_validator_timeout = 10.0
+    mock_settings.cursor_observation_max_chars = 1000
+    mock_settings.prompt_cache_ttl = "5m"
+
+    mock_harness = MagicMock()
+    mock_harness.project_root = temp_project
+    mock_harness.before_llm_call = AsyncMock(side_effect=lambda x: x)
+    mock_harness.after_llm_call = AsyncMock()
+
+    mock_llm = AsyncMock()
+    mock_resp = MagicMock()
+    mock_resp.content = '{"action":"edit","target_file":"target.py","patch":"..."}'
+    mock_resp.usage = MagicMock()
+    mock_llm.chat = AsyncMock(return_value=mock_resp)
+
+    # Setup target file with multiple lines
+    target_file = temp_project / "target.py"
+    target_file.write_text("line1\nline2\nline3\nline4\nline5\n", encoding="utf-8")
+
+    with patch("src.tools.assembled.decision_edit.CursorDecisionLLM") as mock_dec_cls, \
+         patch("src.tools.assembled.decision_edit.CursorPatchApplier"), \
+         patch("src.tools.assembled.decision_edit.CursorExecutor") as mock_exec_cls, \
+         patch("src.tools.assembled.decision_edit.CursorValidator"):
+
+        mock_dec = mock_dec_cls.return_value
+        from src.agent.contracts import Decision
+        parsed_decision = Decision(
+            action="edit",
+            target_file="target.py",
+            patch="<<<<<<< SEARCH\nline3\n=======\nline3_modified\n>>>>>>> REPLACE",
+            suggested_completion=100
+        )
+        mock_dec.parse = MagicMock(return_value=parsed_decision)
+        mock_dec.build_messages = MagicMock(return_value=[])
+        
+        mock_exec = mock_exec_cls.return_value
+        from src.agent.contracts import ExecutionResult, ValidationResult
+        exec_res = ExecutionResult(success=True, file="target.py")
+        val_res = ValidationResult(success=True)
+        mock_exec.execute_transaction = AsyncMock(return_value=(exec_res, val_res, MagicMock()))
+
+        tool = DecisionEditTool(
+            project_root=temp_project,
+            settings=mock_settings,
+            decision_llm=mock_llm,
+            harness=mock_harness,
+        )
+
+        # Call with context_window containing target.py span
+        result = await tool.execute(
+            target_file="target.py",
+            intent="edit line3",
+            context_window=[
+                {"file": "target.py", "span": [2, 4], "reason": "target span"}
+            ]
+        )
+        assert result.success is True
+
+        # Verify that only lines 2-4 of target.py were loaded as the target ContextWindow
+        call_args = mock_dec.build_messages.call_args[1]
+        context_pack = call_args["context_pack"]
+        windows = context_pack.windows
+        
+        target_windows = [w for w in windows if w.file == "target.py"]
+        assert len(target_windows) == 1
+        assert target_windows[0].role == "target"
+        assert target_windows[0].mode == "snippet"
+        assert target_windows[0].start_line == 2
+        assert target_windows[0].end_line == 4
+        assert target_windows[0].content == "line2\nline3\nline4"

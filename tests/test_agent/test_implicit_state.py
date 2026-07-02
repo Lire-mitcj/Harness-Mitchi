@@ -297,7 +297,12 @@ async def test_plan_lock_execution_mode() -> None:
         {"pattern": "auth_me", "mode": "symbol"},
         allowed_tools={"grep_search"},
         checklist=["[ ] Fix auth"],
-        context_anchors_code=[{"symbol": "auth_me"}],
+        context_anchors_code=[{
+            "symbol": "auth_me",
+            "file": "auth.py",
+            "span": [1, 2],
+            "code": "def auth_me():\n    return True",
+        }],
     )
     assert err is not None
     assert "Redundant search. Symbol 'auth_me' is already present" in err
@@ -308,7 +313,12 @@ async def test_plan_lock_execution_mode() -> None:
         {"symbol": "auth_me", "target_file": "auth.py"},
         allowed_tools={"view_symbol_code"},
         checklist=["[ ] Fix auth"],
-        context_anchors_code=[{"symbol": "auth_me"}],
+        context_anchors_code=[{
+            "symbol": "auth_me",
+            "file": "auth.py",
+            "span": [1, 2],
+            "code": "def auth_me():\n    return True",
+        }],
     )
     assert err is not None
     assert "Redundant read. Symbol 'auth_me' is already present" in err
@@ -320,7 +330,12 @@ async def test_plan_lock_execution_mode() -> None:
         allowed_tools={"view_symbol_code"},
         checklist=["[ ] Fix auth"],
         context_anchors_code=[],
-        raw_evidence_store=[{"symbol": "auth_me", "file": "auth.py"}],
+        raw_evidence_store=[{
+            "symbol": "auth_me",
+            "file": "auth.py",
+            "span": [1, 2],
+            "code": "def auth_me():\n    return True",
+        }],
     )
     assert err is not None
     assert "already loaded in a previous step and is cached" in err
@@ -331,10 +346,30 @@ async def test_plan_lock_execution_mode() -> None:
         {"symbol": "auth_me", "target_file": "auth.py"},
         allowed_tools={"view_symbol_code"},
         checklist=[],
-        context_anchors_code=[{"symbol": "auth_me"}],
+        context_anchors_code=[{
+            "symbol": "auth_me",
+            "file": "auth.py",
+            "span": [1, 2],
+            "code": "def auth_me():\n    return True",
+        }],
     )
     assert err is not None
     assert "Redundant read. Symbol 'auth_me' is already present" in err
+
+    # Locator-only grep anchors do not prove that the symbol body was loaded.
+    err = await inspect_tool_request_async(
+        "view_symbol_code",
+        {"symbol": "auth_me", "target_file": "auth.py"},
+        allowed_tools={"view_symbol_code"},
+        checklist=[],
+        context_anchors_code=[{
+            "symbol": "auth_me",
+            "file": "auth.py",
+            "span": [1, 1],
+            "match_line": "def auth_me():",
+        }],
+    )
+    assert err is None
 
     # 8. view_symbol_code is ALLOWED if the target file is in modified_files (verification bypass)
     err = await inspect_tool_request_async(
@@ -527,5 +562,3 @@ def test_retrieval_disabled_schema_pruning() -> None:
     res = controller.coordinate_next_turn(context_mock, env_mock)
     assert controller.retrieval_disabled is True
     assert "DECISION OVERRIDE LAYER" in res["gravity_prompt"]
-
-

@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 MAX_SYMBOL_OUTPUT_LINES = 120
 MAX_SYMBOL_OUTPUT_CHARS = 8_000
 _SKIPPED_SEARCH_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build"}
+_SQL_DEFINITION_KINDS = "TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|EVENT"
 
 
 def _find_symbol_span_in_python_file(content: str, symbol_name: str) -> tuple[int, int] | None:
@@ -75,7 +76,9 @@ def _find_symbol_span_by_regex(content: str, symbol_name: str) -> tuple[int, int
         # 3. matches SQL view/table definitions with optional backticks/quotes
         escaped_name = re.escape(last_part)
         sql_match = re.search(
-            r'\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP\s+|TEMPORARY\s+)?(?:TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+            r'\bCREATE\s+(?:OR\s+REPLACE\s+)?'
+            r'(?:DEFINER\s*=\s*\S+\s+)?(?:TEMP\s+|TEMPORARY\s+)?'
+            rf'(?:{_SQL_DEFINITION_KINDS})\s+(?:IF\s+NOT\s+EXISTS\s+)?'
             rf'(?:`{escaped_name}`|"{escaped_name}"|\'{escaped_name}\'|\b{escaped_name}\b)',
             line,
             re.IGNORECASE
@@ -84,13 +87,7 @@ def _find_symbol_span_by_regex(content: str, symbol_name: str) -> tuple[int, int
         if def_match or assign_match or sql_match:
             start_line = idx + 1
             if sql_match:
-                end_line = start_line
-                for j in range(idx, len(lines)):
-                    if ';' in lines[j]:
-                        end_line = j + 1
-                        break
-                    end_line = j + 1
-                return start_line, end_line
+                return start_line, _find_sql_definition_end(lines, idx)
 
             indent_match = re.match(r'^(\s*)', line)
             indent = indent_match.group(1) if indent_match else ""
@@ -107,6 +104,35 @@ def _find_symbol_span_by_regex(content: str, symbol_name: str) -> tuple[int, int
                 end_line = j + 1
             return start_line, end_line
     return None
+
+
+def _find_sql_definition_end(lines: list[str], start_index: int) -> int:
+    """Locate a SQL object's end while respecting MySQL DELIMITER blocks."""
+    delimiter = ";"
+    for line in lines[:start_index]:
+        match = re.match(r"\s*DELIMITER\s+(\S+)", line, re.IGNORECASE)
+        if match:
+            delimiter = match.group(1)
+
+    if delimiter != ";":
+        for index in range(start_index, len(lines)):
+            if delimiter in lines[index]:
+                return index + 1
+
+    declaration = lines[start_index].casefold()
+    is_programmable = any(
+        f" {kind} " in f" {declaration} "
+        for kind in ("procedure", "function", "trigger", "event")
+    )
+    if is_programmable:
+        for index in range(start_index, len(lines)):
+            if re.search(r"\bEND\s*;", lines[index], re.IGNORECASE):
+                return index + 1
+
+    for index in range(start_index, len(lines)):
+        if ";" in lines[index]:
+            return index + 1
+    return len(lines)
 
 
 def _find_symbol_definitions(
@@ -127,7 +153,9 @@ def _find_symbol_definitions(
     # SQL view/table declaration pattern
     escaped_name = re.escape(leaf_name)
     sql_declaration = re.compile(
-        r'\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP\s+|TEMPORARY\s+)?(?:TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+        r'\bCREATE\s+(?:OR\s+REPLACE\s+)?'
+        r'(?:DEFINER\s*=\s*\S+\s+)?(?:TEMP\s+|TEMPORARY\s+)?'
+        rf'(?:{_SQL_DEFINITION_KINDS})\s+(?:IF\s+NOT\s+EXISTS\s+)?'
         rf'(?:`{escaped_name}`|"{escaped_name}"|\'{escaped_name}\'|\b{escaped_name}\b)',
         re.IGNORECASE
     )
@@ -234,7 +262,11 @@ class ViewSymbolCodeTool(Tool):
 
         # 3. Locate the symbol span
         span = None
-        if target_file.endswith(".py"):
+        basename = Path(target_file).name
+        if symbol == basename or symbol.lower() in ("*", "all", "file", target_file):
+            span = (1, len(content.splitlines()))
+
+        if not span and target_file.endswith(".py"):
             span = _find_symbol_span_in_python_file(content, symbol)
 
         if not span:

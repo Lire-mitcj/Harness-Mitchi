@@ -77,7 +77,7 @@ class DecisionEditTool(Tool):
                 "description": "任务执行约束条件。"
             }
         },
-        "required": ["target_file", "intent"]
+        "required": ["target_file", "intent", "context_window"]
     }
 
     def __init__(
@@ -125,6 +125,11 @@ class DecisionEditTool(Tool):
     def set_active_files(self, active_files: list[str]) -> None:
         self.active_files = list(active_files)
 
+    def validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        if "context_window" not in params:
+            params = {**params, "context_window": []}
+        return super().validate_params(params)
+
     def _build_context_pack(
         self,
         target_file: str,
@@ -133,24 +138,57 @@ class DecisionEditTool(Tool):
     ) -> ContextPack:
         windows = []
 
-        # 1. Read the target file in full from the disk (if it exists)
+        norm_target = target_file.replace("\\", "/").lstrip("./")
+
+        # 1. Check if the target_file itself has a specified span in context_window
+        target_span = None
+        if context_window is not None:
+            for item in context_window:
+                file_path = item.get("file")
+                if file_path:
+                    norm_file = file_path.replace("\\", "/").lstrip("./")
+                    if norm_file == norm_target:
+                        span = item.get("span")
+                        if span and len(span) == 2:
+                            target_span = (span[0], span[1])
+                            break
+
+        # Read the target file from the disk (load span if specified, otherwise full file)
         abs_target_path = (self.project_root / target_file).resolve()
         if abs_target_path.exists():
             try:
-                content = abs_target_path.read_text(encoding="utf-8")
-                lines = content.splitlines()
-                windows.append(
-                    ContextWindow(
-                        file=target_file,
-                        start_line=1,
-                        end_line=len(lines),
-                        content=content,
-                        symbols=(),
-                        semantic_tags=(),
-                        role="target",
-                        mode="full",
+                lines = abs_target_path.read_text(encoding="utf-8").splitlines()
+                if target_span is not None:
+                    start_line, end_line = target_span
+                    start = max(1, start_line)
+                    end = min(len(lines), end_line)
+                    content = "\n".join(lines[start - 1 : end])
+                    windows.append(
+                        ContextWindow(
+                            file=target_file,
+                            start_line=start,
+                            end_line=end,
+                            content=content,
+                            symbols=(),
+                            semantic_tags=(),
+                            role="target",
+                            mode="snippet",
+                        )
                     )
-                )
+                else:
+                    content = "\n".join(lines)
+                    windows.append(
+                        ContextWindow(
+                            file=target_file,
+                            start_line=1,
+                            end_line=len(lines),
+                            content=content,
+                            symbols=(),
+                            semantic_tags=(),
+                            role="target",
+                            mode="full",
+                        )
+                    )
             except Exception as exc:
                 log.warning("Failed to read target file %s: %s", target_file, exc)
 
@@ -158,7 +196,10 @@ class DecisionEditTool(Tool):
         if context_window is not None:
             for item in context_window:
                 file_path = item.get("file")
-                if not file_path or file_path == target_file:
+                if not file_path:
+                    continue
+                norm_file = file_path.replace("\\", "/").lstrip("./")
+                if norm_file == norm_target:
                     continue
                 span = item.get("span")
                 if not span or len(span) < 2:
@@ -314,15 +355,17 @@ class DecisionEditTool(Tool):
             content_chunks = []
 
             def count_diff_lines(text: str) -> tuple[int, int]:
+                normalized = text.replace("\\n", "\n")
                 added = 0
                 removed = 0
                 state = "normal"
-                for line in text.splitlines():
-                    if line.startswith("<<<<<<< SEARCH"):
+                for line in normalized.splitlines():
+                    clean_line = line.strip().strip('"\'')
+                    if "<<<<<<< SEARCH" in clean_line:
                         state = "search"
-                    elif line.startswith("======="):
+                    elif "=======" in clean_line:
                         state = "replace"
-                    elif line.startswith(">>>>>>> REPLACE"):
+                    elif ">>>>>>> REPLACE" in clean_line:
                         state = "normal"
                     else:
                         if state == "search":

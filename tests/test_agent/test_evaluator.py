@@ -247,3 +247,33 @@ def test_v2_test_case_loader_auto_selects_unique_name_match(tmp_path: Path) -> N
     )
 
     assert case.name == "passenger-list-sensitive-fields"
+
+
+def test_patch_applier_creates_new_file_and_applies_empty_search(tmp_path: Path) -> None:
+    applier = CursorPatchApplier(tmp_path)
+    new_file = "subdir/new_file.py"
+    
+    # 1. Test creating a brand-new file using empty SEARCH block
+    patch = (
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "print('hello world')\n"
+        ">>>>>>> REPLACE"
+    )
+    success, error = applier.apply_patch(new_file, patch)
+    assert success is True
+    assert (tmp_path / new_file).exists()
+    assert (tmp_path / new_file).read_text(encoding="utf-8") == "print('hello world')\n"
+
+    # 2. Test editing an empty file using empty SEARCH block
+    empty_file = "empty.py"
+    (tmp_path / empty_file).write_text("", encoding="utf-8")
+    patch_empty = (
+        "<<<<<<< SEARCH\n"
+        "=======\n"
+        "print('populated')\n"
+        ">>>>>>> REPLACE"
+    )
+    success, error = applier.apply_patch(empty_file, patch_empty)
+    assert success is True
+    assert (tmp_path / empty_file).read_text(encoding="utf-8") == "print('populated')\n"

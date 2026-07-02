@@ -161,9 +161,20 @@ def test_grep_pending_keeps_only_top_five_relevant_symbols() -> None:
 
 
 def test_sql_semantic_structuring_hook() -> None:
+    def structure(sql: str) -> ToolResult:
+        return apply_post_tool_context_hook(
+            "view_symbol_code",
+            {"target_file": "schema.sql", "symbol": "sql_block"},
+            ToolResult(
+                success=True,
+                output="{}",
+                metadata={"verbatim_code": sql, "raw_evidence_store": []},
+            ),
+        )
+
     # 1. Test DDL alteration parsing
     alter_sql = "ALTER TABLE ticket_order ADD COLUMN status TEXT;"
-    res = apply_post_tool_context_hook("grep_search", {"pattern": "alter"}, ToolResult(success=True, output=alter_sql))
+    res = structure(alter_sql)
     assert "[STRUCTURED SQL SEMANTIC TRUTH]" in res.output
     assert '"op": "add_column"' in res.output
     assert '"table": "ticket_order"' in res.output
@@ -172,7 +183,7 @@ def test_sql_semantic_structuring_hook() -> None:
 
     # 2. Test DML insertion parsing
     insert_sql = "INSERT INTO ticket_order (p_id, status) VALUES (1, 'paid')"
-    res = apply_post_tool_context_hook("grep_search", {"pattern": "insert"}, ToolResult(success=True, output=insert_sql))
+    res = structure(insert_sql)
     assert '"op": "insert"' in res.output
     assert '"table": "ticket_order"' in res.output
     assert '"p_id": 1' in res.output
@@ -180,7 +191,7 @@ def test_sql_semantic_structuring_hook() -> None:
 
     # 3. Test SELECT with filters parsing
     select_sql = "SELECT p_id, status FROM ticket_order WHERE p_id = 1"
-    res = apply_post_tool_context_hook("grep_search", {"pattern": "select"}, ToolResult(success=True, output=select_sql))
+    res = structure(select_sql)
     assert '"op": "select"' in res.output
     assert '"table": "ticket_order"' in res.output
     assert '"columns": [\n      "p_id",\n      "status"\n    ]' in res.output or '"columns": ["p_id", "status"]' in res.output or 'p_id' in res.output
@@ -190,7 +201,7 @@ def test_sql_semantic_structuring_hook() -> None:
 
     # 4. Test JOIN parsing and table alias resolution
     join_sql = "SELECT a.p_id, b.status FROM ticket_order a JOIN passenger_info b ON a.p_id = b.id"
-    res = apply_post_tool_context_hook("grep_search", {"pattern": "join"}, ToolResult(success=True, output=join_sql))
+    res = structure(join_sql)
     assert '"op": "join"' in res.output
     assert '"tables": [\n      "ticket_order",\n      "passenger_info"\n    ]' in res.output or 'ticket_order' in res.output
     assert '"left": "ticket_order.p_id"' in res.output
@@ -198,9 +209,61 @@ def test_sql_semantic_structuring_hook() -> None:
 
     # 5. Test GRANT permission parsing
     grant_sql = "GRANT SELECT ON ticket_order TO admin"
-    res = apply_post_tool_context_hook("grep_search", {"pattern": "grant"}, ToolResult(success=True, output=grant_sql))
+    res = structure(grant_sql)
     assert '"op": "grant"' in res.output
     assert '"permission": "select"' in res.output
     assert '"table": "ticket_order"' in res.output
     assert '"role": "admin"' in res.output
+
+
+def test_grep_json_is_not_parsed_as_sql() -> None:
+    output = '{"matches":[{"match_line":"SELECT * FROM ticket_order"}]}'
+    result = apply_post_tool_context_hook(
+        "grep_search",
+        {"pattern": "ticket_order"},
+        ToolResult(success=True, output=output, metadata={"raw_evidence_store": []}),
+    )
+
+    assert result.output == output
+    assert "STRUCTURED SQL SEMANTIC TRUTH" not in result.output
+
+
+def test_before_tool_fact_locking_range_coverage() -> None:
+    from src.hooks.before_tool import inspect_tool_request_async
+    import asyncio
+
+    # Dummy content with my_func at lines [12, 15]
+    dummy_content = (
+        "line_1\nline_2\nline_3\nline_4\nline_5\nline_6\nline_7\nline_8\nline_9\n"
+        "line_10\nline_11\ndef my_func():\n    print(1)\n    print(2)\n    return\n"
+        "line_16\nline_17\nline_18\nline_19\nline_20\nline_21\n"
+    )
+    import tempfile
+    from pathlib import Path
+    with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as tmp:
+        tmp.write(dummy_content.encode("utf-8"))
+        tmp_name = tmp.name
+
+    try:
+        res = asyncio.run(
+            inspect_tool_request_async(
+                "view_symbol_code",
+                {"target_file": tmp_name, "symbol": "my_func"},
+                allowed_tools={"view_symbol_code"},
+                context_anchors_code=[
+                    {
+                        "file": tmp_name,
+                        "span": [10, 20],
+                        "code": "\n".join(dummy_content.splitlines()[9:20]),
+                    }
+                ]
+            )
+        )
+        assert res is not None
+        assert res.startswith("SUCCESS:")
+        data = json.loads(res.replace("SUCCESS: ", "", 1))
+        assert "my_func" in data["observation_code"]
+        assert data["span"] == [12, 15]
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
 

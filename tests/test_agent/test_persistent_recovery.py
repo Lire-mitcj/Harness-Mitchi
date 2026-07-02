@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -6,8 +7,10 @@ import pytest
 from src.agent.decision import CursorDecisionLLM
 from src.agent.executor import CursorExecutor
 from src.agent.patch_applier import CursorPatchApplier
-from src.agent.validator import CursorValidator
+from src.agent.types import ToolResult
+from src.agent.validator import CursorValidator, _collect_view_schemas
 from src.harness.cursor.manager import CursorStateManager
+from src.hooks.post_tool_context import apply_post_tool_context_hook
 
 
 def test_validator_reports_exact_python_syntax_coordinates(tmp_path: Path) -> None:
@@ -87,3 +90,83 @@ async def test_rolled_back_attempt_is_compiled_into_next_prompt(tmp_path: Path) 
         hint=None,
     )
     assert "STATE DIFF EVOLUTION LAYER" in messages[1]["content"]
+
+
+def test_validator_cache_refreshes_when_mtime_is_unchanged(tmp_path: Path) -> None:
+    # 1. Create a schema file defining a view
+    schema_file = tmp_path / "schema.sql"
+    schema_file.write_text(
+        "CREATE VIEW my_view AS SELECT id FROM my_table;\n", encoding="utf-8"
+    )
+    os.utime(schema_file, (1000, 1000))
+
+    # 2. Collect view schemas -> should load my_view with field 'id'
+    schemas = _collect_view_schemas(
+        tmp_path, target_file="other.py", original_content="", patched_content=""
+    )
+    assert "my_view" in schemas
+    assert schemas["my_view"]["fields"] == {"id"}
+
+    # 3. Modify the schema file to add a column, keeping the same mtime to trick the st_mtime check
+    schema_file.write_text(
+        "CREATE VIEW my_view AS SELECT id, name FROM my_table;\n", encoding="utf-8"
+    )
+    os.utime(schema_file, (1000, 1000))
+
+    # Collection must notice the edit even though st_mtime was forced back.
+    schemas_cached = _collect_view_schemas(
+        tmp_path, target_file="other.py", original_content="", patched_content=""
+    )
+    assert schemas_cached["my_view"]["fields"] == {"id", "name"}
+
+    # 4. Invalidate cache for the schema file using the hook system
+    apply_post_tool_context_hook(
+        tool_name="decision_edit",
+        arguments={"target_file": "schema.sql"},
+        result=ToolResult(success=True, output="", error=None, metadata={}),
+    )
+
+    # Explicit hook invalidation remains supported as well.
+    schemas_fresh = _collect_view_schemas(
+        tmp_path, target_file="other.py", original_content="", patched_content=""
+    )
+    assert schemas_fresh["my_view"]["fields"] == {"id", "name"}
+
+
+def test_validator_parses_view_expressions_with_commas(tmp_path: Path) -> None:
+    schema_file = tmp_path / "schema.sql"
+    schema_file.write_text(
+        "CREATE VIEW order_view AS "
+        "SELECT id, COALESCE(first_name, last_name) AS display_name "
+        "FROM orders;\n",
+        encoding="utf-8",
+    )
+    validator = CursorValidator(tmp_path)
+
+    result = validator.validate_schema(
+        target_file="api.py",
+        patch="SELECT id, display_name FROM order_view",
+        original_content="SELECT id, first_name, last_name FROM orders",
+        patched_content="SELECT id, display_name FROM order_view",
+    )
+
+    assert result["pass"] is True
+    assert result["missing_fields"] == []
+
+
+def test_validator_schema_error_reports_missing_fields(tmp_path: Path) -> None:
+    (tmp_path / "schema.sql").write_text(
+        "CREATE VIEW order_view AS SELECT id FROM orders;\n",
+        encoding="utf-8",
+    )
+    validator = CursorValidator(tmp_path)
+
+    result = validator.validate_schema(
+        target_file="api.py",
+        patch="SELECT id, missing_name FROM order_view",
+        original_content="",
+        patched_content="SELECT id, missing_name FROM order_view",
+    )
+
+    assert result["issues"] == ["SELECT_FIELD_NOT_IN_VIEW"]
+    assert result["missing_fields"] == ["missing_name"]

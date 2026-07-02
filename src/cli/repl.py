@@ -325,7 +325,47 @@ class REPLSession:
                 spinner_active = True
             display_text = f"[dim cyan]{text}[/]"
             if thinking_buffer:
-                display_text = f"[dim cyan]{text}[/]\n[dim]{escape(thinking_buffer)}[/]"
+                import unicodedata
+                console_width = self._console.width if self._console.width else 80
+                width = min(80, console_width - 4)
+                width = max(40, width)
+                limit_width = width - 4
+
+                raw_lines = thinking_buffer.splitlines()
+                wrapped_lines = []
+                for line in raw_lines:
+                    if not line.strip():
+                        wrapped_lines.append("")
+                        continue
+                    
+                    current_line = []
+                    current_width = 0
+                    for char in line:
+                        # CJK characters take 2 visual columns, ASCII takes 1
+                        char_width = 2 if unicodedata.east_asian_width(char) in ('W', 'F', 'A') else 1
+                        if current_width + char_width > limit_width:
+                            if current_line:
+                                wrapped_lines.append("".join(current_line))
+                            current_line = [char]
+                            current_width = char_width
+                        else:
+                            current_line.append(char)
+                            current_width += char_width
+                    if current_line:
+                        wrapped_lines.append("".join(current_line))
+
+                max_lines = 6
+                total_lines = len(wrapped_lines)
+                show_lines = wrapped_lines[-max_lines:]
+                if total_lines > max_lines:
+                    if len(show_lines) > 0 and show_lines[0] != "...":
+                        show_lines = ["..."] + show_lines[1:] if len(show_lines) > 1 else ["..."]
+
+                box_lines = []
+                for line in show_lines:
+                    box_lines.append(f"  [dim]{escape(line)}[/]")
+                box_text = "\n".join(box_lines)
+                display_text = f"[dim cyan]{text}[/]\n{box_text}"
             status.update(display_text)
 
         def _dismiss_spinner() -> None:
