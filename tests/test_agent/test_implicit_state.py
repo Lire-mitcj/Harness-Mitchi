@@ -202,6 +202,17 @@ async def test_convergence_signals_inspect_tool_request_async() -> None:
     )
     assert err2 is None
 
+    # 1c. Redundant grep allowed during edit recovery after a blocked edit
+    err_recovery = await inspect_tool_request_async(
+        "grep_search",
+        {"pattern": "auth_me", "path": "app.py"},
+        allowed_tools={"grep_search"},
+        has_compile_error=False,
+        search_history=history,
+        edit_recovery=True,
+    )
+    assert err_recovery is None
+
     # 2. Semantic overlap test (Blocked when has_compile_error is False)
     mock_embedder = MagicMock()
     mock_embedder.embed = AsyncMock(side_effect=lambda x: [1.0, 0.0] if x == "auth_me" else [0.95, 0.05])
@@ -241,7 +252,9 @@ async def test_convergence_signals_inspect_tool_request_async() -> None:
     assert args4["_structural_connection"] == 1.0
     assert args4["_novelty_score"] == 0.0
 
-    # 4. Coverage Gate trigger test (Blocked with BLOCK_SEARCH_FORCE_EDIT)
+    # 4. Gravity no longer gates retrieval: a novel, low-similarity search is
+    #    allowed even when gravity is low. Tool-opening policy lives in
+    #    reallocate_tools / the manifest, not in fact locking.
     args5 = {"pattern": "different_pattern", "path": "app.py"}
     mock_gravity_controller = MagicMock()
     mock_gravity_controller.last_gravity = 0.25
@@ -253,33 +266,30 @@ async def test_convergence_signals_inspect_tool_request_async() -> None:
         search_history=history,
         gravity_controller=mock_gravity_controller,
     )
-    assert err5 is not None
-    assert "BLOCK_SEARCH_FORCE_EDIT" in err5
+    assert err5 is None
 
 
 @pytest.mark.asyncio
 async def test_plan_lock_execution_mode() -> None:
     from src.hooks.before_tool import inspect_tool_request_async
 
-    # 1. codebase_retrieve should be disabled in execution mode
+    # 1. A checklist alone does not disable codebase_retrieve; RunState owns authorization.
     err = await inspect_tool_request_async(
         "codebase_retrieve",
         {"query": "find auth router"},
         allowed_tools={"codebase_retrieve"},
         checklist=["[ ] Fix auth", "[x] Read DB"],
     )
-    assert err is not None
-    assert "codebase_retrieve is DISABLED in EXECUTION MODE" in err
+    assert err is None
 
-    # 2. grep_search default mode should be disabled in execution mode
+    # 2. A checklist alone does not disable grep_search either.
     err = await inspect_tool_request_async(
         "grep_search",
         {"pattern": "auth_me", "mode": "default"},
         allowed_tools={"grep_search"},
         checklist=["[ ] Fix auth"],
     )
-    assert err is not None
-    assert "grep_search is DISABLED in EXECUTION MODE" in err
+    assert err is None
 
     # 3. grep_search symbol mode is allowed for missing symbols
     err = await inspect_tool_request_async(
@@ -305,7 +315,7 @@ async def test_plan_lock_execution_mode() -> None:
         }],
     )
     assert err is not None
-    assert "Redundant search. Symbol 'auth_me' is already present" in err
+    assert err.startswith("BLOCK: Redundant search.")
 
     # 5. view_symbol_code is blocked if symbol is already in context
     err = await inspect_tool_request_async(
@@ -321,7 +331,8 @@ async def test_plan_lock_execution_mode() -> None:
         }],
     )
     assert err is not None
-    assert "Redundant read. Symbol 'auth_me' is already present" in err
+    assert err.startswith("BLOCK:")
+    assert "already present" in err
 
     # 6. view_symbol_code is blocked if symbol is already loaded in previous step
     err = await inspect_tool_request_async(
@@ -338,7 +349,8 @@ async def test_plan_lock_execution_mode() -> None:
         }],
     )
     assert err is not None
-    assert "already loaded in a previous step and is cached" in err
+    assert err.startswith("BLOCK:")
+    assert "already loaded previously" in err
 
     # 7. view_symbol_code is blocked globally even without a checklist
     err = await inspect_tool_request_async(
@@ -354,7 +366,8 @@ async def test_plan_lock_execution_mode() -> None:
         }],
     )
     assert err is not None
-    assert "Redundant read. Symbol 'auth_me' is already present" in err
+    assert err.startswith("BLOCK:")
+    assert "already present" in err
 
     # Locator-only grep anchors do not prove that the symbol body was loaded.
     err = await inspect_tool_request_async(
@@ -394,7 +407,7 @@ async def test_decision_edit_preflight_validation() -> None:
         allowed_tools={"decision_edit"}
     )
     assert err is not None
-    assert "SIGNAL: Invalid Task Packet. Missing required 'target_file'" in err
+    assert "Invalid decision_edit: missing required 'target_file'" in err
 
     # 2. Missing intent
     err = await inspect_tool_request_async(
@@ -403,7 +416,31 @@ async def test_decision_edit_preflight_validation() -> None:
         allowed_tools={"decision_edit"}
     )
     assert err is not None
-    assert "SIGNAL: Invalid Task Packet. Missing required 'intent'" in err
+    assert "Invalid decision_edit: missing required 'intent'" in err
+
+    # 2a. Read-only intent is forwarded to DecisionLLM (harness does not block).
+    err = await inspect_tool_request_async(
+        "decision_edit",
+        {
+            "target_file": "db/init/init.sql",
+            "intent": "Read the full file to understand the schema",
+            "context_window": [],
+        },
+        allowed_tools={"decision_edit", "view_symbol_code"},
+    )
+    assert err is None
+
+    # 2b. An edit may mention inspection when it also specifies a mutation.
+    err = await inspect_tool_request_async(
+        "decision_edit",
+        {
+            "target_file": "list.py",
+            "intent": "Inspect the handler and add validation",
+            "context_window": [],
+        },
+        allowed_tools={"decision_edit"},
+    )
+    assert err is None
 
     # 3. Invalid focus_symbols type
     err = await inspect_tool_request_async(
@@ -412,7 +449,7 @@ async def test_decision_edit_preflight_validation() -> None:
         allowed_tools={"decision_edit"}
     )
     assert err is not None
-    assert "SIGNAL: Invalid Task Packet. 'focus_symbols' must be a JSON array" in err
+    assert "Invalid decision_edit: 'focus_symbols' must be a JSON array" in err
 
     # 4. Invalid focus_symbols element type
     err = await inspect_tool_request_async(
@@ -421,7 +458,7 @@ async def test_decision_edit_preflight_validation() -> None:
         allowed_tools={"decision_edit"}
     )
     assert err is not None
-    assert "SIGNAL: Invalid Task Packet. 'focus_symbols' index 0 must be a string" in err
+    assert "Invalid decision_edit: 'focus_symbols' index 0 must be a string" in err
 
     # 5. Invalid context_window type
     err = await inspect_tool_request_async(
@@ -430,7 +467,7 @@ async def test_decision_edit_preflight_validation() -> None:
         allowed_tools={"decision_edit"}
     )
     assert err is not None
-    assert "SIGNAL: Invalid Task Packet. 'context_window' must be a JSON array" in err
+    assert "Invalid decision_edit: 'context_window' must be a JSON array" in err
 
     # 6. Missing context_window file field
     err = await inspect_tool_request_async(
@@ -443,7 +480,7 @@ async def test_decision_edit_preflight_validation() -> None:
         allowed_tools={"decision_edit"}
     )
     assert err is not None
-    assert "SIGNAL: Invalid Task Packet. 'context_window' index 0 is missing a valid 'file'" in err
+    assert "Invalid decision_edit: 'context_window' index 0 is missing a valid 'file'" in err
 
     # 7. Invalid context_window span values
     err = await inspect_tool_request_async(
@@ -456,7 +493,7 @@ async def test_decision_edit_preflight_validation() -> None:
         allowed_tools={"decision_edit"}
     )
     assert err is not None
-    assert "SIGNAL: Invalid Task Packet. 'context_window' index 0 'span' must be a list containing [start_line, end_line]" in err
+    assert "Invalid decision_edit: 'context_window' index 0 'span' must be a list containing [start_line, end_line]" in err
 
     # 8. Start line greater than end line
     err = await inspect_tool_request_async(
@@ -469,7 +506,7 @@ async def test_decision_edit_preflight_validation() -> None:
         allowed_tools={"decision_edit"}
     )
     assert err is not None
-    assert "SIGNAL: Invalid Task Packet. 'context_window' index 0 'span' start_line 50 cannot be greater than end_line 20" in err
+    assert "Invalid decision_edit: 'context_window' index 0 'span' start_line 50 cannot be greater than end_line 20" in err
 
     # 9. Valid parameters pass successfully
     err = await inspect_tool_request_async(

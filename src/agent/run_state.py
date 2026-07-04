@@ -3,7 +3,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
+
+from src.agent.manifest import (
+    EvidenceItem,
+    StepManifest,
+    reconcile_observations,
+)
 
 
 class RunPhase(StrEnum):
@@ -114,6 +120,14 @@ class RunState:
     waiting: WaitingState | None = None
     terminal: TerminalResult | None = None
     transition_reason: str = "request_started"
+    manifest: StepManifest = field(default_factory=StepManifest)
+    retrieval_gain_in_round: bool = False
+    retrieval_no_gain_rounds: int = 0
+    view_last_round_all_duplicate: bool = False
+    last_grep_error: str = ""
+    grep_suggested_views: tuple[dict[str, Any], ...] = ()
+    edit_patch_failed: bool = False
+    rounds_since_last_edit: int = 0
 
     @property
     def retrieval_complete(self) -> bool:
@@ -156,6 +170,12 @@ class RunEvent:
     answer: str = ""
     reason: str = ""
     fingerprint: str | None = None
+    observations: tuple[dict[str, Any], ...] = ()
+    retrieval_attempted: bool = False
+    view_all_duplicate: bool = False
+    grep_error: str = ""
+    grep_suggested_views: tuple[dict[str, Any], ...] = ()
+    edit_applied_this_round: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,12 +220,29 @@ def requirements_for_task(task_text: str) -> frozenset[str]:
         required.update(("ownership_relation", "relevant_schema"))
     if any(
         word in lowered
-        for word in ("sql", "schema", "table", "database", "数据库", "表结构")
+        for word in (
+            "sql",
+            "schema",
+            "table",
+            "database",
+            "数据库",
+            "表结构",
+            "新建表",
+            "创建表",
+            "建表",
+            "数据表",
+        )
     ):
         required.add("relevant_schema")
     if any(word in lowered for word in ("test", "verify", "验证", "测试")):
         required.add("test_or_validation_path")
     return frozenset(required)
+
+
+def manifest_template_for_task(task_text: str, task_mode: TaskMode) -> StepManifest:
+    """Create an empty bootstrap manifest; concrete targets are discovered dynamically."""
+    step_kind = "edit" if task_mode == "edit" else "retrieval"
+    return StepManifest(step_id="task.default", step_kind=step_kind)
 
 
 def start_run(
@@ -215,13 +252,15 @@ def start_run(
     retry_limit: int = 3,
     max_steps: int = 20,
 ) -> RunState:
+    task_mode: TaskMode = "edit" if edit_mode else "diagnose"
     return RunState(
         phase=RunPhase.RETRIEVING,
-        task_mode="edit" if edit_mode else "diagnose",
+        task_mode=task_mode,
         step=0,
         max_steps=max_steps,
         evidence=EvidenceLedger(required=requirements_for_task(task_text)),
         retry_budget=RetryBudget(limit=retry_limit),
+        manifest=manifest_template_for_task(task_text, task_mode),
     )
 
 
@@ -233,7 +272,7 @@ def reduce_run_state(
         return state, (RunEffect("ignored", "run is terminal"),)
 
     if event.kind == "step_started":
-        return replace(state, step=state.step + 1), ()
+        return replace(state, step=state.step + 1, retrieval_gain_in_round=False), ()
 
     if event.kind == "evidence_stored":
         known_artifacts = state.artifacts.all | event.artifact_refs.all
@@ -245,9 +284,14 @@ def reduce_run_state(
             dict.fromkeys((*state.evidence.candidates, *event.candidates))
         )[-16:]
         evidence = replace(state.evidence, entries=entries, candidates=candidates)
+        manifest = reconcile_observations(state.manifest, event.observations)
+        gained = _retrieval_gain_from_observations(event.observations)
         next_state = replace(
             state,
             evidence=evidence,
+            manifest=manifest,
+            retrieval_gain_in_round=(state.retrieval_gain_in_round or gained),
+            edit_patch_failed=False if gained else state.edit_patch_failed,
             artifacts=_merge_artifact_refs(state.artifacts, event.artifact_refs),
             transition_reason=event.reason or "evidence_stored",
         )
@@ -264,6 +308,43 @@ def reduce_run_state(
             )
         return next_state, ()
 
+    if event.kind == "tool_round_observed":
+        no_gain_rounds = state.retrieval_no_gain_rounds
+        if event.retrieval_attempted:
+            no_gain_rounds = (
+                0 if state.retrieval_gain_in_round else no_gain_rounds + 1
+            )
+        grep_error = state.last_grep_error
+        grep_views = state.grep_suggested_views
+        if event.grep_error:
+            grep_error = event.grep_error
+        elif state.retrieval_gain_in_round:
+            grep_error = ""
+        if event.grep_suggested_views:
+            grep_views = event.grep_suggested_views
+        edit_patch_failed = state.edit_patch_failed
+        if event.view_all_duplicate and event.retrieval_attempted:
+            edit_patch_failed = False
+        if event.edit_applied_this_round:
+            rounds_since_last_edit = 0
+        elif state.changes.files:
+            rounds_since_last_edit = state.rounds_since_last_edit + 1
+        else:
+            rounds_since_last_edit = 0
+        return (
+            replace(
+                state,
+                retrieval_no_gain_rounds=no_gain_rounds,
+                view_last_round_all_duplicate=bool(event.view_all_duplicate),
+                edit_patch_failed=edit_patch_failed,
+                last_grep_error=grep_error,
+                grep_suggested_views=grep_views,
+                rounds_since_last_edit=rounds_since_last_edit,
+                transition_reason=event.reason or "tool_round_observed",
+            ),
+            (),
+        )
+
     if event.kind == "artifacts_invalidated":
         removed = event.artifact_refs.all
         evidence = replace(
@@ -272,10 +353,16 @@ def reduce_run_state(
                 item for item in state.evidence.entries if item.artifact_id not in removed
             ),
         )
+        stale_files = {_file_from_artifact_id(ref) for ref in removed}
+        stale_files.discard("")
+        manifest = _mark_stale_for_files(
+            state.manifest, stale_files, "artifacts invalidated"
+        )
         return (
             replace(
                 state,
                 evidence=evidence,
+                manifest=manifest,
                 artifacts=_subtract_artifact_refs(state.artifacts, removed),
                 transition_reason=event.reason or "artifacts_invalidated",
             ),
@@ -298,12 +385,16 @@ def reduce_run_state(
     if event.kind == "edit_applied":
         files = tuple(dict.fromkeys((*state.changes.files, event.file or "")))
         files = tuple(item for item in files if item)
+        manifest = _mark_stale_for_files(
+            state.manifest, {event.file or ""}, "file modified by decision_edit"
+        )
         return (
             replace(
                 state,
                 phase=RunPhase.VALIDATING,
                 changes=replace(state.changes, files=files),
                 validation=ValidationState(),
+                manifest=manifest,
                 transition_reason="edit_applied",
             ),
             (RunEffect("run_validation"),),
@@ -316,11 +407,14 @@ def reduce_run_state(
                     state,
                     phase=RunPhase.ACTING,
                     validation=ValidationState(status="passed"),
+                    manifest=_clear_failure_items(state.manifest),
+                    edit_patch_failed=False,
                     transition_reason="validation_passed_choose_edit_or_answer",
                 ),
                 (),
             )
         budget = _record_failure(state.retry_budget, event.fingerprint or "validation")
+        manifest = _append_failure_items(state.manifest, event.issues, "test_failure")
         if budget.exhausted:
             terminal = TerminalResult(False, "", "validation retry budget exhausted")
             return (
@@ -329,6 +423,7 @@ def reduce_run_state(
                     phase=RunPhase.TERMINAL,
                     validation=ValidationState(status="failed", issues=event.issues),
                     retry_budget=budget,
+                    manifest=manifest,
                     terminal=terminal,
                     transition_reason=terminal.reason,
                 ),
@@ -340,6 +435,7 @@ def reduce_run_state(
                 phase=RunPhase.ACTING,
                 validation=ValidationState(status="failed", issues=event.issues),
                 retry_budget=budget,
+                manifest=manifest,
                 transition_reason="validation_failed_retry_edit",
             ),
             (RunEffect("retry_edit", event.reason),),
@@ -423,10 +519,14 @@ def reduce_run_state(
                 ),
                 (),
             )
+        edit_patch_failed = state.edit_patch_failed
+        if event.tool_name == "decision_edit":
+            edit_patch_failed = True
         return (
             replace(
                 state,
                 retry_budget=budget,
+                edit_patch_failed=edit_patch_failed,
                 transition_reason=event.reason or "tool_failed",
             ),
             (RunEffect("retry", event.reason),),
@@ -445,6 +545,24 @@ def reduce_run_state(
         )
 
     return state, (RunEffect("ignored", f"unknown event: {event.kind}"),)
+
+
+def _retrieval_gain_from_observations(observations: tuple[Any, ...]) -> bool:
+    """True when a durable code/schema observation was stored (not locator-only)."""
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        if observation.get("locator_only") or observation.get("match_line"):
+            continue
+        code = (
+            observation.get("code")
+            or observation.get("observation_code")
+            or observation.get("verbatim_code")
+            or ""
+        )
+        if str(code).strip() and observation.get("file"):
+            return True
+    return False
 
 
 def _dedupe_evidence(items: tuple[Evidence, ...]) -> tuple[Evidence, ...]:
@@ -484,3 +602,72 @@ def _record_failure(budget: RetryBudget, fingerprint: str) -> RetryBudget:
 
 def _failure_fingerprint(reason: str) -> str:
     return re.sub(r"\d+", "#", reason.casefold()).strip()[:160]
+
+
+def _norm_path(path: str) -> str:
+    return str(path or "").replace("\\", "/").lstrip("./")
+
+
+def _file_from_artifact_id(artifact_id: str) -> str:
+    """Artifact ids look like 'path/to/file.py:12-40'; recover the file part."""
+    match = re.match(r"^(?P<file>.+):\d+-\d+$", artifact_id)
+    return _norm_path(match.group("file")) if match else ""
+
+
+def _mark_stale_for_files(
+    manifest: StepManifest,
+    files: set[str],
+    reason: str,
+) -> StepManifest:
+    targets = {_norm_path(item) for item in files if item}
+    if not targets:
+        return manifest
+    updated = []
+    for item in manifest.required_items:
+        if item.is_failure:
+            updated.append(item)
+            continue
+        if item.file and _norm_path(item.file) in targets and item.status != "MISSING":
+            updated.append(replace(item, status="STALE", stale_reason=reason))
+        else:
+            updated.append(item)
+    return replace(manifest, required_items=tuple(updated))
+
+
+def _append_failure_items(
+    manifest: StepManifest,
+    issues: tuple[str, ...],
+    failure_type: str,
+) -> StepManifest:
+    existing = {item.id for item in manifest.required_items}
+    additions: list[EvidenceItem] = []
+    for index, issue in enumerate(issues):
+        text = " ".join(str(issue).split())[:200]
+        if not text:
+            continue
+        item_id = f"{failure_type}.{_failure_fingerprint(text)[:48]}"
+        if item_id in existing:
+            continue
+        existing.add(item_id)
+        additions.append(
+            EvidenceItem(
+                id=item_id,
+                need=text,
+                type=failure_type,  # type: ignore[arg-type]
+                status="MISSING",
+                provenance="validator",
+            )
+        )
+    if not additions:
+        return manifest
+    return replace(
+        manifest,
+        required_items=(*manifest.required_items, *tuple(additions)),
+    )
+
+
+def _clear_failure_items(manifest: StepManifest) -> StepManifest:
+    remaining = tuple(item for item in manifest.required_items if not item.is_failure)
+    if len(remaining) == len(manifest.required_items):
+        return manifest
+    return replace(manifest, required_items=remaining)

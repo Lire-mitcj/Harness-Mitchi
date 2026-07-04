@@ -46,7 +46,9 @@ async def test_symbol_promotion_def(grep_tool: GrepSearchTool, sample_files: Pat
     assert result.success
     payload = json.loads(result.output)
     matches = payload["matches"]
-    assert payload["next_action"] == {"tool": "view_symbol_code", "symbols": ["helper_func"]}
+    assert payload["next_action"]["tool"] == "view_symbol_code"
+    assert payload["next_action"]["symbols"] == ["helper_func"]
+    assert payload["suggested_views"][0]["symbol"] == "helper_func"
     # Output should contain definition (line 1 of helper.py) and NOT the import/usage inside test_api.py
     assert any(m["file"].endswith("helper.py") and m["span"] == [1, 1] and m["symbol"] == "helper_func" for m in matches)
     assert not any("test_api.py" in m["file"] for m in matches)
@@ -82,6 +84,43 @@ async def test_noise_excludes(grep_tool: GrepSearchTool, sample_files: Path) -> 
     assert result.success
     matches = json.loads(result.output)["matches"]
     assert not any("package-lock.json" in m["file"] for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_grep_search_batch_patterns(grep_tool: GrepSearchTool, sample_files: Path) -> None:
+    import json
+
+    result = await grep_tool.execute(
+        patterns=["helper_func", "HelperClass", "missing_symbol"],
+        path=str(sample_files),
+    )
+    assert result.success
+    payload = json.loads(result.output)
+    matches = payload["matches"]
+    assert payload["searched_patterns"] == ["helper_func", "HelperClass", "missing_symbol"]
+    assert any(m["symbol"] == "helper_func" for m in matches)
+    assert any(m["symbol"] == "HelperClass" for m in matches)
+    assert payload["returned_matches"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_grep_search_sql_match_suggests_view(tmp_path: Path) -> None:
+    import json
+
+    sql_file = tmp_path / "schema.sql"
+    sql_file.write_text(
+        "CREATE TABLE IF NOT EXISTS `order_timeline` (\n"
+        "  id INT PRIMARY KEY\n"
+        ");\n",
+        encoding="utf-8",
+    )
+    tool = GrepSearchTool()
+    result = await tool.execute(pattern="CREATE TABLE", path=str(tmp_path), include="*.sql")
+    assert result.success
+    payload = json.loads(result.output)
+    assert payload["suggested_views"]
+    assert payload["suggested_views"][0]["symbol"] == "order_timeline"
+    assert payload["next_action"]["suggested_views"][0]["file"].endswith("schema.sql")
 
 
 @pytest.mark.asyncio

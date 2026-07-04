@@ -158,6 +158,26 @@ def cosine_similarity(v1: list[float], v2: list[float]) -> float:
     return dot / (norm1 * norm2)
 
 
+def _manifest_stale_targets(manifest: Any) -> tuple[set[str], set[str]]:
+    """Return (stale_files, stale_symbols) from the projected manifest.
+
+    STALE items were invalidated by a prior edit and are allowed to be re-read.
+    """
+    stale_files: set[str] = set()
+    stale_symbols: set[str] = set()
+    items = getattr(manifest, "stale_items", None)
+    if not items:
+        return stale_files, stale_symbols
+    for item in items:
+        file = getattr(item, "file", None)
+        if file:
+            stale_files.add(str(file).replace("\\", "/").strip().lstrip("./"))
+        symbol = getattr(item, "symbol", None)
+        if symbol:
+            stale_symbols.add(str(symbol))
+    return stale_files, stale_symbols
+
+
 def _anchor_has_complete_source(anchor: Mapping[str, Any]) -> bool:
     code = str(anchor.get("code") or anchor.get("verbatim_code") or "").strip()
     if not code:
@@ -227,13 +247,23 @@ async def inspect_fact_locking_async(
     raw_evidence_store: list[dict[str, Any]] | None = None,
     git_diff: str | None = None,
     modified_files: list[str] | None = None,
+    manifest: Any = None,
+    edit_recovery: bool = False,
 ) -> str | None:
-    """Layer 2: Async Fact Locking, line span matching, and semantic query gating."""
+    """Layer 2: Async Fact Locking, line span matching, and semantic query gating.
+
+    Fact locking blocks re-reading evidence that is already SATISFIED (present as
+    a durable verbatim anchor). STALE manifest targets are exempt so the agent can
+    refresh code that a prior edit invalidated. Policy about *which* tools to open
+    lives in reallocate_tools, not here.
+    """
     # Normalize modified_files and target file paths for clean checks
     normalized_modified_files = set()
     if modified_files:
         for f in modified_files:
             normalized_modified_files.add(str(f).replace("\\", "/").strip().lstrip("./"))
+
+    stale_files, stale_symbols = _manifest_stale_targets(manifest)
 
     target_file = arguments.get("target_file") or arguments.get("path")
     normalized_target_file = ""
@@ -268,38 +298,19 @@ async def inspect_fact_locking_async(
                                 f"since the edit tool already returned the unified diff. Rely on validator results."
                             )
 
-    # 2. PLAN LOCK Check
-    if checklist and len(checklist) > 0:
-        # EXECUTION MODE is active
-        if tool_name == "codebase_retrieve":
-            return (
-                "BLOCK: codebase_retrieve is DISABLED in EXECUTION MODE (Plan Lock active). "
-                "You have already produced a plan/checklist, so you must execute the steps using "
-                "decision_edit, view_symbol_code, or final response."
-            )
-        elif tool_name == "grep_search":
-            if not has_compile_error:
-                mode = arguments.get("mode", "default")
-                pattern = arguments.get("pattern", "")
-                if mode not in ("symbol", "import"):
-                    return (
-                        f"BLOCK: grep_search is DISABLED in EXECUTION MODE (Plan Lock active) "
-                        f"unless performing explicit symbol or import scanning for missing symbols. "
-                        f"Your query '{pattern}' (mode: {mode}) is rejected."
-                    )
-                # Check if search targets a symbol already in context
-                if context_anchors_code:
-                    for anchor in context_anchors_code:
-                        sym = anchor.get("symbol")
-                        if sym and sym == pattern:
-                            return f"BLOCK: Redundant search. Symbol '{pattern}' is already present in CURRENT_CONTEXT."
-
-    # 3. Fact Locking / Cache Overlap checking for view_symbol_code
+    # 2. Fact Locking / Cache Overlap checking for view_symbol_code.
+    # A checklist is descriptive state, not retrieval authorization; the
+    # relevance preflight and reducer-provided allowed tools own that decision.
     if tool_name == "view_symbol_code":
         requested_symbol = arguments.get("symbol")
         if requested_symbol:
             # Bypass blocker if the target file or the symbol's file is modified (allowing verification)
-            bypass_blocker = is_target_modified
+            # or if the manifest marks this target STALE (needs a fresh read).
+            bypass_blocker = (
+                is_target_modified
+                or requested_symbol in stale_symbols
+                or normalized_target_file in stale_files
+            )
             if not bypass_blocker and normalized_modified_files:
                 matching_files = set()
                 if context_anchors_code:
@@ -352,14 +363,11 @@ async def inspect_fact_locking_async(
                         coverage = check_coverage(raw_evidence_store)
 
                     if coverage:
-                        res_payload = {
-                            "info": f"SUCCESS: Redundant read. Symbol '{requested_symbol}' lines [{start_line}-{end_line}] are already fully covered by cached file span in CURRENT_CONTEXT (Fact Locking active).",
-                            "file": coverage["file"],
-                            "span": coverage["span"],
-                            "observation_code": coverage["code"],
-                            "verbatim_code": coverage["code"],
-                        }
-                        return "SUCCESS: " + json.dumps(res_payload, ensure_ascii=False)
+                        return (
+                            f"BLOCK: Symbol '{requested_symbol}' lines "
+                            f"[{start_line}-{end_line}] are already present in CURRENT_CONTEXT. "
+                            "Reuse the cached slice; do not re-fetch."
+                        )
 
                 # 3.2 Symbol Name matching fallback (Condition A: Symbol in context)
                 if context_anchors_code:
@@ -373,14 +381,10 @@ async def inspect_fact_locking_async(
                             cached_code = anchor.get("code") or anchor.get("verbatim_code") or ""
                             file_name = anchor.get("file") or "unknown"
                             span = anchor.get("span") or [1, 1]
-                            res_payload = {
-                                "info": f"SUCCESS: Redundant read. Symbol '{requested_symbol}' is already present in CURRENT_CONTEXT (Fact Locking active).",
-                                "file": file_name,
-                                "span": span,
-                                "observation_code": cached_code,
-                                "verbatim_code": cached_code,
-                            }
-                            return "SUCCESS: " + json.dumps(res_payload, ensure_ascii=False)
+                            return (
+                                f"BLOCK: Symbol '{requested_symbol}' is already present in CURRENT_CONTEXT "
+                                f"({file_name}:{span[0]}-{span[1]}). Reuse it; do not re-fetch."
+                            )
 
                 # 3.3 Symbol Name matching fallback (Condition B: Symbol loaded via previous step)
                 if raw_evidence_store:
@@ -394,14 +398,10 @@ async def inspect_fact_locking_async(
                             cached_code = anchor.get("code") or anchor.get("verbatim_code") or ""
                             file_name = anchor.get("file") or "unknown"
                             span = anchor.get("span") or [1, 1]
-                            res_payload = {
-                                "info": f"SUCCESS: Redundant read. Symbol '{requested_symbol}' was already loaded in a previous step and is cached. Synthesize from existing cache instead of re-fetching.",
-                                "file": file_name,
-                                "span": span,
-                                "observation_code": cached_code,
-                                "verbatim_code": cached_code,
-                            }
-                            return "SUCCESS: " + json.dumps(res_payload, ensure_ascii=False)
+                            return (
+                                f"BLOCK: Symbol '{requested_symbol}' was already loaded previously "
+                                f"({file_name}:{span[0]}-{span[1]}). Reuse it; do not re-fetch."
+                            )
 
     # 4. Redundant Search Prevention for grep_search
     if tool_name == "grep_search":
@@ -433,7 +433,10 @@ async def inspect_fact_locking_async(
                                 "returned_matches": 1,
                                 "total_matches": 1,
                             }
-                            return "SUCCESS: " + json.dumps(res_payload, ensure_ascii=False)
+                            return (
+                                "BLOCK: Redundant search. The pattern is already present in CURRENT_CONTEXT. "
+                                "Reuse the existing context; do not re-search for confirmation."
+                            )
 
     # 5. Convergence similarity scoring and search gating for grep_search
     if tool_name == "grep_search" and search_history:
@@ -488,18 +491,10 @@ async def inspect_fact_locking_async(
             max_sim = max(lexical_similarity, semantic_similarity, structural_connection)
             arguments["_novelty_score"] = 1.0 - max_sim
 
-        # Gating checks to enforce search default policies and drive LLM decisions
-        if not has_compile_error:
-            # A. Coverage Gate
-            if gravity_controller is not None:
-                last_gravity = getattr(gravity_controller, "last_gravity", 1.0)
-                if last_gravity < 0.3:
-                    return (
-                        f"BLOCK_SEARCH_FORCE_EDIT: Retrieval is complete. All required code evidence has been saturated "
-                        f"(DECISION_GRAVITY: {last_gravity:.2f} < 0.3). You MUST stop calling search/retrieval tools "
-                        f"and immediately proceed to edit or formulate final response."
-                    )
-
+        # Redundancy gating to prevent no-novelty grep loops. Tool-opening policy
+        # (convergence / gravity) is owned by reallocate_tools, not fact locking.
+        # After a blocked edit, allow one recovery grep/view without semantic blocks.
+        if not has_compile_error and not edit_recovery:
             # C. Symbol Dominance Gate
             if structural_connection == 1.0 and (lexical_similarity > 0.8 or semantic_similarity > 0.8):
                 return (

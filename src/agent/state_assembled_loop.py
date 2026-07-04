@@ -13,9 +13,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from src.state import StateLayer, DecisionGravityController
+from src.state import StateLayer
 from src.state.decision_gravity import evaluate_search_intent
-from src.agent.context_assembly import ContextAssembly
+from src.agent.context_assembly import (
+    ContextAssembly,
+    build_runtime_state_block,
+    build_turn_context_block,
+)
+from src.agent.manifest import execution_card, manifest_metrics, observations_from_edited_file, project_manifest
 from src.agent.run_state import (
     ArtifactRefs,
     Evidence,
@@ -48,9 +53,17 @@ from src.agent.types import (
     system_message,
     tool_message,
 )
+from src.tools.grep_tool_args import prepare_grep_search_args
 from src.hooks.after_tool import apply_after_tool_output_limit
 from src.hooks.post_tool_context import apply_post_tool_context_hook
-from src.hooks.reallocate_tools import determine_allowed_tools
+from src.hooks.reallocate_tools import determine_allowed_tools, post_edit_verification_ready
+from src.hooks.retrieval_convergence import (
+    RETRIEVAL_TOOLS,
+    format_duplicate_retrieval_receipt,
+    is_duplicate_retrieval_result,
+    view_round_all_duplicate,
+    retrieval_tool_signal_status,
+)
 from src.llm.client import LLMClient
 from src.llm.dsml import contains_tool_call_markup, strip_dsml_text
 
@@ -63,6 +76,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 ASSEMBLED_TOOL_NAMES = frozenset({"codebase_retrieve", "decision_edit", "view_symbol_code", "grep_search"})
+LOADED_CODE_ANCHOR_LIMIT = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +101,7 @@ class AssembledState:
     search_cache: dict[str, Any] = field(default_factory=dict)
     context_anchors: ContextAnchors = field(default_factory=ContextAnchors)
     core_context_history: tuple[dict[str, Any], ...] = ()
+    retrieval_outcome: dict[str, Any] = field(default_factory=dict)
     run_state: RunState = field(default_factory=lambda: start_run("", edit_mode=False))
 
     def getMessagesAfterCompactBoundary(self) -> tuple[Message, ...]:
@@ -156,10 +171,9 @@ class ConversationShaper:
             if m.tool_calls:
                 for tc in m.tool_calls:
                     if tc.name in PARALLEL_RETRIEVAL_TOOLS:
-                        target = tc.arguments.get("target_file") or tc.arguments.get("query") or tc.name
-                        reads.append(str(target))
+                        reads.append(_summarize_tool_call(tc))
                     elif tc.name == "decision_edit":
-                        edits.append(str(tc.arguments.get("target_file") or "unknown"))
+                        edits.append(_summarize_tool_call(tc))
             if m.role == "assistant" and m.content.strip() and "[CONTEXT COLLAPSE" not in m.content:
                 normalized = " ".join(m.content.split())
                 if _is_process_only_intent(normalized):
@@ -209,6 +223,156 @@ def _is_process_only_intent(text: str) -> bool:
         r"\bunderstand\s+the\s+(?:full|current)\s+(?:picture|state|system)\b",
     )
     return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _retrieval_tool_signal(
+    tc: ToolCall,
+    result: Any,
+    *,
+    arguments: dict[str, Any] | None = None,
+) -> str:
+    """Compact tool-round summary for RUNTIME STATE (includes failure reason)."""
+    call = (
+        ToolCall(id=tc.id, name=tc.name, arguments=arguments)
+        if arguments is not None
+        else tc
+    )
+    summary = _summarize_tool_call(call)
+    status = retrieval_tool_signal_status(tc.name, result)
+    if status != "failed":
+        return f"{summary} -> {status}"
+    err = str(getattr(result, "error", "") or "").strip()
+    if not err:
+        err = str(getattr(result, "output", "") or "").strip()
+    if err:
+        short = err.splitlines()[0][:140]
+        return f"{summary} -> failed: {short}"
+    return f"{summary} -> failed"
+
+
+def _prepare_tool_arguments(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    hint_text: str,
+) -> dict[str, Any]:
+    args = dict(arguments)
+    if tool_name == "grep_search":
+        args = prepare_grep_search_args(args, hint_text=hint_text)
+    return args
+
+
+def _merge_suggested_views(
+    existing: list[dict[str, Any]],
+    new_items: Any,
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    merged = list(existing)
+    seen = {(str(i.get("file") or ""), str(i.get("symbol") or "")) for i in merged}
+    if not isinstance(new_items, list):
+        return merged
+    for item in new_items:
+        if not isinstance(item, dict):
+            continue
+        file_path = str(item.get("file") or "").strip()
+        symbol = str(item.get("symbol") or "").strip()
+        if not file_path or not symbol:
+            continue
+        key = (file_path, symbol)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def _observe_grep_round(
+    tool_name: str,
+    result: ToolResult,
+    *,
+    round_grep_error: str,
+    round_suggested_views: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    if tool_name != "grep_search":
+        return round_grep_error, round_suggested_views
+    if not result.success:
+        err = str(result.error or result.output or "").strip()
+        return (round_grep_error or err), round_suggested_views
+    views = (result.metadata or {}).get("suggested_views")
+    return round_grep_error, _merge_suggested_views(round_suggested_views, views)
+
+
+def _summarize_tool_call(tc: ToolCall) -> str:
+    args = tc.arguments or {}
+    if tc.name == "view_symbol_code":
+        target = args.get("target_file") or args.get("file") or "unknown"
+        symbol = args.get("symbol") or args.get("name")
+        if symbol:
+            return f"view_symbol_code({target}::{symbol})"
+        return f"view_symbol_code({target})"
+    if tc.name == "grep_search":
+        pattern = str(args.get("pattern") or "").strip()
+        path = str(args.get("path") or ".").strip()
+        include = str(args.get("include") or "").strip()
+        scope = path if not include else f"{path}, include={include}"
+        patterns = args.get("patterns") or []
+        if isinstance(patterns, list) and patterns:
+            preview = ", ".join(repr(str(item)) for item in patterns[:4])
+            if len(patterns) > 4:
+                preview += ", ..."
+            return f"grep_search([{preview}] @ {scope})"
+        return f"grep_search({pattern!r} @ {scope})"
+    if tc.name == "codebase_retrieve":
+        query = str(args.get("query") or "").strip()
+        if len(query) > 140:
+            query = query[:137] + "..."
+        return f"codebase_retrieve({query!r})"
+    if tc.name == "decision_edit":
+        target = args.get("target_file") or "unknown"
+        intent = " ".join(str(args.get("intent") or "").split())
+        if len(intent) > 160:
+            intent = intent[:157] + "..."
+        return f"decision_edit({target}: {intent})" if intent else f"decision_edit({target})"
+    return tc.name
+
+
+def _loaded_code_anchor_block(context_block: str) -> str:
+    from src.agent.context_assembly import build_loaded_code_anchor_block
+
+    return build_loaded_code_anchor_block(context_block)
+
+
+def _build_runtime_state_block(
+    *,
+    active_files: list[str],
+    checklist_str: str,
+    git_diff: str,
+    validation_error: str | None,
+    last_tool_result: str | None,
+    last_error: dict[str, Any] | None,
+) -> str:
+    return build_runtime_state_block(
+        active_files=active_files,
+        checklist_str=checklist_str,
+        git_diff=git_diff,
+        validation_error=validation_error,
+        last_tool_result=last_tool_result,
+        last_error=last_error,
+    )
+
+
+def _build_turn_context_block(
+    *,
+    loaded_anchors: str,
+    execution_card_text: str,
+) -> str:
+    return build_turn_context_block(
+        loaded_anchors=loaded_anchors,
+        execution_card_text=execution_card_text,
+    )
 
 
 def _microcompact_retrieval_payload(content: str) -> str:
@@ -327,6 +491,34 @@ def _dedupe_code_anchors(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif _anchor_quality(item) > _anchor_quality(kept[duplicate_index]):
             kept[duplicate_index] = item
     return kept
+
+
+def _touch_raw_evidence_lru(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    *,
+    limit: int = LOADED_CODE_ANCHOR_LIMIT,
+) -> list[dict[str, Any]]:
+    """Keep prompt-facing loaded anchors as a small LRU working set."""
+    working = [item for item in existing if isinstance(item, dict) and _anchor_id(item)]
+    for item in (entry for entry in incoming if isinstance(entry, dict) and _anchor_id(entry)):
+        working = [
+            prior for prior in working
+            if not (
+                _same_evidence_identity(prior, item)
+                or (
+                    prior.get("file") == item.get("file")
+                    and _span_overlap_ratio(prior, item) > 0.90
+                    and (
+                        not _anchor_symbol_name(prior)
+                        or not _anchor_symbol_name(item)
+                        or _anchor_symbol_name(prior) == _anchor_symbol_name(item)
+                    )
+                )
+            )
+        ]
+        working.append(item)
+    return working[-max(1, limit):]
 
 
 def _extract_physical_signature(code: str) -> str:
@@ -646,8 +838,17 @@ def _collapse_retrieval_turn(
 def _search_cache_view(state: AssembledState) -> dict[str, Any]:
     """Compatibility projection for context builders and tools; never stored."""
     view = dict(state.search_cache)
-    if state.context_anchors.code:
-        view["raw_evidence_store"] = list(state.context_anchors.code)
+    explicit_working_set = view.get("raw_evidence_store")
+    if isinstance(explicit_working_set, list) and explicit_working_set:
+        view["raw_evidence_store"] = _touch_raw_evidence_lru(
+            [],
+            [item for item in explicit_working_set if isinstance(item, dict)],
+        )
+    elif state.context_anchors.code:
+        view["raw_evidence_store"] = _touch_raw_evidence_lru(
+            [],
+            list(state.context_anchors.code),
+        )
     if state.context_anchors.summaries:
         view["summary_anchors"] = dict(state.context_anchors.summaries)
     if state.context_anchors.purposes:
@@ -737,39 +938,64 @@ def _tool_result_observation(result: ToolResult) -> str:
 
 
 def _tool_history_receipt(tool_call: ToolCall, result: ToolResult) -> str:
-    if tool_call.name not in PARALLEL_RETRIEVAL_TOOLS:
-        return _tool_result_observation(result)
-    anchors = (result.metadata or {}).get("raw_evidence_store") or []
-    duplicate_replay = str(
-        (result.metadata or {}).get("duplicate_anchor_replay") or ""
-    ).strip()
-    if not anchors:
-        return duplicate_replay or (
-            f"[CODE ANCHOR ALREADY STORED]\n- tool: {tool_call.name}\n- status: success"
+    if tool_call.name in RETRIEVAL_TOOLS and is_duplicate_retrieval_result(
+        tool_call.name, result
+    ):
+        return format_duplicate_retrieval_receipt(
+            tool_call.name,
+            result,
+            arguments=tool_call.arguments,
         )
-    kinds = {
-        _anchor_memory_kind(item) for item in anchors if isinstance(item, dict)
-    }
-    header = (
-        "[CODE ANCHOR STORED]" if kinds == {"symbol"}
-        else "[FILE FACT STORED]" if kinds == {"fact"}
-        else "[SCHEMA CONTRACT STORED]" if kinds == {"schema"}
-        else "[MEMORY ARTIFACT STORED]"
+
+    observation = _tool_result_observation(result).strip()
+    metadata = result.metadata or {}
+    if observation and metadata.get("llm_observation"):
+        return observation
+    # Successful retrieval with novel evidence: code lands in LOADED CODE ANCHORS.
+    if result.success:
+        if tool_call.name in PARALLEL_RETRIEVAL_TOOLS:
+            return (
+                "[RETRIEVAL OK — NEW EVIDENCE STORED]\n"
+                "Verbatim code was added to LOADED CODE ANCHORS for the next turn."
+            )
+        duplicate_replay = str(metadata.get("duplicate_anchor_replay") or "").strip()
+        return duplicate_replay or observation
+    error_text = (result.error or "").strip()
+    if error_text:
+        return f"{observation}\n\n[TOOL_ERROR]\n{error_text}".strip()
+    return observation
+
+
+def _fact_lock_replay_result(
+    tool_call: ToolCall,
+    payload_text: str,
+    previous_outcome: dict[str, Any],
+    unresolved: tuple[str, ...] = (),
+) -> ToolResult:
+    """Translate an internal cache replay into a minimal successful tool result."""
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+
+    output = ""
+    if isinstance(payload, dict):
+        output = str(
+            payload.get("observation_code")
+            or payload.get("verbatim_code")
+            or payload.get("code")
+            or ""
+        ).strip()
+    if not output:
+        output = payload_text.strip()
+
+    return ToolResult(
+        success=True,
+        output=output,
+        metadata={
+            "is_mock_success": True,
+        },
     )
-    lines = [header, f"- tool: {tool_call.name}"]
-    for item in anchors:
-        if not isinstance(item, dict):
-            continue
-        span = item.get("span") or ["?", "?"]
-        lines.extend([
-            f"- file: `{item.get('file')}`",
-            f"  span: `{span[0]}-{span[1]}`",
-            f"  symbol: `{item.get('symbol') or 'unresolved'}`",
-            f"  memory_kind: `{_anchor_memory_kind(item)}`",
-        ])
-    if duplicate_replay:
-        lines.extend(["", duplicate_replay])
-    return "\n".join(lines)
 
 
 def _run_evidence_event(result: ToolResult) -> RunEvent | None:
@@ -826,25 +1052,27 @@ def _run_evidence_event(result: ToolResult) -> RunEvent | None:
         for item in payload.get("candidates") or ()
         if isinstance(item, dict) and item.get("file") and item.get("symbol")
     )
-    if not evidence and not candidates and not available_refs:
+    observations = tuple(dict(item) for item in raw_items)
+    if not evidence and not candidates and not available_refs and not observations:
         return None
     return RunEvent(
         "evidence_stored",
         evidence=tuple(evidence),
         candidates=candidates,
         artifact_refs=refs,
+        observations=observations,
         reason="tool evidence ingested",
     )
 
 
 def _duplicate_anchor_replay(items: list[dict[str, Any]]) -> str:
-    """Return full code and completeness flags for anchors already durable."""
+    """Return exact durable slices without implying full-file coverage."""
     unique: dict[tuple[Any, ...], dict[str, Any]] = {}
     for item in items:
         unique[_anchor_key(item)] = item
     lines = [
         "[DUPLICATE ANCHOR — EXISTING FACTS REPLAYED]",
-        "The following symbols are already durable and fully loaded in the context:",
+        "The following exact code slices are already durable in the context:",
     ]
     for item in unique.values():
         code = str(item.get("code") or "")
@@ -856,8 +1084,8 @@ def _duplicate_anchor_replay(items: list[dict[str, Any]]) -> str:
         lines.extend(
             [
                 f"- `{item.get('file')}:{span[0]}-{span[1]}` `{symbol}` ({kind})",
-                f"  [SYMBOL COMPLETENESS = TRUE]",
-                f"  FULL SOURCE LOADED",
+                "  [EXACT SYMBOL SLICE COMPLETE]",
+                f"  SOURCE COVERAGE: {item.get('file')}:{span[0]}-{span[1]} only",
                 f"  signature: `{signature}`",
                 f"  decorators: {', '.join(decorators) or 'none'}",
                 f"  returns: {returns}",
@@ -992,32 +1220,82 @@ def _search_cache_for_context(
     return compacted
 
 
-def _latest_symbol_slice_projection(search_cache: dict[str, Any]) -> str:
+def _format_symbol_slice(item: dict[str, Any]) -> str | None:
+    projection_code = item.get("projection_code") or item.get("code")
+    file_path = item.get("file")
+    span = item.get("span") or []
+    if not projection_code or not file_path or len(span) < 2:
+        return None
+    truncated_attr = ' truncated="true"' if item.get("truncated") else ""
+    symbol_attr = f' symbol="{item.get("symbol")}"' if item.get("symbol") else ""
+    return (
+        f'<symbol_slice file="{file_path}"{symbol_attr} '
+        f'span="{span[0]}-{span[1]}"{truncated_attr}>\n'
+        f"{projection_code}\n"
+        "</symbol_slice>"
+    )
+
+
+def _format_raw_anchor(item: dict[str, Any]) -> str:
+    file_path = item.get("file", "?")
+    span = item.get("span") or ["?", "?"]
+    symbol = item.get("symbol")
+    code = item.get("code") or item.get("verbatim_code") or ""
+    header = f"// {file_path}:{span[0]}-{span[1]}"
+    if symbol:
+        header += f" {symbol}"
+    return f"{header}\n```python\n{code}\n```"
+
+
+def _build_deduped_loaded_anchors_block(search_cache: dict[str, Any]) -> str:
+    """Build one deduplicated loaded-code section for the Core LLM prompt."""
+    seen: set[tuple[Any, ...]] = set()
+    blocks: list[str] = []
+    projected_symbols: set[str] = set()
+
     projections = search_cache.get("symbol_projections") or []
-    if not isinstance(projections, list):
-        return ""
+    if isinstance(projections, list):
+        for item in projections[-2:]:
+            if not isinstance(item, dict):
+                continue
+            key = _anchor_key(item)
+            if key in seen:
+                continue
+            formatted = _format_symbol_slice(item)
+            if not formatted:
+                continue
+            seen.add(key)
+            sym = item.get("symbol")
+            if sym:
+                projected_symbols.add(str(sym))
+            blocks.append(formatted)
 
-    blocks = []
-    for item in projections[-2:]:
-        if not isinstance(item, dict):
-            continue
-        projection_code = item.get("projection_code")
-        file_path = item.get("file")
-        span = item.get("span") or []
-        if not projection_code or not file_path or len(span) < 2:
-            continue
-        truncated_attr = ' truncated="true"' if item.get("truncated") else ""
-        symbol_attr = f' symbol="{item.get("symbol")}"' if item.get("symbol") else ""
-        blocks.append(
-            f'<symbol_slice file="{file_path}"{symbol_attr} '
-            f'span="{span[0]}-{span[1]}"{truncated_attr}>\n'
-            f"{projection_code}\n"
-            "</symbol_slice>"
-        )
+    raw_anchors = search_cache.get("raw_evidence_store") or []
+    if isinstance(raw_anchors, list):
+        for item in raw_anchors:
+            if not isinstance(item, dict):
+                continue
+            sym = item.get("symbol")
+            if sym and str(sym) in projected_symbols:
+                continue
+            key = _anchor_key(item)
+            if key in seen:
+                continue
+            code = str(item.get("code") or item.get("verbatim_code") or "").strip()
+            if not code:
+                continue
+            seen.add(key)
+            blocks.append(_format_raw_anchor(item))
 
-    if not blocks:
+    return "\n\n".join(blocks)
+
+
+def _latest_symbol_slice_projection(search_cache: dict[str, Any]) -> str:
+    """Legacy wrapper; prefer _build_deduped_loaded_anchors_block."""
+    block = _build_deduped_loaded_anchors_block(search_cache)
+    if not block:
         return ""
-    return "### ACTIVE TEMPORARY CODE SLICES (from view_symbol_code) ###\n" + "\n\n".join(blocks)
+    return "### ACTIVE TEMPORARY CODE SLICES (from view_symbol_code) ###\n" + block
 
 
 def _retrieval_snapshot_from_output(
@@ -1042,12 +1320,41 @@ def _retrieval_snapshot_from_output(
             for related in (item.get("related_functions") or [])
             if isinstance(related, dict) and related.get("name")
         }
+        symbols.update(
+            str(item["symbol"])
+            for item in payload
+            if isinstance(item, dict) and item.get("symbol")
+        )
+        list_anchors = []
+        for item in payload:
+            if not isinstance(item, dict) or not item.get("file"):
+                continue
+            span = item.get("span") or []
+            list_anchors.append({
+                "file": str(item["file"]),
+                "span": list(span[:2]) if len(span) >= 2 else [],
+                "symbol": str(item.get("symbol") or ""),
+            })
+        precise_keys = {
+            (item["file"], item["symbol"])
+            for item in list_anchors if len(item["span"]) >= 2
+        }
+        list_anchors = [
+            item for item in list_anchors
+            if len(item["span"]) >= 2 or (item["file"], item["symbol"]) not in precise_keys
+        ]
+        list_anchors = list({
+            (item["file"], tuple(item["span"]), item["symbol"]): item
+            for item in list_anchors
+        }.values())
+        list_anchors.sort(key=lambda item: (item["file"], item["span"], item["symbol"]))
         signature_src = json.dumps(
-            {"query": query.strip().lower(), "files": sorted(files), "symbols": sorted(symbols)},
+            {"files": sorted(files), "symbols": sorted(symbols), "anchors": list_anchors},
             ensure_ascii=False, sort_keys=True,
         )
         return {
             "step": step, "query": query, "files": sorted(files), "symbols": sorted(symbols),
+            "anchors": list_anchors,
             "signature": hashlib.sha256(signature_src.encode("utf-8")).hexdigest()[:16],
         }
     if not isinstance(payload, dict):
@@ -1057,6 +1364,7 @@ def _retrieval_snapshot_from_output(
     evidence = payload.get("evidence") or []
     files = set()
     symbols = set()
+    anchors: list[dict[str, Any]] = []
     for item in grounding.get("files", []):
         if isinstance(item, dict) and item.get("path"):
             files.add(str(item["path"]))
@@ -1066,18 +1374,52 @@ def _retrieval_snapshot_from_output(
                 files.add(str(item["file"]))
             if item.get("name"):
                 symbols.add(str(item["name"]))
+            if item.get("file"):
+                span = item.get("span") or []
+                anchors.append({
+                    "file": str(item["file"]),
+                    "span": list(span[:2]) if len(span) >= 2 else [],
+                    "symbol": str(item.get("name") or ""),
+                })
     for item in evidence:
         if isinstance(item, dict):
             if item.get("file"):
                 files.add(str(item["file"]))
             if item.get("symbol"):
                 symbols.add(str(item["symbol"]))
+            if item.get("file"):
+                span = item.get("span") or []
+                anchors.append({
+                    "file": str(item["file"]),
+                    "span": list(span[:2]) if len(span) >= 2 else [],
+                    "symbol": str(item.get("symbol") or ""),
+                })
+
+    if not anchors:
+        anchors = [
+            {"file": file_path, "span": [], "symbol": symbol}
+            for file_path in sorted(files)
+            for symbol in (sorted(symbols) or [""])
+        ]
+    precise_keys = {
+        (item["file"], item["symbol"])
+        for item in anchors if len(item["span"]) >= 2
+    }
+    anchors = [
+        item for item in anchors
+        if len(item["span"]) >= 2 or (item["file"], item["symbol"]) not in precise_keys
+    ]
+    anchors = list({
+        (item["file"], tuple(item["span"]), item["symbol"]): item
+        for item in anchors
+    }.values())
+    anchors.sort(key=lambda item: (item["file"], item["span"], item["symbol"]))
 
     signature_src = json.dumps(
         {
-            "query": query.strip().lower(),
             "files": sorted(files),
             "symbols": sorted(symbols),
+            "anchors": anchors,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -1087,48 +1429,52 @@ def _retrieval_snapshot_from_output(
         "query": query,
         "files": sorted(files),
         "symbols": sorted(symbols),
+        "anchors": anchors,
         "signature": hashlib.sha256(signature_src.encode("utf-8")).hexdigest()[:16],
     }
 
 
+def _anchor_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
+    if left.get("file") != right.get("file"):
+        return 0.0
+    left_symbol = str(left.get("symbol") or "")
+    right_symbol = str(right.get("symbol") or "")
+    if left_symbol and right_symbol and left_symbol != right_symbol:
+        return 0.0
+    left_span = left.get("span") or []
+    right_span = right.get("span") or []
+    if len(left_span) < 2 or len(right_span) < 2:
+        return 1.0 if left_symbol == right_symbol or not left_symbol or not right_symbol else 0.0
+    left_start, left_end = int(left_span[0]), int(left_span[1])
+    right_start, right_end = int(right_span[0]), int(right_span[1])
+    intersection = max(0, min(left_end, right_end) - max(left_start, right_start) + 1)
+    union = max(left_end, right_end) - min(left_start, right_start) + 1
+    return intersection / union if union else 0.0
+
+
+def _snapshot_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
+    left_anchors = left.get("anchors") or []
+    right_anchors = right.get("anchors") or []
+    if left_anchors and right_anchors:
+        scores = [
+            max((_anchor_similarity(anchor, other) for other in right_anchors), default=0.0)
+            for anchor in left_anchors
+        ]
+        return sum(score >= 0.8 for score in scores) / max(len(left_anchors), len(right_anchors))
+    left_facts = set(left.get("files") or ()) | set(left.get("symbols") or ())
+    right_facts = set(right.get("files") or ()) | set(right.get("symbols") or ())
+    union = left_facts | right_facts
+    return len(left_facts & right_facts) / len(union) if union else 0.0
 
 
 
-def _repeated_retrieval_message(
-    query: str,
-    retrieval_history: tuple[dict[str, Any], ...],
-    search_output: str,
-    *,
-    step: int,
-) -> str | None:
-    snapshot = _retrieval_snapshot_from_output(query, search_output, step=step)
-    if not snapshot:
-        return None
-    for item in retrieval_history:
-        if item.get("signature") == snapshot["signature"]:
-            symbols = ", ".join(snapshot["symbols"][:8]) or "known symbols"
-            files = ", ".join(snapshot["files"][:8]) or "known files"
-            return (
-                "[codebase_retrieve blocked: repeated retrieval]\n"
-                f"Query: {query}\n"
-                f"Already explored files: {files}\n"
-                f"Already explored symbols: {symbols}\n"
-                "Search policy: do not retrieve the same path again. "
-                "Use view_symbol_code for exact source of an explored symbol, "
-                "or choose a genuinely new file/symbol to explore."
-            )
-    return None
 
 
-def _append_retrieval_history(
-    retrieval_history: tuple[dict[str, Any], ...],
-    snapshot: dict[str, Any] | None,
-) -> tuple[dict[str, Any], ...]:
-    if not snapshot:
-        return retrieval_history
-    if any(item.get("signature") == snapshot["signature"] for item in retrieval_history):
-        return retrieval_history
-    return (*retrieval_history, snapshot)[-12:]
+#
+# NOTE: Retrieval repetition signalling / outcome ledgers were intentionally
+# removed. The Core LLM prompt should contain concrete code context and actionable
+# failures only (tool errors / validator errors). Any redundancy prevention is
+# enforced via tool availability and preflight blockers.
 
 
 def _run_state_projection(state: RunState) -> str:
@@ -1238,7 +1584,6 @@ class StateAssembledLoop:
 
         self.context_assembly = ContextAssembly(harness.project_root)
         self.stateLayer = StateLayer(harness.project_root, self.context_assembly)
-        self.gravity_controller = DecisionGravityController()
         self._grep_search_history: list[dict[str, Any]] = []
         self._last_novelty_value: float = 1.0
         self._embeddings_cache: dict[str, list[float]] = {}
@@ -1253,6 +1598,7 @@ class StateAssembledLoop:
         self._run_events: list[RunEvent] = []
         self.agent_telemetry = AgentState()
         self._retrieval_history: tuple[dict[str, Any], ...] = ()
+        self._task_text: str = ""
 
     async def _run_tool_with_sentinel(
         self, name: str, args: dict[str, Any], queue: asyncio.Queue[Any]
@@ -1540,6 +1886,8 @@ class StateAssembledLoop:
         if len(accepted) == len(raw):
             return result
         metadata["raw_evidence_store"] = accepted
+        if replayed:
+            metadata["refresh_evidence_store"] = replayed
         accepted_ids = {_anchor_id(item) for item in accepted}
 
         def filter_json_list(value: Any) -> Any:
@@ -1697,6 +2045,99 @@ class StateAssembledLoop:
                 ),
             ),
             messages_history=messages,
+        )
+
+    def _ingest_post_edit_observations(self, tool_call: ToolCall, target_file: str) -> None:
+        """Register new DDL blocks from a validated SQL edit into manifest anchors."""
+        norm = str(target_file).replace("\\", "/").lstrip("./")
+        abs_path = (self.harness.project_root / norm).resolve()
+        if not abs_path.is_file():
+            return
+        try:
+            content = abs_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        observations = observations_from_edited_file(norm, content)
+        if not observations:
+            return
+        raw_store = [dict(item) for item in observations]
+        self._ingest_code_artifacts(tool_call, raw_store)
+        merged_cache = dict(self.state.search_cache)
+        current_raw = list(merged_cache.get("raw_evidence_store") or [])
+        merged_cache["raw_evidence_store"] = _touch_raw_evidence_lru(
+            current_raw,
+            raw_store,
+        )
+        self.state = replace(self.state, search_cache=merged_cache)
+        self._dispatch_run_event(
+            RunEvent(
+                "evidence_stored",
+                observations=tuple(raw_store),
+                reason="post_edit_schema_observed",
+            )
+        )
+
+    async def _inspect_tool_preflight_async(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> str | None:
+        """Run static + fact-locking preflight for a tool call."""
+        embedder_instance = getattr(self, "_embedder", None)
+        if embedder_instance is None:
+            from src.indexer.embedder import Embedder
+
+            self._embedder = Embedder(
+                model=self.settings.embedding_model,
+                provider=self.settings.embedding_provider,
+            )
+
+        context_builder = getattr(self, "context_builder", None)
+        repo_map = None
+        if context_builder is not None:
+            service = getattr(context_builder, "repo_map_service", None)
+            if service is not None:
+                try:
+                    repo_map = getattr(service, "map", None)
+                except Exception:
+                    pass
+
+        from src.hooks.before_tool import inspect_tool_request_async
+
+        return await inspect_tool_request_async(
+            tool_name,
+            tool_args,
+            allowed_tools=self._current_step_tools,
+            has_compile_error=bool(self._validation_error()),
+            search_history=self._grep_search_history,
+            repo_map=repo_map,
+            embedder=self._embedder,
+            embeddings_cache=self._embeddings_cache,
+            gravity_controller=None,
+            checklist=list(self.state.checklist),
+            context_anchors_code=list(self.state.context_anchors.code),
+            raw_evidence_store=list(self.state.search_cache.get("raw_evidence_store", [])),
+            git_diff=self.state.git_diff,
+            modified_files=list(self.state.run_state.changes.files),
+            manifest=self.state.run_state.manifest,
+            project_root=self.harness.project_root,
+            edit_recovery=bool(self.state.run_state.edit_patch_failed),
+        )
+
+    def _record_preflight_block(self, tc: ToolCall, err: str) -> ToolResult:
+        """Persist a preflight rejection and reopen retrieval when edit was misused."""
+        if tc.name == "decision_edit":
+            self._dispatch_run_event(
+                RunEvent(
+                    "tool_failed",
+                    tool_name="decision_edit",
+                    reason=err,
+                )
+            )
+        return ToolResult(
+            success=False,
+            output=f"Error: {err}",
+            error=err,
         )
 
 
@@ -1876,8 +2317,8 @@ class StateAssembledLoop:
         user_context = user_msg
         edit_mode = bool(
             re.search(
-                r"\b(?:fix|implement|change|edit|add|remove|refactor|supplement|support|optimize|adjust)\b|"
-                r"修复|修改|实现|新增|删除|重构|补充|完善|加上|添加|引入|支持|调整|优化",
+                r"\b(?:fix|implement|change|edit|add|remove|refactor|supplement|support|optimize|adjust|create|build)\b|"
+                r"修复|修改|实现|新增|删除|重构|补充|完善|加上|添加|引入|支持|调整|优化|创建|构建|开发",
                 user_msg,
                 re.IGNORECASE,
             )
@@ -1890,6 +2331,7 @@ class StateAssembledLoop:
         self.stateLayer.clear_cache()
         self.state = replace(
             self.state,
+            retrieval_outcome={},
             run_state=start_run(
                 user_msg,
                 edit_mode=edit_mode,
@@ -1938,6 +2380,7 @@ class StateAssembledLoop:
 
         yield AgentEvent(type=EventType.STREAM_START)
         self.harness.phase_metrics.reset_turn()
+        self._task_text = user_context.strip()
 
         step = 0
         protocol_failures = 0
@@ -2017,14 +2460,37 @@ class StateAssembledLoop:
                 current_step=self.state.run_state.step,
             )
 
-            # Coordinates next turn via DecisionGravityController
-            gravity_info = self.gravity_controller.coordinate_next_turn(self.state, self)
+            # Project the Step Evidence Manifest from durable verbatim anchors so
+            # tool allocation, fact-locking and the execution card all read the
+            # same computed sufficiency for this turn.
+            anchor_pool = [
+                *self.state.context_anchors.code,
+                *(self.state.search_cache.get("raw_evidence_store") or []),
+            ]
+            projected_manifest = project_manifest(
+                self.state.run_state.manifest,
+                anchor_pool,
+                step=self.state.run_state.step,
+                task_mode=self.state.run_state.task_mode,
+            )
+            self.state = replace(
+                self.state,
+                run_state=replace(self.state.run_state, manifest=projected_manifest),
+            )
 
             self._current_step_tools = determine_allowed_tools(
                 self.state,
-                self.gravity_controller,
+                None,
                 default_tools=ASSEMBLED_TOOL_NAMES,
                 has_compile_error=bool(self._validation_error()),
+                validation_error=self._validation_error(),
+            )
+            self._trace_manifest(
+                self.state.run_state.manifest,
+                allowed_tools=self._current_step_tools,
+                retrieval_no_gain_rounds=(
+                    self.state.run_state.retrieval_no_gain_rounds
+                ),
             )
 
             # --- CONTEXT ASSEMBLY ---
@@ -2034,242 +2500,71 @@ class StateAssembledLoop:
                 sliced_messages = []
 
             # Now build the messages payload for LiteLLM/OpenAI
-            system_content = shaped_sys_prompt
-
             checklist_str = "\n".join(f"- {item}" for item in shaped_checklist) or "- No checklist items"
             if ready_final:
                 context_block = _response_evidence_summary(self.state)
             else:
-                context_block = self.context_assembly.build_context_block(
-                    list(shaped_active_files),
-                    search_cache=projected_search_cache,
-                    modified_files=list(self.state.run_state.changes.files),
-                )
-                symbol_projection_block = _latest_symbol_slice_projection(self.state.search_cache)
-                if symbol_projection_block:
-                    context_block = (
-                        f"{context_block}\n\n{symbol_projection_block}"
-                        if context_block
-                        else symbol_projection_block
-                    )
-            # Remove old RunState projection block to make state completely implicit
+                context_block = _build_deduped_loaded_anchors_block(projected_search_cache)
 
-            substituted = system_content
-            has_new_slots = (
-                "{{STATE.ACTIVE_FILES_LIST}}" in system_content or
-                "{{STATE.CHECKLIST}}" in system_content or
-                "{{STATE.GIT_DIFFS}}" in system_content or
-                "{{STATE.BUILD_ERRORS}}" in system_content or
-                "{{STATE.ACTIVE_FILES_BLOCKS}}" in system_content or
-                "{{STATE.LAST_TOOL_RESULT}}" in system_content or
-                "{{STATE.LAST_ERROR}}" in system_content or
-                "{{STATE.REPO_MAP}}" in system_content
+            rules_block = (
+                f"\n\n### PROJECT RULES & USER CONTEXT ###\n{shaped_rules_text}\n"
+                if shaped_rules_text
+                else ""
             )
 
-            rules_block = f"\n\n### PROJECT RULES & USER CONTEXT ###\n{shaped_rules_text}\n" if shaped_rules_text else ""
-            implicit_state_block = ""
-            if gravity_info.get("gravity_prompt"):
-                implicit_state_block += f"\n\n{gravity_info['gravity_prompt']}"
-            if gravity_info.get("blind_spots_prompt"):
-                implicit_state_block += f"\n\n{gravity_info['blind_spots_prompt']}"
-
-            # --- RETRIEVAL STATE INJECTION ---
-            # 1. Collect Loaded Files
-            loaded_files = []
-            if hasattr(self.state, "context_anchors") and self.state.context_anchors.code:
-                loaded_files = list({c.get("file") for c in self.state.context_anchors.code if isinstance(c, dict) and c.get("file")})
-            for f in shaped_active_files:
-                if f not in loaded_files:
-                    loaded_files.append(f)
-            
-            # 2. Collect Loaded Symbols
-            loaded_symbols = []
-            projections = self.state.search_cache.get("symbol_projections") or []
-            for item in projections:
-                if isinstance(item, dict) and item.get("symbol"):
-                    loaded_symbols.append(item["symbol"])
-            if hasattr(self.state, "context_anchors") and self.state.context_anchors.code:
-                for c in self.state.context_anchors.code:
-                    sym = c.get("symbol")
-                    if sym and sym not in loaded_symbols:
-                        loaded_symbols.append(sym)
-
-            # 3. Determine Database Schema grounding
-            detected_tables = set()
-            raw_ev = self.state.search_cache.get("raw_evidence_store") or []
-            for item in raw_ev:
-                if isinstance(item, dict):
-                    code = item.get("code") or ""
-                    if code:
-                        from src.hooks.post_tool_context import _parse_and_structure_sql
-                        try:
-                            structs = _parse_and_structure_sql(code)
-                            for s in structs:
-                                tbl = s.get("table")
-                                if tbl:
-                                    detected_tables.add(tbl)
-                                tables = s.get("tables")
-                                if tables:
-                                    detected_tables.update(tables)
-                        except Exception:
-                            pass
-            
-            # Also check if any schema/sql files are in loaded_files
-            has_sql_file = any(f.endswith(".sql") for f in loaded_files)
-            if has_sql_file or detected_tables:
-                tables_suffix = f" (tables: {', '.join(sorted(detected_tables))})" if detected_tables else ""
-                db_schema_str = f"fully grounded{tables_suffix}"
-            else:
-                db_schema_str = "fully grounded"
-
-            # 4. Determine Convergence status
-            is_closed = getattr(self.gravity_controller, "retrieval_disabled", False)
-            retrieval_phase = "CLOSED" if is_closed else "ACTIVE"
-            evidence_saturation = "HIGH" if is_closed else "MEDIUM"
-            allowed_actions_str = ", ".join(sorted(self._current_step_tools)) or "final response only (NO TOOLS)"
-            allowed_actions = f"{{{allowed_actions_str}}}"
-
-            loaded_files_str = "\n".join(f"  * {f} (FULL SOURCE LOADED)" for f in loaded_files) if loaded_files else "  * none"
-            loaded_symbols_str = "\n".join(f"  * {s} [SYMBOL COMPLETENESS = TRUE] (FULL SOURCE LOADED)" for s in loaded_symbols) if loaded_symbols else "  * none"
-
-            state_injection_block = (
-                f"\n\n### [RETRIEVAL STATE INJECTION] ###\n"
-                f"[STATE UPDATE]\n"
-                f"- Loaded Files:\n{loaded_files_str}\n"
-                f"- Loaded Symbols:\n{loaded_symbols_str}\n"
-                f"- Database Schema: {db_schema_str}\n"
-                f"\n"
-                f"[CONVERGENCE STATUS]\n"
-                f"- retrieval phase = {retrieval_phase}\n"
-                f"- evidence saturation = {evidence_saturation}\n"
-                f"- allowed actions = {allowed_actions}\n"
+            runtime_state_block = _build_runtime_state_block(
+                active_files=list(shaped_active_files),
+                checklist_str=checklist_str,
+                git_diff=self.state.git_diff,
+                validation_error=self._validation_error(),
+                last_tool_result=self._last_tool_result(),
+                last_error=self._last_error(),
             )
-            if self._current_step_tools == frozenset({"decision_edit"}):
-                state_injection_block += (
-                    "\n[IMPORTANT INSTRUCTION]\n"
-                    "All retrieval, search, and symbol reading tools (e.g. view_symbol_code, grep_search, codebase_retrieve) "
-                    "have been disabled because your design phase/retrieval is complete. You already have all necessary code "
-                    "symbols fully loaded in the CURRENT CONTEXT. Do NOT attempt to read files or search. You MUST proceed "
-                    "directly to applying your proposed code modifications using the 'decision_edit' tool.\n"
+
+            turn_context_block = ""
+            if not ready_final:
+                verification_active = post_edit_verification_ready(
+                    self.state.run_state,
+                    checklist=self.state.checklist,
                 )
-            implicit_state_block += state_injection_block
-
-            if has_new_slots:
-                active_files_list_str = ", ".join(shaped_active_files)
-                git_diff_str = (
-                    f"```text\n{self.state.git_diff}\n```"
-                    if self.state.git_diff
-                    else "Clean working tree."
+                card = execution_card(
+                    self.state.run_state.manifest,
+                    sorted(self._current_step_tools),
+                    retrieval_no_gain_rounds=(
+                        self.state.run_state.retrieval_no_gain_rounds
+                    ),
+                    task_slots=sorted(self.state.run_state.evidence.required),
+                    last_grep_error=self.state.run_state.last_grep_error,
+                    grep_suggested_views=self.state.run_state.grep_suggested_views,
+                    edit_burst=bool(self.state.run_state.changes.files)
+                    and self.state.run_state.validation.status == "passed"
+                    and "decision_edit" in self._current_step_tools
+                    and "grep_search" not in self._current_step_tools
+                    and not self.state.run_state.edit_patch_failed
+                    and not verification_active,
+                    edited_files=self.state.run_state.changes.files,
+                    edit_patch_failed=self.state.run_state.edit_patch_failed,
+                    view_last_round_all_duplicate=(
+                        self.state.run_state.view_last_round_all_duplicate
+                    ),
+                    verification_mode=verification_active,
                 )
-                validation_error = self._validation_error()
-                build_errors_str = (
-                    f"```\n{validation_error}\n```"
-                    if validation_error else "No compile or build errors."
+                turn_context_block = _build_turn_context_block(
+                    loaded_anchors=context_block,
+                    execution_card_text=card,
                 )
-                active_files_blocks_str = context_block or "No active files in context yet."
-                last_tool_result_str = self._last_tool_result() or "No tools executed yet."
-                import json
-                last_error = self._last_error()
-                last_error_str = json.dumps(last_error, ensure_ascii=False) if last_error else "None"
+            elif context_block.strip():
+                turn_context_block = f"\n\n{context_block}"
 
-                exclude_symbols = set()
-                if hasattr(self.state, "context_anchors") and self.state.context_anchors.code:
-                    for anchor in self.state.context_anchors.code:
-                        sym = anchor.get("symbol")
-                        if sym:
-                            exclude_symbols.add(sym)
-                raw_ev = self.state.search_cache.get("raw_evidence_store") or []
-                for item in raw_ev:
-                    sym = item.get("symbol")
-                    if sym:
-                        exclude_symbols.add(sym)
-                proj = self.state.search_cache.get("symbol_projections") or []
-                for item in proj:
-                    sym = item.get("symbol")
-                    if sym:
-                        exclude_symbols.add(sym)
-
-                repo_map_str = ""
-                context_builder = getattr(self, "context_builder", None)
-                if context_builder is not None:
-                    service = getattr(context_builder, "repo_map_service", None)
-                    if service is not None and not hasattr(service, "assert_called") and hasattr(service, "to_planner_context"):
-                        try:
-                            max_chars = getattr(context_builder, "repo_map_max_chars", 12000)
-                            if not isinstance(max_chars, int):
-                                max_chars = 12000
-                            block = service.to_planner_context(max_chars=max_chars, exclude_symbols=exclude_symbols)
-                            if block and isinstance(block, str):
-                                repo_map_str = block
-                        except Exception:
-                            pass
-                if ready_final:
-                    repo_map_str = "RepoMap omitted: retrieval evidence is complete."
-                elif not repo_map_str:
-                    repo_map_str = "No repository map available."
-
-                substituted = substituted.replace("{{STATE.ACTIVE_FILES_LIST}}", active_files_list_str)
-                substituted = substituted.replace("{{STATE.CHECKLIST}}", checklist_str)
-                substituted = substituted.replace("{{STATE.GIT_DIFFS}}", git_diff_str)
-                substituted = substituted.replace("{{STATE.BUILD_ERRORS}}", build_errors_str)
-                substituted = substituted.replace("{{STATE.ACTIVE_FILES_BLOCKS}}", active_files_blocks_str)
-                substituted = substituted.replace("{{STATE.LAST_TOOL_RESULT}}", last_tool_result_str)
-                substituted = substituted.replace("{{STATE.LAST_ERROR}}", last_error_str)
-                substituted = substituted.replace("{{STATE.REPO_MAP}}", repo_map_str)
-
-                assembled_sys_content = substituted
-                user_instruction_block = f"{rules_block}\nOriginal Request: {user_context}{implicit_state_block}" if rules_block else f"Original Request: {user_context}{implicit_state_block}"
-            else:
-                assembled_sys_content = system_content
-                state_parts = [
-                    "### CURRENT STATE ###",
-                    f"Active Checklist:\n{checklist_str}",
-                ]
-                last_tool_result = self._last_tool_result()
-                if last_tool_result:
-                    state_parts.append(f"Last Tool Result: {last_tool_result}")
-                last_error = self._last_error()
-                if last_error:
-                    import json
-                    state_parts.append(f"Last Error (Structured):\n```json\n{json.dumps(last_error, ensure_ascii=False, indent=2)}\n```")
-                if self.state.git_diff:
-                    state_parts.append(
-                        f"Git Working Tree State:\n```text\n{self.state.git_diff}\n```"
-                    )
-                validation_error = self._validation_error()
-                if validation_error:
-                    state_parts.append(f"Validation/Compiler Failures:\n```\n{validation_error}\n```")
-
-                state_text = "\n\n".join(state_parts)
-                context_text = f"### CURRENT CONTEXT ###\n\n{context_block}" if context_block else "### CURRENT CONTEXT ###\n\nNo active files in context yet."
-
-                user_instruction_block = (
-                    f"{state_text}\n\n"
-                )
-                if rules_block:
-                    user_instruction_block += f"{rules_block}\n"
-                user_instruction_block += (
-                    f"{context_text}\n\n"
-                    f"Original Request: {user_context}{implicit_state_block}"
-                )
+            # System prompt is static policy; volatile state lives in the user message.
+            assembled_sys_content = shaped_sys_prompt
+            user_instruction_block = (
+                f"Original Request: {user_context}"
+                f"{rules_block}\n\n{runtime_state_block}"
+                f"{turn_context_block}"
+            )
 
             assembled_messages = []
-            if self._current_step_tools == frozenset({"decision_edit"}):
-                sys_override = (
-                    "\n\n"
-                    "========================================================================\n"
-                    "### CRITICAL SYSTEM INSTRUCTION OVERRIDE — EDIT PHASE ACTIVE ###\n"
-                    "All search and read tools (including view_symbol_code, grep_search, codebase_retrieve) "
-                    "have been disabled because your design phase/retrieval is complete. You already have all "
-                    "necessary code symbols fully loaded in the CURRENT CONTEXT. Do NOT attempt to read files, "
-                    "view symbols, or search.\n"
-                    "You MUST proceed directly to applying your proposed code modifications using the 'decision_edit' tool.\n"
-                    "Any attempt to call a forbidden tool will result in a tool rejection error.\n"
-                    "========================================================================\n"
-                )
-                if sys_override not in assembled_sys_content:
-                    assembled_sys_content += sys_override
-
             assembled_messages.append({"role": "system", "content": assembled_sys_content})
             for msg in sliced_messages:
                 assembled_messages.append(msg.to_dict())
@@ -2408,13 +2703,11 @@ class StateAssembledLoop:
             protocol_failures = 0
 
             # Update checklist from thoughts/response dynamically
-            matches = re.findall(r'-\s+\[( |x|X)\]\s+(.*)', response_text)
-            if matches:
-                checklist_items = []
-                for status, task in matches:
-                    check_char = "x" if status.lower() == "x" else " "
-                    checklist_items.append(f"[{check_char}] {task.strip()}")
-                self.state = replace(self.state, checklist=tuple(checklist_items))
+            from src.agent.checklist import parse_checklist_lines
+
+            checklist_items = parse_checklist_lines(response_text)
+            if checklist_items:
+                self.state = replace(self.state, checklist=checklist_items)
 
             # Process actions (tool calls)
             if response.tool_calls:
@@ -2487,17 +2780,39 @@ class StateAssembledLoop:
         yield AgentEvent(type=EventType.STREAM_END)
 
     def _post_process_tool_result(self, name: str, arguments: dict[str, Any], result: ToolResult) -> ToolResult:
+        from dataclasses import is_dataclass
+
+        run_state = getattr(getattr(self, "state", None), "run_state", None)
+        if (
+            result.success
+            and name in {"grep_search", "view_symbol_code"}
+            and is_dataclass(run_state)
+            and run_state.edit_patch_failed
+        ):
+            self.state = replace(
+                self.state,
+                run_state=replace(run_state, edit_patch_failed=False),
+            )
         if name == "grep_search" and result.success:
-            pattern = arguments.get("pattern", "")
             path = arguments.get("path", ".")
             has_compile_error = bool(self._validation_error())
-            # Use multi-signal novelty score if pre-computed, otherwise fallback
-            evaluation = evaluate_search_intent(pattern, path, self._grep_search_history, has_compile_error)
-            novelty = arguments.get("_novelty_score", evaluation["novelty"])
-            
-            self._grep_search_history.append({"file": path, "pattern": pattern})
-            self._last_novelty_value = novelty
-            
+            searched = list(
+                dict.fromkeys(
+                    (result.metadata or {}).get("searched_patterns")
+                    or arguments.get("patterns")
+                    or ([arguments.get("pattern")] if arguments.get("pattern") else [])
+                )
+            )
+            novelty = self._last_novelty_value
+            for pattern in searched:
+                if not str(pattern or "").strip():
+                    continue
+                evaluation = evaluate_search_intent(
+                    str(pattern), path, self._grep_search_history, has_compile_error
+                )
+                novelty = arguments.get("_novelty_score", evaluation["novelty"])
+                self._grep_search_history.append({"file": path, "pattern": str(pattern)})
+                self._last_novelty_value = novelty
             uncertainty = 1.0 if has_compile_error else 0.2
             retrieval_weight = 0.3 * novelty + 0.7 * uncertainty
             action = "PROCEED_WITH_TRUNCATED_DATA" if retrieval_weight <= 0.35 else "PROCEED_WITH_FULL_DATA"
@@ -2547,7 +2862,11 @@ class StateAssembledLoop:
         )
 
         executed_tool_signals = []
+        retrieval_round_results: list[tuple[str, ToolResult]] = []
         first_error_to_structure = None
+        round_grep_error = ""
+        round_suggested_views: list[dict[str, Any]] = []
+        edit_applied_this_round = False
 
         # Classify and batch tools: parallelizable tools run in parallel, sequential tools run one-by-one
         batches: list[list[ToolCall]] = []
@@ -2586,7 +2905,11 @@ class StateAssembledLoop:
                 async def run_one(tc: ToolCall) -> tuple[ToolCall, ToolResult]:
                     if tc.id in preflight_results:
                         return tc, preflight_results[tc.id]
-                    tool_args = dict(tc.arguments)
+                    tool_args = _prepare_tool_arguments(
+                        tc.name,
+                        dict(tc.arguments),
+                        hint_text=self._task_text,
+                    )
                     tool_cache = _search_cache_view(self.state)
                     if tool_cache:
                         tool_args["_search_cache"] = tool_cache
@@ -2620,12 +2943,15 @@ class StateAssembledLoop:
                         repo_map=repo_map,
                         embedder=self._embedder,
                         embeddings_cache=self._embeddings_cache,
-                        gravity_controller=self.gravity_controller,
+                        gravity_controller=None,
                         checklist=list(self.state.checklist),
                         context_anchors_code=list(self.state.context_anchors.code),
                         raw_evidence_store=list(self.state.search_cache.get("raw_evidence_store", [])),
                         git_diff=self.state.git_diff,
                         modified_files=list(self.state.run_state.changes.files),
+                        manifest=self.state.run_state.manifest,
+                        project_root=self.harness.project_root,
+                        edit_recovery=bool(self.state.run_state.edit_patch_failed),
                     )
                     warning_feedback = None
                     is_hard_block = False
@@ -2636,7 +2962,6 @@ class StateAssembledLoop:
                         else:
                             is_hard_block = True
                             warning_feedback = err
-                            self.gravity_controller.last_feedback = err
 
                     self.harness.phase_metrics.start(
                         f"tool_{tc.name}", subtask_id=str(self.state.run_state.step)
@@ -2651,35 +2976,10 @@ class StateAssembledLoop:
                             )
                         elif is_mock_success:
                             output_msg = err[len("SUCCESS:"):].strip()
-                            mock_metadata = {
-                                "llm_observation": output_msg,
-                                "is_mock_success": True,
-                            }
-                            try:
-                                parsed = json.loads(output_msg)
-                                if isinstance(parsed, dict):
-                                    if "verbatim_code" in parsed:
-                                        import hashlib
-                                        code_str = parsed.get("verbatim_code") or ""
-                                        code_hash = hashlib.md5(code_str.encode("utf-8")).hexdigest()[:6]
-                                        anchor = {
-                                            "file": parsed.get("file"),
-                                            "span": parsed.get("span"),
-                                            "symbol": tc.arguments.get("symbol"),
-                                            "code": code_str,
-                                            "verbatim_code": code_str,
-                                            "hash": code_hash,
-                                        }
-                                        mock_metadata["raw_evidence_store"] = [anchor]
-                                        mock_metadata["span"] = parsed.get("span")
-                                    elif "matches" in parsed:
-                                        mock_metadata["raw_evidence_store"] = parsed.get("matches")
-                            except Exception:
-                                pass
                             result = ToolResult(
                                 success=True,
                                 output=output_msg,
-                                metadata=mock_metadata,
+                                metadata={"is_mock_success": True},
                             )
                             success = True
                         else:
@@ -2716,14 +3016,27 @@ class StateAssembledLoop:
                 results = self._dedupe_parallel_anchor_results(results)
 
                 for tc, result in results:
+                    if tc.name in RETRIEVAL_TOOLS:
+                        result = self._dedupe_result_anchors(result)
+                        retrieval_round_results.append((tc.name, result))
                     task_completion = self._apply_context_update(result)
                     display_output = result.output if result.success else f"Error: {result.error}"
                     self._trace_tool_result(tc.name, display_output, success=result.success)
 
-                    # Log signal for parallel retrieve
-                    sig_args = f"query=\"{tc.arguments.get('query', '')}\"" if tc.name == "codebase_retrieve" else "..."
-                    sig_status = "success" if result.success else "failed"
-                    executed_tool_signals.append(f"{tc.name}({sig_args}) -> {sig_status}")
+                    norm_args = _prepare_tool_arguments(
+                        tc.name,
+                        dict(tc.arguments),
+                        hint_text=self._task_text,
+                    )
+                    executed_tool_signals.append(
+                        _retrieval_tool_signal(tc, result, arguments=norm_args)
+                    )
+                    round_grep_error, round_suggested_views = _observe_grep_round(
+                        tc.name,
+                        result,
+                        round_grep_error=round_grep_error,
+                        round_suggested_views=round_suggested_views,
+                    )
 
                     if not result.success:
                         if not first_error_to_structure:
@@ -2735,36 +3048,6 @@ class StateAssembledLoop:
                             if "search_output" in result.metadata:
                                 new_output = result.metadata["search_output"]
                                 retrieval_query = str(tc.arguments.get("query", ""))
-                                repeated_msg = _repeated_retrieval_message(
-                                    retrieval_query,
-                                    self._retrieval_history,
-                                    new_output,
-                                    step=self.state.run_state.step,
-                                )
-                                if repeated_msg:
-                                    result = ToolResult(
-                                        success=True,
-                                        output=repeated_msg,
-                                        metadata={
-                                            "llm_observation": repeated_msg,
-                                            "retrieval_repeated": True,
-                                        },
-                                    )
-                                    display_output = repeated_msg
-                                    self._trace_tool_result(tc.name, display_output, success=True)
-                                    self.state = replace(
-                                        self.state,
-                                        messages_history=self.state.messages_history + (
-                                            tool_message(tc.id, _tool_history_receipt(tc, result)),
-                                        ),
-                                    )
-                                    yield tool_result_event(tc.name, display_output, success=True)
-                                    continue
-                                snapshot = _retrieval_snapshot_from_output(
-                                    retrieval_query,
-                                    new_output,
-                                    step=self.state.run_state.step,
-                                )
                                 existing_output = merged_cache.get("search_output")
                                 if existing_output:
                                     try:
@@ -2784,10 +3067,6 @@ class StateAssembledLoop:
                                         last_updated_step=self.state.run_state.step,
                                     ),
                                 )
-                                self._retrieval_history = _append_retrieval_history(
-                                    self._retrieval_history,
-                                    snapshot,
-                                )
                             if "edit_context" in result.metadata:
                                 merged_cache["edit_context"] = result.metadata["edit_context"]
                             if "snippets" in result.metadata:
@@ -2799,18 +3078,24 @@ class StateAssembledLoop:
                                 merged_cache["symbol_projections"] = existing_projections[-8:]
                             
                             raw_store = result.metadata.get("raw_evidence_store")
+                            refresh_store = result.metadata.get("refresh_evidence_store")
                             if raw_store:
                                 self._ingest_code_artifacts(tc, raw_store)
+                            if raw_store or refresh_store:
                                 current_raw = list(merged_cache.get("raw_evidence_store") or [])
-                                for item in raw_store:
-                                    # Prune any existing cached evidence matching the same file and overlapping span
-                                    current_raw = [
-                                        existing for existing in current_raw
-                                        if not (existing.get("file") == item.get("file") and
-                                                _span_overlap_ratio(existing, item) > 0.90)
-                                    ]
-                                    current_raw.append(item)
-                                merged_cache["raw_evidence_store"] = current_raw
+                                merged_cache["raw_evidence_store"] = _touch_raw_evidence_lru(
+                                    current_raw,
+                                    [
+                                        *(
+                                            item for item in (refresh_store or [])
+                                            if isinstance(item, dict)
+                                        ),
+                                        *(
+                                            item for item in (raw_store or [])
+                                            if isinstance(item, dict)
+                                        ),
+                                    ],
+                                )
 
                             self.state = replace(self.state, search_cache=merged_cache)
 
@@ -2881,7 +3166,63 @@ class StateAssembledLoop:
                         first_error_to_structure = denied_msg
                     continue
 
-                # Check permission
+                tool_args = _prepare_tool_arguments(
+                    tc.name,
+                    dict(tc.arguments),
+                    hint_text=self._task_text,
+                )
+                tool_cache = _search_cache_view(self.state)
+                if tool_cache:
+                    tool_args["_search_cache"] = tool_cache
+
+                preflight_err = await self._inspect_tool_preflight_async(tc.name, tool_args)
+                if preflight_err:
+                    if preflight_err.startswith("SUCCESS:"):
+                        output_msg = preflight_err[len("SUCCESS:"):].strip()
+                        result = ToolResult(
+                            success=True,
+                            output=output_msg,
+                            metadata={"is_mock_success": True},
+                        )
+                        display_output = output_msg
+                        self.state = replace(
+                            self.state,
+                            messages_history=self.state.messages_history + (
+                                tool_message(tc.id, display_output),
+                            ),
+                        )
+                        self._trace_tool_result(tc.name, display_output, success=True)
+                        yield tool_result_event(tc.name, display_output, success=True)
+                        executed_tool_signals.append(f"{tc.name}(...) -> preflight_mock")
+                        continue
+
+                    result = self._record_preflight_block(tc, preflight_err)
+                    if tc.name in RETRIEVAL_TOOLS:
+                        retrieval_round_results.append((tc.name, result))
+                    display_output = (
+                        _tool_history_receipt(tc, result)
+                        if tc.name in RETRIEVAL_TOOLS
+                        and is_duplicate_retrieval_result(tc.name, result)
+                        else f"Error: {preflight_err}"
+                    )
+                    self.state = replace(
+                        self.state,
+                        messages_history=self.state.messages_history + (
+                            tool_message(tc.id, display_output),
+                        ),
+                    )
+                    self._trace_tool_result(tc.name, display_output, success=False)
+                    yield tool_result_event(tc.name, display_output, success=False)
+                    executed_tool_signals.append(
+                        _retrieval_tool_signal(tc, result, arguments=dict(tc.arguments))
+                        if tc.name in RETRIEVAL_TOOLS
+                        else f"{tc.name}(...) -> preflight_blocked"
+                    )
+                    if not first_error_to_structure:
+                        first_error_to_structure = preflight_err
+                    continue
+
+                # Check permission (after preflight — invalid args never prompt)
                 approved = True
                 permission_event_started = False
                 tool = self.tools.get(tc.name)
@@ -2940,138 +3281,34 @@ class StateAssembledLoop:
                     data={"spinner_only": True, "phase": "executor"},
                 )
 
-                # Execute the tool
-                tool_args = dict(tc.arguments)
-                tool_cache = _search_cache_view(self.state)
-                if tool_cache:
-                    tool_args["_search_cache"] = tool_cache
-
-                # Run preflight constraints and convergence checks
-                embedder_instance = getattr(self, "_embedder", None)
-                if embedder_instance is None:
-                    from src.indexer.embedder import Embedder
-                    self._embedder = Embedder(
-                        model=self.settings.embedding_model,
-                        provider=self.settings.embedding_provider,
-                    )
-                
-                context_builder = getattr(self, "context_builder", None)
-                repo_map = None
-                if context_builder is not None:
-                    service = getattr(context_builder, "repo_map_service", None)
-                    if service is not None:
-                        try:
-                            repo_map = getattr(service, "map", None)
-                        except Exception:
-                            pass
-
-                from src.hooks.before_tool import inspect_tool_request_async
-                err = await inspect_tool_request_async(
-                    tc.name,
-                    tool_args,
-                    allowed_tools=self._current_step_tools,
-                    has_compile_error=bool(self._validation_error()),
-                    search_history=self._grep_search_history,
-                    repo_map=repo_map,
-                    embedder=self._embedder,
-                    embeddings_cache=self._embeddings_cache,
-                    gravity_controller=self.gravity_controller,
-                    checklist=list(self.state.checklist),
-                    context_anchors_code=list(self.state.context_anchors.code),
-                    raw_evidence_store=list(self.state.search_cache.get("raw_evidence_store", [])),
-                    git_diff=self.state.git_diff,
-                    modified_files=list(self.state.run_state.changes.files),
-                )
-
-                warning_feedback = None
-                is_hard_block = False
-                is_mock_success = False
-                if err:
-                    if err.startswith("SUCCESS:"):
-                        is_mock_success = True
-                    else:
-                        is_hard_block = True
-                        warning_feedback = err
-                        self.gravity_controller.last_feedback = err
-
                 self.harness.phase_metrics.start(
                     f"tool_{tc.name}", subtask_id=str(self.state.run_state.step)
                 )
                 success = False
                 try:
-                    if is_hard_block:
-                        result = ToolResult(
-                            success=False,
-                            output=f"Error: {err}",
-                            error=err,
-                        )
-                    elif is_mock_success:
-                        output_msg = err[len("SUCCESS:"):].strip()
-                        mock_metadata = {
-                            "llm_observation": output_msg,
-                            "is_mock_success": True,
-                        }
-                        try:
-                            parsed = json.loads(output_msg)
-                            if isinstance(parsed, dict):
-                                if "verbatim_code" in parsed:
-                                    import hashlib
-                                    code_str = parsed.get("verbatim_code") or ""
-                                    code_hash = hashlib.md5(code_str.encode("utf-8")).hexdigest()[:6]
-                                    anchor = {
-                                        "file": parsed.get("file"),
-                                        "span": parsed.get("span"),
-                                        "symbol": tc.arguments.get("symbol"),
-                                        "code": code_str,
-                                        "verbatim_code": code_str,
-                                        "hash": code_hash,
-                                    }
-                                    mock_metadata["raw_evidence_store"] = [anchor]
-                                    mock_metadata["span"] = parsed.get("span")
-                                elif "matches" in parsed:
-                                    mock_metadata["raw_evidence_store"] = parsed.get("matches")
-                        except Exception:
-                            pass
-                        result = ToolResult(
-                            success=True,
-                            output=output_msg,
-                            metadata=mock_metadata,
-                        )
-                        success = True
-                    else:
-                        progress_queue = asyncio.Queue()
-                        self.harness.progress_callback = progress_queue.put_nowait
+                    progress_queue = asyncio.Queue()
+                    self.harness.progress_callback = progress_queue.put_nowait
 
-                        tool_task = asyncio.create_task(
-                            self._run_tool_with_sentinel(tc.name, tool_args, progress_queue),
-                            name=f"action-layer:{tc.name}:{tc.id}",
+                    tool_task = asyncio.create_task(
+                        self._run_tool_with_sentinel(tc.name, tool_args, progress_queue),
+                        name=f"action-layer:{tc.name}:{tc.id}",
+                    )
+                    while True:
+                        progress_text = await progress_queue.get()
+                        if progress_text is None:
+                            break
+                        yield AgentEvent(
+                            type=EventType.STATUS,
+                            content=progress_text,
+                            data={"phase": "executor", "spinner_only": True},
                         )
-                        while True:
-                            progress_text = await progress_queue.get()
-                            if progress_text is None:
-                                break
-                            yield AgentEvent(
-                                type=EventType.STATUS,
-                                content=progress_text,
-                                data={"phase": "executor", "spinner_only": True},
-                            )
-                        result = await tool_task
-                        if hasattr(self.harness, "progress_callback"):
-                            delattr(self.harness, "progress_callback")
-                        result = apply_after_tool_output_limit(tc.name, result)
-                        result = apply_post_tool_context_hook(tc.name, tc.arguments, result)
-                        result = self._post_process_tool_result(tc.name, tc.arguments, result)
-                        success = result.success
-                        if warning_feedback:
-                            result.output = (
-                                f"Error: {warning_feedback}\n"
-                                f"[Note: This search was executed, but convergence feedback was triggered.]\n\n"
-                                f"[TOOL OUTPUT]\n"
-                                f"{result.output}"
-                            )
-                            result.error = warning_feedback
-                            result.success = False
-                            success = False
+                    result = await tool_task
+                    if hasattr(self.harness, "progress_callback"):
+                        delattr(self.harness, "progress_callback")
+                    result = apply_after_tool_output_limit(tc.name, result)
+                    result = apply_post_tool_context_hook(tc.name, tc.arguments, result)
+                    result = self._post_process_tool_result(tc.name, tc.arguments, result)
+                    success = result.success
                 except asyncio.CancelledError:
                     self._trace_tool_result(tc.name, "Tool task cancelled", success=False)
                     raise
@@ -3089,22 +3326,26 @@ class StateAssembledLoop:
                     )
 
                 result = self._dedupe_result_anchors(result)
+                if tc.name in RETRIEVAL_TOOLS:
+                    retrieval_round_results.append((tc.name, result))
                 display_output = result.output if result.success else f"Error: {result.error}"
                 task_completion = self._apply_context_update(result)
                 self._trace_tool_result(tc.name, display_output, success=result.success)
 
-                # Log sequential tool signals
-                sig_args = ""
-                if tc.name == "decision_edit":
-                    sig_args = f"target_file=\"{tc.arguments.get('target_file', '')}\""
-                elif tc.name == "codebase_retrieve":
-                    sig_args = f"query=\"{tc.arguments.get('query', '')}\""
-                elif tc.name == "view_symbol_code":
-                    sig_args = f"target_file=\"{tc.arguments.get('target_file', '')}\", symbol=\"{tc.arguments.get('symbol', '')}\""
-                else:
-                    sig_args = "..."
-                sig_status = "success" if result.success else "failed"
-                executed_tool_signals.append(f"{tc.name}({sig_args}) -> {sig_status}")
+                norm_args = _prepare_tool_arguments(
+                    tc.name,
+                    dict(tc.arguments),
+                    hint_text=self._task_text,
+                )
+                executed_tool_signals.append(
+                    _retrieval_tool_signal(tc, result, arguments=norm_args)
+                )
+                round_grep_error, round_suggested_views = _observe_grep_round(
+                    tc.name,
+                    result,
+                    round_grep_error=round_grep_error,
+                    round_suggested_views=round_suggested_views,
+                )
 
                 if not result.success:
                     if not first_error_to_structure:
@@ -3115,37 +3356,6 @@ class StateAssembledLoop:
                         merged_cache = dict(self.state.search_cache)
                         if "search_output" in result.metadata:
                             new_output = result.metadata["search_output"]
-                            retrieval_query = str(tc.arguments.get("query", ""))
-                            repeated_msg = _repeated_retrieval_message(
-                                retrieval_query,
-                                self._retrieval_history,
-                                new_output,
-                                step=self.state.run_state.step,
-                            )
-                            if repeated_msg:
-                                result = ToolResult(
-                                    success=True,
-                                    output=repeated_msg,
-                                    metadata={
-                                        "llm_observation": repeated_msg,
-                                        "retrieval_repeated": True,
-                                    },
-                                )
-                                display_output = repeated_msg
-                                self._trace_tool_result(tc.name, display_output, success=True)
-                                self.state = replace(
-                                    self.state,
-                                    messages_history=self.state.messages_history + (
-                                        tool_message(tc.id, _tool_history_receipt(tc, result)),
-                                    ),
-                                )
-                                yield tool_result_event(tc.name, display_output, success=True)
-                                continue
-                            snapshot = _retrieval_snapshot_from_output(
-                                retrieval_query,
-                                new_output,
-                                step=self.state.run_state.step,
-                            )
                             existing_output = merged_cache.get("search_output")
                             if existing_output:
                                 try:
@@ -3165,10 +3375,6 @@ class StateAssembledLoop:
                                     last_updated_step=self.state.run_state.step,
                                 ),
                             )
-                            self._retrieval_history = _append_retrieval_history(
-                                self._retrieval_history,
-                                snapshot,
-                            )
                         if "edit_context" in result.metadata:
                             merged_cache["edit_context"] = result.metadata["edit_context"]
                         if "snippets" in result.metadata:
@@ -3180,18 +3386,24 @@ class StateAssembledLoop:
                             merged_cache["symbol_projections"] = existing_projections[-8:]
                         
                         raw_store = result.metadata.get("raw_evidence_store")
+                        refresh_store = result.metadata.get("refresh_evidence_store")
                         if raw_store:
                             self._ingest_code_artifacts(tc, raw_store)
+                        if raw_store or refresh_store:
                             current_raw = list(merged_cache.get("raw_evidence_store") or [])
-                            for item in raw_store:
-                                # Prune any existing cached evidence matching the same file and overlapping span
-                                current_raw = [
-                                    existing for existing in current_raw
-                                    if not (existing.get("file") == item.get("file") and
-                                            _span_overlap_ratio(existing, item) > 0.90)
-                                ]
-                                current_raw.append(item)
-                            merged_cache["raw_evidence_store"] = current_raw
+                            merged_cache["raw_evidence_store"] = _touch_raw_evidence_lru(
+                                current_raw,
+                                [
+                                    *(
+                                        item for item in (refresh_store or [])
+                                        if isinstance(item, dict)
+                                    ),
+                                    *(
+                                        item for item in (raw_store or [])
+                                        if isinstance(item, dict)
+                                    ),
+                                ],
+                            )
 
                         self.state = replace(self.state, search_cache=merged_cache)
 
@@ -3212,8 +3424,14 @@ class StateAssembledLoop:
                             file=str(target),
                         ))
                         self._dispatch_run_event(RunEvent("validation_finished"))
+                        self._ingest_post_edit_observations(tc, str(target))
                         import difflib
                         diff_text = ""
+                        # Default: treat a validated edit as a real change. Only a
+                        # positively-detected empty diff (the LLM abusing edit as a
+                        # pseudo-viewer) is excluded so rounds_since_last_edit can
+                        # advance and reopen real verification tools next round.
+                        edit_produced_change = True
                         exec_res = result.metadata.get("execution") if result.metadata else None
                         if exec_res:
                             orig = getattr(exec_res, "original_content", "") or (exec_res.get("original_content", "") if isinstance(exec_res, dict) else "")
@@ -3229,6 +3447,9 @@ class StateAssembledLoop:
                                 ))
                                 if diff_lines:
                                     diff_text = "\n\nApplied Diff:\n```diff\n" + "".join(diff_lines) + "\n```"
+                                else:
+                                    edit_produced_change = False
+                        edit_applied_this_round = edit_applied_this_round or edit_produced_change
 
                         diff_suffix = f"\n\n{diff_text}" if diff_text else ""
                         if task_completion:
@@ -3306,6 +3527,14 @@ class StateAssembledLoop:
             "tool_round_observed",
             reason=last_tool_result or "",
             issues=((str(first_error_to_structure),) if first_error_to_structure else ()),
+            retrieval_attempted=any(
+                signal.startswith(("grep_search(", "view_symbol_code(", "codebase_retrieve("))
+                for signal in executed_tool_signals
+            ),
+            view_all_duplicate=view_round_all_duplicate(retrieval_round_results),
+            grep_error=round_grep_error,
+            grep_suggested_views=tuple(round_suggested_views),
+            edit_applied_this_round=edit_applied_this_round,
         ))
 
     def _merge_raw_evidence(self, project_root: Path, raw_evidence_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3680,7 +3909,49 @@ class StateAssembledLoop:
         )
 
     @staticmethod
+    def _trace_manifest(
+        manifest: Any,
+        *,
+        allowed_tools: frozenset[str],
+        retrieval_no_gain_rounds: int = 0,
+    ) -> None:
+        """Print the projected manifest that governs this step's tool access."""
+        metrics = manifest_metrics(manifest)
+        snapshot = {
+            "step": getattr(manifest, "updated_at_step", None),
+            "step_id": getattr(manifest, "step_id", ""),
+            "step_kind": getattr(manifest, "step_kind", ""),
+            "sufficiency": getattr(manifest, "sufficiency", "INSUFFICIENT"),
+            "required_coverage": round(metrics.coverage, 3),
+            "missing_ratio": round(metrics.missing_ratio, 3),
+            "stale_ratio": round(metrics.stale_ratio, 3),
+            "retrieval_no_gain_rounds": retrieval_no_gain_rounds,
+            "items": [
+                {
+                    "id": getattr(item, "id", ""),
+                    "need": getattr(item, "need", ""),
+                    "type": getattr(item, "type", ""),
+                    "role": getattr(item, "role", "required"),
+                    "status": getattr(item, "status", "MISSING"),
+                    "file": getattr(item, "file", None),
+                    "span": getattr(item, "span", None),
+                    "symbol": getattr(item, "symbol", None),
+                    "stale_reason": getattr(item, "stale_reason", None),
+                }
+                for item in getattr(manifest, "required_items", ())
+            ],
+            "allowed_tools": sorted(allowed_tools),
+        }
+        print(
+            "[debug][manifest][projection-json]\n"
+            + json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
+            flush=True,
+        )
+
+    @staticmethod
     def _trace_tool_result(name: str, output: str, *, success: bool) -> None:
+        if name in {"grep_search", "view_symbol_code"}:
+            return
         state = "ok" if success else "error"
         print(
             f"[debug][action-layer][tool-result][{state}] {name}:\n{output}",

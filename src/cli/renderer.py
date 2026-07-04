@@ -306,7 +306,14 @@ def _format_compact_tool_call(name: str, params: dict[str, Any]) -> str:
             return ", ".join(shown) + suffix
         return "?"
     if name == "grep_search":
-        pattern = params.get("pattern", "?")
+        patterns = params.get("patterns")
+        if isinstance(patterns, list) and patterns:
+            preview = ", ".join(repr(str(item)) for item in patterns[:3])
+            if len(patterns) > 3:
+                preview += ", ..."
+            include = params.get("include") or params.get("path") or "*"
+            return f"[{preview}] in {include}"
+        pattern = params.get("pattern") or "?"
         include = params.get("include") or params.get("path") or "*"
         return f'"{pattern}" in {include}'
     if name == "map_search":

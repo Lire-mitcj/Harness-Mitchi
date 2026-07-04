@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,68 @@ from src.agent.types import Message
 from src.context.prompt_resources import load_internal_prompt
 
 log = logging.getLogger(__name__)
+
+
+def build_runtime_state_block(
+    *,
+    active_files: list[str],
+    checklist_str: str,
+    git_diff: str,
+    validation_error: str | None,
+    last_tool_result: str | None,
+    last_error: dict[str, Any] | None,
+) -> str:
+    """Volatile per-turn state injected near the top of the user message."""
+    git_diff_str = (
+        f"```text\n{git_diff}\n```" if git_diff else "Clean working tree."
+    )
+    build_errors_str = (
+        f"```\n{validation_error}\n```"
+        if validation_error
+        else "No compile or build errors."
+    )
+    last_error_str = json.dumps(last_error, ensure_ascii=False) if last_error else "None"
+    return "\n".join([
+        "### RUNTIME STATE (this turn)",
+        f"- Active files: {', '.join(active_files) or 'none'}",
+        "- Git working-tree state:",
+        git_diff_str,
+        "- Latest compile/build/test errors:",
+        build_errors_str,
+        f"- Last tool execution: {last_tool_result or 'No tools executed yet.'}",
+        f"- Last structured error: {last_error_str}",
+        "- Preserved execution checklist:",
+        checklist_str,
+    ])
+
+
+def build_loaded_code_anchor_block(context_block: str) -> str:
+    context = context_block.strip()
+    if not context:
+        context = "No loaded code anchors in the current prompt."
+    return (
+        "### LOADED CODE ANCHORS (verified; reuse, do not reload) ###\n"
+        "These are the grounded code/schema snippets available for the next action. "
+        "Use them directly; a file listed elsewhere is only a locator unless it appears here "
+        "or in STEP EVIDENCE as loaded.\n\n"
+        f"{context}"
+    )
+
+
+def build_turn_context_block(
+    *,
+    loaded_anchors: str,
+    execution_card_text: str,
+) -> str:
+    """Assemble per-turn context with recency-weighted ordering for the Core LLM."""
+    blocks: list[str] = []
+    if loaded_anchors.strip():
+        blocks.append(build_loaded_code_anchor_block(loaded_anchors))
+    if execution_card_text.strip():
+        blocks.append(execution_card_text)
+    if not blocks:
+        return ""
+    return "\n\n" + "\n\n".join(blocks)
 
 
 class ContextAssembly:
@@ -107,74 +170,34 @@ class ContextAssembly:
         rules_block = f"\n\n### PROJECT RULES & USER CONTEXT ###\n{rules_text}\n" if rules_text else ""
 
         checklist_str = "\n".join(f"- {item}" for item in checklist) or "- No checklist items"
-        context_block = self.build_context_block(active_files, search_cache=search_cache, modified_files=modified_files)
-
-        # Check if new placeholders exist in system prompt
-        has_new_slots = (
-            "{{STATE.ACTIVE_FILES_LIST}}" in system_base or
-            "{{STATE.CHECKLIST}}" in system_base or
-            "{{STATE.GIT_DIFFS}}" in system_base or
-            "{{STATE.BUILD_ERRORS}}" in system_base or
-            "{{STATE.ACTIVE_FILES_BLOCKS}}" in system_base or
-            "{{STATE.LAST_TOOL_RESULT}}" in system_base or
-            "{{STATE.LAST_ERROR}}" in system_base
+        context_block = self.build_context_block(
+            active_files,
+            search_cache=search_cache,
+            modified_files=modified_files,
         )
 
-        if has_new_slots:
-            active_files_list_str = ", ".join(active_files)
-            git_diff_str = (
-                f"```text\n{git_diff}\n```" if git_diff else "Clean working tree."
-            )
-            build_errors_str = f"```\n{validation_error}\n```" if validation_error else "No compile or build errors."
-            active_files_blocks_str = context_block or "No active files in context yet."
-            last_tool_result_str = last_tool_result or "No tools executed yet."
-            import json
-            last_error_str = json.dumps(last_error, ensure_ascii=False) if last_error else "None"
+        runtime_state_block = build_runtime_state_block(
+            active_files=active_files,
+            checklist_str=checklist_str,
+            git_diff=git_diff,
+            validation_error=validation_error,
+            last_tool_result=last_tool_result,
+            last_error=last_error,
+        )
 
-            substituted = system_base
-            substituted = substituted.replace("{{STATE.ACTIVE_FILES_LIST}}", active_files_list_str)
-            substituted = substituted.replace("{{STATE.CHECKLIST}}", checklist_str)
-            substituted = substituted.replace("{{STATE.GIT_DIFFS}}", git_diff_str)
-            substituted = substituted.replace("{{STATE.BUILD_ERRORS}}", build_errors_str)
-            substituted = substituted.replace("{{STATE.ACTIVE_FILES_BLOCKS}}", active_files_blocks_str)
-            substituted = substituted.replace("{{STATE.LAST_TOOL_RESULT}}", last_tool_result_str)
-            substituted = substituted.replace("{{STATE.LAST_ERROR}}", last_error_str)
-
-            system_content = substituted
-            user_instruction_block = f"{rules_block}\nOriginal Request: {user_query}" if rules_block else f"Original Request: {user_query}"
-        else:
-            # Fallback format if template doesn't contain placeholders
-            system_content = system_base
-
-            state_parts = [
-                "### CURRENT STATE ###",
-                f"Active Checklist:\n{checklist_str}",
-            ]
-            if last_tool_result:
-                state_parts.append(f"Last Tool Result: {last_tool_result}")
-            if last_error:
-                import json
-                state_parts.append(f"Last Error (Structured):\n```json\n{json.dumps(last_error, ensure_ascii=False, indent=2)}\n```")
-            if git_diff:
-                state_parts.append(f"Git Working Tree State:\n```text\n{git_diff}\n```")
-            if validation_error:
-                state_parts.append(f"Validation/Compiler Failures:\n```\n{validation_error}\n```")
-
-            state_text = "\n\n".join(state_parts)
-            context_text = f"### CURRENT CONTEXT ###\n\n{context_block}" if context_block else "### CURRENT CONTEXT ###\n\nNo active files in context yet."
-
-            user_instruction_block = (
-                f"{state_text}\n\n"
-            )
-            if rules_block:
-                user_instruction_block += f"{rules_block}\n"
-            user_instruction_block += (
-                f"{context_text}\n\n"
-                f"Original Request: {user_query}"
-            )
+        context_text = (
+            f"\n\n{build_loaded_code_anchor_block(context_block)}"
+            if context_block.strip()
+            else ""
+        )
+        user_instruction_block = (
+            f"Original Request: {user_query}"
+            f"{rules_block}\n\n{runtime_state_block}"
+            f"{context_text}"
+        )
 
         formatted_messages = []
-        formatted_messages.append({"role": "system", "content": system_content})
+        formatted_messages.append({"role": "system", "content": system_base})
 
         for msg in messages_history:
             formatted_messages.append(msg.to_dict())

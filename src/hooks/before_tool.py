@@ -4,8 +4,11 @@ import logging
 from collections.abc import Mapping, Set
 from typing import Any
 
-from src.hooks.preflight.static_constraints import inspect_static_constraints
+from pathlib import Path
+
+from src.hooks.preflight.context_window import inspect_context_window_disk
 from src.hooks.preflight.fact_locking import inspect_fact_locking_async
+from src.hooks.preflight.static_constraints import inspect_static_constraints
 
 log = logging.getLogger(__name__)
 
@@ -15,12 +18,14 @@ def inspect_tool_request(
     arguments: Mapping[str, Any],
     *,
     allowed_tools: Set[str],
+    manifest: Any = None,
 ) -> str | None:
     """Delegates to Layer 1 static constraints validation hook."""
     return inspect_static_constraints(
         tool_name=tool_name,
         arguments=arguments,
         allowed_tools=allowed_tools,
+        manifest=manifest,
     )
 
 
@@ -40,18 +45,32 @@ async def inspect_tool_request_async(
     raw_evidence_store: list[dict[str, Any]] | None = None,
     git_diff: str | None = None,
     modified_files: list[str] | None = None,
+    manifest: Any = None,
+    project_root: Path | None = None,
+    edit_recovery: bool = False,
 ) -> str | None:
-    """Delegates sequentially to Layer 1 (Static Constraints) and Layer 2 (Fact Locking) preflight hooks."""
+    """Run static constraints, then fact-locking preflight hooks."""
     # 1. Layer 1: Static Constraints precheck
     err = inspect_static_constraints(
         tool_name=tool_name,
         arguments=arguments,
         allowed_tools=allowed_tools,
+        manifest=manifest,
     )
     if err:
         return err
 
-    # 2. Layer 2: Dynamic Fact Locking precheck
+    # 1b. Disk-backed context_window validation for decision_edit
+    err = inspect_context_window_disk(
+        tool_name,
+        arguments,
+        project_root=project_root,
+        manifest=manifest,
+    )
+    if err:
+        return err
+
+    # 2. Dynamic Fact Locking: block reads of SATISFIED evidence, allow STALE.
     return await inspect_fact_locking_async(
         tool_name=tool_name,
         arguments=arguments,
@@ -66,4 +85,6 @@ async def inspect_tool_request_async(
         raw_evidence_store=raw_evidence_store,
         git_diff=git_diff,
         modified_files=modified_files,
+        manifest=manifest,
+        edit_recovery=edit_recovery,
     )

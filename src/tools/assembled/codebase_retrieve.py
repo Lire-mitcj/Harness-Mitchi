@@ -46,9 +46,15 @@ MAX_EVIDENCE_ITEMS = 4
 class CodebaseRetrieveTool(Tool):
     name = "codebase_retrieve"
     description = (
-        "Search and retrieve relevant codebase context (files, symbols, code blocks, relation graphs) "
-        "for a given query. This returns structured code snippets and summaries, and automatically "
-        "loads them into CURRENT_CONTEXT for the next turn."
+        "Heavy last-resort semantic retrieval when grep_search cannot locate a target. "
+        "Use only when the file/symbol is still unknown after focused grep—conceptual "
+        "feature names, cross-file dependencies, or error-driven discovery with no "
+        "concrete pattern yet. Returns bounded symbol/file snippets and loads them "
+        "into context for the next turn. Prefer grep_search + view_symbol_code for "
+        "routine work. Do NOT use for exact strings, known file paths, or symbols "
+        "already named by STEP EVIDENCE missing/stale. Do NOT retry the same query "
+        "after an empty or failed result. Never use this tool to inspect files for "
+        "editing—only to gather evidence."
     )
     risk_level = RiskLevel.SAFE
     parameters = {

@@ -8,7 +8,7 @@ from src.agent.decision import CursorDecisionLLM
 from src.agent.executor import CursorExecutor
 from src.agent.patch_applier import CursorPatchApplier
 from src.agent.types import ToolResult
-from src.agent.validator import CursorValidator, _collect_view_schemas
+from src.agent.validator import CursorValidator, _collect_view_schemas, _sql_alias_safety
 from src.harness.cursor.manager import CursorStateManager
 from src.hooks.post_tool_context import apply_post_tool_context_hook
 
@@ -170,3 +170,78 @@ def test_validator_schema_error_reports_missing_fields(tmp_path: Path) -> None:
 
     assert result["issues"] == ["SELECT_FIELD_NOT_IN_VIEW"]
     assert result["missing_fields"] == ["missing_name"]
+
+
+def test_sql_alias_safety_accepts_mysql_trigger_pseudo_rows() -> None:
+    sql = """
+    CREATE TRIGGER tg_order_timeline
+    AFTER UPDATE ON ticket_order
+    FOR EACH ROW
+    BEGIN
+        IF NEW.status <> OLD.status THEN
+            INSERT INTO order_timeline (order_id, status)
+            VALUES (NEW.order_id, NEW.status);
+        END IF;
+    END;
+    """
+
+    result = _sql_alias_safety(sql)
+
+    assert result["pass"] is True
+    assert result["trigger_pseudo_aliases"] == ["new", "old"]
+    assert result["dead_aliases"] == []
+
+
+def test_sql_alias_safety_does_not_allow_pseudo_rows_outside_trigger() -> None:
+    result = _sql_alias_safety("SELECT NEW.status FROM ticket_order")
+
+    assert result["pass"] is False
+    assert result["trigger_pseudo_aliases"] == []
+    assert result["dead_aliases"] == ["new"]
+
+
+def test_sql_alias_safety_keeps_rejecting_real_dead_alias_inside_trigger() -> None:
+    sql = """
+    CREATE TRIGGER tg_order_timeline
+    AFTER UPDATE ON ticket_order
+    FOR EACH ROW
+    BEGIN
+        INSERT INTO order_timeline (order_id, status)
+        VALUES (missing_alias.order_id, NEW.status);
+    END;
+    """
+
+    result = _sql_alias_safety(sql)
+
+    assert result["pass"] is False
+    assert result["dead_aliases"] == ["missing_alias"]
+
+
+def test_validator_schema_accepts_order_timeline_trigger(tmp_path: Path) -> None:
+    sql = """
+    CREATE TABLE IF NOT EXISTS order_timeline (
+        timeline_id INT AUTO_INCREMENT PRIMARY KEY,
+        order_id INT NOT NULL,
+        status VARCHAR(20) NOT NULL
+    );
+    CREATE TRIGGER tg_order_timeline
+    AFTER UPDATE ON ticket_order
+    FOR EACH ROW
+    BEGIN
+        IF NEW.status <> OLD.status THEN
+            INSERT INTO order_timeline (order_id, status)
+            VALUES (NEW.order_id, NEW.status);
+        END IF;
+    END;
+    """
+    validator = CursorValidator(tmp_path)
+
+    result = validator.validate_schema(
+        target_file="db/init/init.sql",
+        patch=sql,
+        original_content="",
+        patched_content=sql,
+    )
+
+    assert result["pass"] is True
+    assert "DEAD_SQL_ALIAS" not in result["issues"]

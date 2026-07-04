@@ -8,8 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.agent.context_assembly import ContextAssembly
+from src.agent.context_assembly import ContextAssembly, build_turn_context_block
 from src.agent.events import EventType
+from src.agent.manifest import EvidenceItem, StepManifest, Sufficiency
 from src.agent.state_assembled_loop import (
     ASSEMBLED_TOOL_NAMES,
     AssembledState,
@@ -18,14 +19,15 @@ from src.agent.state_assembled_loop import (
     SystemLayerShaper,
     StateAssembledLoop,
     _latest_symbol_slice_projection,
+    _build_deduped_loaded_anchors_block,
     _collapse_retrieval_turn,
     _get_git_state,
     _dedupe_code_anchors,
     _anchor_key,
     _anchor_memory_kind,
     _enrich_anchor_contract,
+    _fact_lock_replay_result,
     _microcompact_retrieval_payload,
-    _repeated_retrieval_message,
     _retrieval_snapshot_from_output,
     _search_cache_for_context,
     _search_cache_view,
@@ -48,6 +50,42 @@ from src.harness.gates.phase_metrics import PhaseMetrics
 from src.hooks.post_tool_context import apply_post_tool_context_hook
 from src.tools.assembled.codebase_retrieve import CodebaseRetrieveTool
 from src.tools.assembled.decision_edit import DecisionEditTool
+
+
+def test_trace_manifest_prints_projected_state_and_allowed_tools(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manifest = StepManifest(
+        step_id="task.default",
+        step_kind="edit",
+        updated_at_step=3,
+        sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        required_items=(
+            EvidenceItem(
+                id="target_implementation",
+                need="目标实现代码已加载",
+                status="STALE",
+                file="src/example.py",
+                span=(10, 20),
+                symbol="target",
+                stale_reason="file modified by decision_edit",
+            ),
+        ),
+    )
+
+    StateAssembledLoop._trace_manifest(
+        manifest,
+        allowed_tools=frozenset({"decision_edit", "view_symbol_code"}),
+    )
+
+    output = capsys.readouterr().out
+    assert output.startswith("[debug][manifest][projection-json]\n")
+    snapshot = json.loads(output.split("\n", 1)[1])
+    assert snapshot["step"] == 3
+    assert snapshot["sufficiency"] == "SUFFICIENT_FOR_EDIT"
+    assert snapshot["items"][0]["status"] == "STALE"
+    assert snapshot["items"][0]["span"] == [10, 20]
+    assert snapshot["allowed_tools"] == ["decision_edit", "view_symbol_code"]
 
 
 @pytest.fixture
@@ -104,11 +142,12 @@ def test_context_assembly(temp_project: Path) -> None:
     
     assert "central commander and orchestrator" in system_msg["content"]
     assert "Follow project rules." in user_msg["content"]
-    assert "step 1" in system_msg["content"]
-    assert "target.py" in system_msg["content"]
+    assert "step 1" in user_msg["content"]
+    assert "target.py" in user_msg["content"]
     assert "def run():" not in user_msg["content"]
-    assert "dummy diff" in system_msg["content"]
-    assert "dummy error" in system_msg["content"]
+    assert "dummy diff" in user_msg["content"]
+    assert "dummy error" in user_msg["content"]
+    assert "RUNTIME STATE (this turn)" in user_msg["content"]
 
 
 @pytest.mark.asyncio
@@ -132,19 +171,14 @@ def test_context_assembly_with_search_cache(temp_project: Path) -> None:
             "<projected_retrieval file=\"target.py\">def mock_find(): pass</projected_retrieval>"
         ),
     }
-    messages = assembly.assemble(
-        user_query="implement feature X",
-        active_files=["target.py"],
-        checklist=["[ ] step 1"],
-        git_diff="",
-        validation_error=None,
-        messages_history=[],
+    tool_context = assembly.build_context_block(
+        ["target.py"],
         search_cache=search_cache,
+        modified_files=[],
     )
-    system_msg = next(m for m in messages if m["role"] == "system")
-    assert "RETRIEVAL CODE ANCHOR (current turn only)" in system_msg["content"]
-    assert "mock_find" in system_msg["content"]
-    assert "hidden_artifact" not in system_msg["content"]
+    assert "RETRIEVAL CODE ANCHOR (current turn only)" in tool_context
+    assert "mock_find" in tool_context
+    assert "hidden_artifact" not in tool_context
 
 
 def test_read_summaries_belong_to_user_context_not_tool_context(temp_project: Path) -> None:
@@ -224,9 +258,25 @@ def test_retrieval_tool_history_stores_receipt_not_verbatim_code() -> None:
 
     receipt = _tool_history_receipt(call, result)
 
-    assert "[CODE ANCHOR STORED]" in receipt
-    assert "main.py" in receipt
-    assert "SECRET_SOURCE" not in receipt
+    assert "[RETRIEVAL OK — NEW EVIDENCE STORED]" in receipt
+
+
+def test_fact_lock_replay_becomes_no_new_evidence() -> None:
+    call = ToolCall(
+        id="read-again",
+        name="view_symbol_code",
+        arguments={"target_file": "main.py", "symbol": "app"},
+    )
+    result = _fact_lock_replay_result(
+        call,
+        json.dumps({"file": "main.py", "span": [41, 41]}),
+        {},
+        ("endpoint_implementation",),
+    )
+
+    assert result.success is True
+    assert result.metadata["is_mock_success"] is True
+    assert result.output == json.dumps({"file": "main.py", "span": [41, 41]})
 
 
 def test_conversation_compaction_is_role_aware_and_excludes_tool_bodies() -> None:
@@ -355,15 +405,16 @@ def test_duplicate_anchor_replays_existing_facts(temp_project: Path) -> None:
     assert "EXISTING FACTS REPLAYED" in result.output
     assert "decode_access_token" in result.output
     assert "user_account" in result.output
-    assert "SYMBOL COMPLETENESS = TRUE" in result.output
-    assert "FULL SOURCE LOADED" in result.output
+    assert "EXACT SYMBOL SLICE COMPLETE" in result.output
+    assert "SOURCE COVERAGE:" in result.output
+    assert "FULL SOURCE LOADED" not in result.output
     assert "sub" in result.output
     receipt = _tool_history_receipt(
         ToolCall(id="dup", name="view_symbol_code", arguments={}),
         result,
     )
-    assert receipt == result.output
-    assert "duplicate code anchor omitted" not in receipt
+    assert "[RETRIEVAL DUPLICATE — NO NEW EVIDENCE]" in receipt
+    assert "EXISTING FACTS REPLAYED" in receipt
 
 
 def test_ready_summary_prunes_contained_code_and_dedupes_imports() -> None:
@@ -936,7 +987,10 @@ async def test_state_assembled_loop_success(temp_project: Path) -> None:
             tool_calls=[ToolCall(
                 id="inspect-1",
                 name="view_symbol_code",
-                arguments={"target_file": "target.py", "symbol": "run"},
+                arguments={
+                    "target_file": "target.py",
+                    "symbol": "run",
+                },
             )],
             usage=None,
             model="coord-model",
@@ -1007,6 +1061,10 @@ async def test_state_assembled_loop_success(temp_project: Path) -> None:
     assert recorded["messages"][0]["role"] == "system"
     assert recorded["messages"][-1]["role"] == "user"
     assert "do something" in recorded["messages"][-1]["content"]
+    second_user_context = loop.state.core_context_history[1]["messages"][-1]["content"]
+    assert "EXACT COVERAGE LOADED" not in second_user_context
+    assert "FULL SOURCE LOADED" not in second_user_context
+    assert "Database Schema:" not in second_user_context
     assert response_index == 2
 
 
@@ -1025,7 +1083,10 @@ async def test_malformed_text_tool_call_retries_instead_of_finalizing(
             tool_calls=[ToolCall(
                 id="inspect-1",
                 name="view_symbol_code",
-                arguments={"target_file": "target.py", "symbol": "run"},
+                arguments={
+                    "target_file": "target.py",
+                    "symbol": "run",
+                },
             )],
             usage=None,
             model="coord-model",
@@ -1103,7 +1164,10 @@ async def test_responding_phase_never_executes_repeated_retrieval_calls(
             tool_calls=[ToolCall(
                 id="inspect-1",
                 name="view_symbol_code",
-                arguments={"target_file": "target.py", "symbol": "run"},
+                arguments={
+                    "target_file": "target.py",
+                    "symbol": "run",
+                },
             )],
             usage=None,
             model="coord-model",
@@ -1266,14 +1330,25 @@ async def test_state_assembled_loop_tool_execution(temp_project: Path) -> None:
     
     response = LLMResponse(
         content=None,
-        tool_calls=[ToolCall(id="retrieve-1", name="codebase_retrieve", arguments={"query": "find run"})],
+        tool_calls=[ToolCall(
+            id="retrieve-1",
+            name="codebase_retrieve",
+            arguments={
+                "query": "find run",
+            },
+        )],
         usage=None,
         model="coord-model",
     )
     
     events = [event async for event in loop._process_tool_calls(response)]
     
-    tools.call.assert_awaited_once_with("codebase_retrieve", {"query": "find run"})
+    tools.call.assert_awaited_once_with(
+        "codebase_retrieve",
+        {
+            "query": "find run",
+        },
+    )
     
     # Check that a status event was yielded for the tool
     status_events = [e for e in events if e.type == EventType.STATUS]
@@ -1513,7 +1588,8 @@ async def test_last_tool_result_and_last_error(temp_project: Path) -> None:
     events = [event async for event in loop._process_tool_calls(response)]
     
     assert loop._last_tool_result() is not None
-    assert "decision_edit(target_file=\"target.py\") -> failed" in loop._last_tool_result()
+    assert "decision_edit(target.py: modify) -> failed" in loop._last_tool_result()
+    assert "DEAD_SQL_ALIAS" in loop._last_tool_result()
     assert loop._last_error() is not None
     assert loop._last_error()["error_type"] == "SchemaValidationError"
     assert loop._last_error()["file"] == "target.py"
@@ -1522,7 +1598,7 @@ async def test_last_tool_result_and_last_error(temp_project: Path) -> None:
     events = [event async for event in loop._process_tool_calls(response)]
     
     assert loop._last_tool_result() is not None
-    assert "decision_edit(target_file=\"target.py\") -> success" in loop._last_tool_result()
+    assert "decision_edit(target.py: modify) -> success" in loop._last_tool_result()
     assert loop._last_error() is None
 
 
@@ -1987,17 +2063,6 @@ def test_retrieval_policy_blocks_repeated_signature() -> None:
 
 
 
-    repeated = _repeated_retrieval_message(
-        "list.py archive_passenger authentication",
-        (snapshot,),
-        search_output,
-        step=2,
-    )
-    assert repeated is not None
-    assert "repeated retrieval" in repeated
-    assert "view_symbol_code" in repeated
-
-
 def test_latest_symbol_slice_projection_uses_recent_two() -> None:
     cache = {
         "symbol_projections": [
@@ -2029,6 +2094,65 @@ def test_latest_symbol_slice_projection_uses_recent_two() -> None:
     assert '<symbol_slice file="b.py" symbol="mid" span="2-3">' in block
     assert '<symbol_slice file="c.py" symbol="new" span="4-5" truncated="true">' in block
     assert "4| def new():" in block
+
+
+def test_build_deduped_loaded_anchors_block_prefers_symbol_slice_over_raw() -> None:
+    cache = {
+        "symbol_projections": [
+            {
+                "file": "svc.py",
+                "symbol": "handler",
+                "span": [1, 3],
+                "projection_code": "1| def handler():\n2|   pass",
+            },
+        ],
+        "raw_evidence_store": [
+            {
+                "file": "svc.py",
+                "symbol": "handler",
+                "span": [1, 3],
+                "code": "def handler():\n    pass",
+            },
+        ],
+    }
+
+    block = _build_deduped_loaded_anchors_block(cache)
+
+    assert block.count("def handler():") == 1
+    assert "<symbol_slice" in block
+
+
+def test_build_deduped_loaded_anchors_block_dedupes_raw_only() -> None:
+    cache = {
+        "raw_evidence_store": [
+            {
+                "file": "a.py",
+                "symbol": "foo",
+                "span": [1, 2],
+                "code": "def foo(): pass",
+            },
+            {
+                "file": "a.py",
+                "symbol": "foo",
+                "span": [1, 2],
+                "code": "def foo(): pass",
+            },
+        ],
+    }
+
+    block = _build_deduped_loaded_anchors_block(cache)
+
+    assert block.count("def foo():") == 1
+
+
+def test_turn_context_block_puts_execution_card_last() -> None:
+    block = build_turn_context_block(
+        loaded_anchors="def handler(): pass",
+        execution_card_text="### STEP EVIDENCE (current step)\ntools_available: grep_search",
+    )
+
+    assert block.index("LOADED CODE ANCHORS") < block.index("### STEP EVIDENCE (current step)")
+    assert block.rstrip().endswith("tools_available: grep_search")
 
 @pytest.mark.asyncio
 async def test_view_symbol_code_tool(temp_project: Path) -> None:
@@ -2190,11 +2314,10 @@ async def test_view_symbol_code_tool(temp_project: Path) -> None:
     assert "CREATE TRIGGER `tg_release_seat`" in trigger.metadata["verbatim_code"]
     assert trigger.metadata["verbatim_code"].endswith("END$$")
 
-    # Test case 9: File-level fallback if symbol matches filename or is a wildcard
+    # Test case 9: Wildcard loads whole file; filename-as-symbol is rejected
     res10 = await tool.execute(target_file="init.sql", symbol="init.sql")
-    assert res10.success is True
-    assert res10.metadata["span"] == [1, 4]
-    assert "CREATE TABLE my_table" in res10.metadata["verbatim_code"]
+    assert res10.success is False
+    assert "filename" in (res10.error or "").lower()
 
     res11 = await tool.execute(target_file="init.sql", symbol="*")
     assert res11.success is True

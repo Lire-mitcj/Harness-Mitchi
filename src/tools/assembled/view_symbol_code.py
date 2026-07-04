@@ -197,9 +197,12 @@ def _find_symbol_definitions(
 class ViewSymbolCodeTool(Tool):
     name = "view_symbol_code"
     description = (
-        "Retrieve the verbatim source code slice of a specific symbol "
-        "(class/function) from a file. "
-        "First queries the Layer 1 cache, then falls back to local file parsing."
+        "Primary load tool: fetch the verbatim source slice of one known symbol "
+        "(function/class) or an identified DDL block from a specific file. Use after "
+        "grep_search or STEP EVIDENCE names a concrete file+symbol that is missing or "
+        "stale. Provides durable code anchors for reasoning and edit context_window "
+        "spans. Do NOT use for fuzzy discovery or whole-file overview. Do NOT re-fetch "
+        "symbols already listed under loaded in STEP EVIDENCE or LOADED CODE ANCHORS."
     )
     risk_level = RiskLevel.SAFE
     parameters = {
@@ -263,8 +266,19 @@ class ViewSymbolCodeTool(Tool):
         # 3. Locate the symbol span
         span = None
         basename = Path(target_file).name
-        if symbol == basename or symbol.lower() in ("*", "all", "file", target_file):
+        stem = Path(target_file).stem
+        if symbol.lower() in ("*", "all", "file"):
             span = (1, len(content.splitlines()))
+        elif symbol == basename or symbol == stem:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Symbol '{symbol}' is the filename, not a code symbol. "
+                    "Use grep_search to locate a CREATE TABLE / def / @router target, "
+                    "then view_symbol_code with that concrete symbol name."
+                ),
+            )
 
         if not span and target_file.endswith(".py"):
             span = _find_symbol_span_in_python_file(content, symbol)

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from src.tools.arg_normalize import normalize_grep_search_args
+
+from src.tools.arg_normalize import normalize_grep_search_args, normalize_shell_exec_args
 
 
 class MockSubtask:
@@ -14,14 +15,30 @@ class MockSubtask:
 def test_normalize_grep_fills_pattern_from_subtask() -> None:
     subtask = MockSubtask()
     args = normalize_grep_search_args({"path": "main.py"}, subtask=subtask)
-    assert "pattern" in args
-    assert "register" in args["pattern"]
+    assert "pattern" in args or "patterns" in args
+    joined = " ".join(args.get("patterns") or [args.get("pattern", "")]).casefold()
+    assert "register" in joined
     assert args["path"] == "main.py"
 
 
-def test_normalize_shell_replaces_missing_workspace(tmp_path: Path) -> None:
-    from src.tools.arg_normalize import normalize_shell_exec_args
+def test_normalize_grep_fills_patterns_from_hint_text() -> None:
+    args = normalize_grep_search_args(
+        {"include": "*.sql"},
+        hint_text="Add order_timeline table and customer service API endpoint",
+    )
+    assert "patterns" in args or "pattern" in args
+    joined = " ".join(args.get("patterns") or [args.get("pattern", "")]).casefold()
+    assert "create table" in joined
+    assert "order_timeline" in joined or "timeline" in joined
 
+
+def test_normalize_grep_leaves_empty_without_hint_or_subtask() -> None:
+    args = normalize_grep_search_args({"include": "*.py"})
+    assert "pattern" not in args
+    assert "patterns" not in args
+
+
+def test_normalize_shell_replaces_missing_workspace(tmp_path: Path) -> None:
     args = normalize_shell_exec_args(
         {"command": "pytest test_api.py -q", "working_dir": "/workspace"},
         project_root=tmp_path,
@@ -30,8 +47,6 @@ def test_normalize_shell_replaces_missing_workspace(tmp_path: Path) -> None:
 
 
 def test_normalize_shell_defaults_cwd(tmp_path: Path) -> None:
-    from src.tools.arg_normalize import normalize_shell_exec_args
-
     args = normalize_shell_exec_args(
         {"command": "pytest -q"},
         project_root=tmp_path,

@@ -779,13 +779,30 @@ def _sql_alias_safety(content: str) -> dict[str, object]:
     }
     used_aliases -= table_names
     used_aliases -= _SQL_RESERVED_ALIASES
+    trigger_pseudo_aliases = (
+        {"new", "old"}
+        if re.search(
+            r"\bCREATE\s+(?:OR\s+REPLACE\s+)?"
+            r"(?:DEFINER\s*=\s*\S+\s+)?TRIGGER\b",
+            content,
+            re.IGNORECASE,
+        )
+        else set()
+    )
     if not used_aliases:
-        return {"checked": False, "pass": True, "aliases": sorted(aliases), "dead_aliases": []}
-    dead_aliases = sorted(used_aliases - aliases)
+        return {
+            "checked": False,
+            "pass": True,
+            "aliases": sorted(aliases),
+            "trigger_pseudo_aliases": sorted(trigger_pseudo_aliases),
+            "dead_aliases": [],
+        }
+    dead_aliases = sorted(used_aliases - aliases - trigger_pseudo_aliases)
     return {
         "checked": True,
         "pass": not dead_aliases,
         "aliases": sorted(aliases),
+        "trigger_pseudo_aliases": sorted(trigger_pseudo_aliases),
         "used_aliases": sorted(used_aliases),
         "dead_aliases": dead_aliases,
     }

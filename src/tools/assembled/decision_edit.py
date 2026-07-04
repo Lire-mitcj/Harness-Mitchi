@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -9,8 +12,8 @@ from src.agent.contracts import ContextPack, ContextWindow
 from src.agent.decision import CursorDecisionLLM
 from src.agent.executor import CursorExecutor
 from src.agent.patch_applier import CursorPatchApplier
-from src.agent.validator import CursorValidator
 from src.agent.types import RiskLevel, ToolResult
+from src.agent.validator import CursorValidator
 from src.llm.client import LLMClient
 from src.tools.base import Tool
 
@@ -20,8 +23,13 @@ log = logging.getLogger(__name__)
 class DecisionEditTool(Tool):
     name = "decision_edit"
     description = (
-        "Generate and apply a SEARCH/REPLACE patch to a file using the Decision LLM. "
-        "Automatically runs linter, tests, and syntax validation. Rolls back if validation fails."
+        "Apply a scoped edit to exactly one file when STEP EVIDENCE shows edit_ready:yes "
+        "and the change is grounded in loaded code anchors. Generates a SEARCH/REPLACE "
+        "patch via the Decision LLM, then runs lint/tests/syntax checks; rolls back on "
+        "failure. Required: target_file, intent, focus_symbols, and context_window "
+        "entries with frozen file+span evidence from loaded anchors. One call modifies "
+        "one file only—do not batch multi-file changes. Do NOT use to inspect, grep, "
+        "or load code. Do not call in parallel with retrieval reads the patch depends on."
     )
     risk_level = RiskLevel.MODERATE
     parameters = {
@@ -92,6 +100,12 @@ class DecisionEditTool(Tool):
         self.settings = settings
         self.decision_llm = decision_llm
         self.harness = harness
+        configured_timeout = getattr(settings, "cursor_decision_timeout", 90.0)
+        self.decision_timeout = (
+            float(configured_timeout)
+            if isinstance(configured_timeout, (int, float))
+            else 90.0
+        )
 
         self.decision = CursorDecisionLLM(self.decision_llm)
         self.patch_applier = CursorPatchApplier(self.project_root)
@@ -130,6 +144,25 @@ class DecisionEditTool(Tool):
             params = {**params, "context_window": []}
         return super().validate_params(params)
 
+    def _read_file_span(self, file_path: str, start_line: int, end_line: int) -> str | None:
+        abs_path = (self.project_root / file_path).resolve()
+        if not abs_path.is_file():
+            return None
+        try:
+            lines = abs_path.read_text(encoding="utf-8").splitlines()
+            start = max(1, start_line)
+            end = min(len(lines), end_line)
+            return "\n".join(lines[start - 1 : end])
+        except Exception as exc:
+            log.warning(
+                "Failed to read span %s:%d-%d from disk: %s",
+                file_path,
+                start_line,
+                end_line,
+                exc,
+            )
+            return None
+
     def _build_context_pack(
         self,
         target_file: str,
@@ -139,43 +172,44 @@ class DecisionEditTool(Tool):
         windows = []
 
         norm_target = target_file.replace("\\", "/").lstrip("./")
+        target_spans: list[tuple[str, int, int]] = []
+        reference_spans: list[tuple[str, int, int]] = []
 
-        # 1. Check if the target_file itself has a specified span in context_window
-        target_span = None
         if context_window is not None:
             for item in context_window:
                 file_path = item.get("file")
-                if file_path:
-                    norm_file = file_path.replace("\\", "/").lstrip("./")
-                    if norm_file == norm_target:
-                        span = item.get("span")
-                        if span and len(span) == 2:
-                            target_span = (span[0], span[1])
-                            break
-
-        # Read the target file from the disk (load span if specified, otherwise full file)
-        abs_target_path = (self.project_root / target_file).resolve()
-        if abs_target_path.exists():
-            try:
-                lines = abs_target_path.read_text(encoding="utf-8").splitlines()
-                if target_span is not None:
-                    start_line, end_line = target_span
-                    start = max(1, start_line)
-                    end = min(len(lines), end_line)
-                    content = "\n".join(lines[start - 1 : end])
-                    windows.append(
-                        ContextWindow(
-                            file=target_file,
-                            start_line=start,
-                            end_line=end,
-                            content=content,
-                            symbols=(),
-                            semantic_tags=(),
-                            role="target",
-                            mode="snippet",
-                        )
-                    )
+                span = item.get("span")
+                if not file_path or not span or len(span) < 2:
+                    continue
+                norm_file = str(file_path).replace("\\", "/").lstrip("./")
+                entry = (str(file_path), int(span[0]), int(span[1]))
+                if norm_file == norm_target:
+                    target_spans.append(entry)
                 else:
+                    reference_spans.append(entry)
+
+        if target_spans:
+            for index, (file_path, start_line, end_line) in enumerate(target_spans):
+                content = self._read_file_span(file_path, start_line, end_line)
+                if content is None:
+                    continue
+                windows.append(
+                    ContextWindow(
+                        file=file_path,
+                        start_line=start_line,
+                        end_line=end_line,
+                        content=content,
+                        symbols=(),
+                        semantic_tags=(),
+                        role="target" if index == 0 else "reference",
+                        mode="snippet",
+                    )
+                )
+        else:
+            abs_target_path = (self.project_root / target_file).resolve()
+            if abs_target_path.exists():
+                try:
+                    lines = abs_target_path.read_text(encoding="utf-8").splitlines()
                     content = "\n".join(lines)
                     windows.append(
                         ContextWindow(
@@ -189,48 +223,27 @@ class DecisionEditTool(Tool):
                             mode="full",
                         )
                     )
-            except Exception as exc:
-                log.warning("Failed to read target file %s: %s", target_file, exc)
+                except Exception as exc:
+                    log.warning("Failed to read target file %s: %s", target_file, exc)
 
-        # 2. If context_window is provided in the arguments, we use exactly those frozen windows!
-        if context_window is not None:
-            for item in context_window:
-                file_path = item.get("file")
-                if not file_path:
-                    continue
-                norm_file = file_path.replace("\\", "/").lstrip("./")
-                if norm_file == norm_target:
-                    continue
-                span = item.get("span")
-                if not span or len(span) < 2:
-                    continue
-                start_line, end_line = span[0], span[1]
+        for file_path, start_line, end_line in reference_spans:
+            content = self._read_file_span(file_path, start_line, end_line)
+            if content is None:
+                continue
+            windows.append(
+                ContextWindow(
+                    file=file_path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    content=content,
+                    symbols=(),
+                    semantic_tags=(),
+                    role="reference",
+                    mode="snippet",
+                )
+            )
 
-                abs_path = (self.project_root / file_path).resolve()
-                content = None
-                if abs_path.is_file():
-                    try:
-                        lines = abs_path.read_text(encoding="utf-8").splitlines()
-                        start = max(1, start_line)
-                        end = min(len(lines), end_line)
-                        content = "\n".join(lines[start - 1 : end])
-                    except Exception as exc:
-                        log.warning("Failed to read frozen span %s:%d-%d from disk: %s", file_path, start_line, end_line, exc)
-
-                if content is not None:
-                    windows.append(
-                        ContextWindow(
-                            file=file_path,
-                            start_line=start_line,
-                            end_line=end_line,
-                            content=content,
-                            symbols=(),
-                            semantic_tags=(),
-                            role="reference",
-                            mode="snippet",
-                        )
-                    )
-        else:
+        if context_window is None:
             # Fall back to historical raw_evidence_store context loading (legacy behavior)
             raw_evidence = []
             if search_cache and "raw_evidence_store" in search_cache:
@@ -328,6 +341,7 @@ class DecisionEditTool(Tool):
         }
 
     async def execute(self, **params: Any) -> ToolResult:
+        started_at = time.monotonic()
         validated = self.validate_params(params)
         target_file = validated["target_file"]
         intent = validated["intent"]
@@ -335,7 +349,20 @@ class DecisionEditTool(Tool):
         context_window = params.get("context_window")
 
         # Build context pack dynamically containing target file and context files
-        context_pack = self._build_context_pack(target_file, search_cache, context_window=context_window)
+        context_pack = self._build_context_pack(
+            target_file,
+            search_cache,
+            context_window=context_window,
+        )
+        context_chars = sum(len(window.content) for window in context_pack.windows)
+        context_lines = sum(len(window.content.splitlines()) for window in context_pack.windows)
+        print(
+            "[debug][decision-edit][context] "
+            f"file={target_file} windows={len(context_pack.windows)} "
+            f"lines={context_lines} chars={context_chars} "
+            f"elapsed={time.monotonic() - started_at:.2f}s",
+            flush=True,
+        )
 
         evidence_flag = self._build_evidence_flag(target_file, search_cache, context_pack)
 
@@ -347,6 +374,7 @@ class DecisionEditTool(Tool):
                 context_pack=context_pack,
                 hint=None,
                 evidence_flag=evidence_flag,
+                edit_only=True,
             )
             trimmed_messages = await self.harness.before_llm_call(decision_messages)
 
@@ -381,28 +409,50 @@ class DecisionEditTool(Tool):
                         tools=None,
                     )
                     if not hasattr(stream_generator, "__aiter__"):
+                        if inspect.iscoroutine(stream_generator):
+                            stream_generator.close()
                         use_stream = False
                 except Exception:
                     use_stream = False
 
-            if use_stream:
-                if hasattr(self.harness, "progress_callback") and self.harness.progress_callback:
-                    self.harness.progress_callback(f"正在编辑文件: {target_file}… [+0 -0]")
+            print(
+                "[debug][decision-edit][decision-llm-start] "
+                f"file={target_file} timeout={self.decision_timeout:g}s",
+                flush=True,
+            )
+            async with asyncio.timeout(self.decision_timeout):
+                if use_stream:
+                    if (
+                        hasattr(self.harness, "progress_callback")
+                        and self.harness.progress_callback
+                    ):
+                        self.harness.progress_callback(f"正在编辑文件: {target_file}… [+0 -0]")
 
-                async for content_chunk, final_response in stream_generator:
-                    if content_chunk:
-                        content_chunks.append(content_chunk)
-                        added, removed = count_diff_lines("".join(content_chunks))
-                        if hasattr(self.harness, "progress_callback") and self.harness.progress_callback:
-                            self.harness.progress_callback(f"正在编辑文件: {target_file}… [+{added} -{removed}]")
-                    if final_response is not None:
-                        response = final_response
-            else:
-                response = await self.decision_llm.chat(
-                    trimmed_messages,
-                    tools=None,
-                    stream=False,
-                )
+                    async for content_chunk, final_response in stream_generator:
+                        if content_chunk:
+                            content_chunks.append(content_chunk)
+                            added, removed = count_diff_lines("".join(content_chunks))
+                            if (
+                                hasattr(self.harness, "progress_callback")
+                                and self.harness.progress_callback
+                            ):
+                                self.harness.progress_callback(
+                                    f"正在编辑文件: {target_file}… [+{added} -{removed}]"
+                                )
+                        if final_response is not None:
+                            response = final_response
+                else:
+                    response = await self.decision_llm.chat(
+                        trimmed_messages,
+                        tools=None,
+                        stream=False,
+                    )
+
+            print(
+                "[debug][decision-edit][decision-llm-done] "
+                f"file={target_file} elapsed={time.monotonic() - started_at:.2f}s",
+                flush=True,
+            )
 
             if response:
                 await self.harness.after_llm_call(response, response.usage)
@@ -422,6 +472,16 @@ class DecisionEditTool(Tool):
             parsed_decision = self.decision.parse(
                 response.content or "",
                 context_pack.candidate_files,
+                edit_only=True,
+            )
+        except TimeoutError:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "DecisionLLM patch generation timed out after "
+                    f"{self.decision_timeout:g}s for {target_file}."
+                ),
             )
         except Exception as exc:
             return ToolResult(
@@ -445,6 +505,12 @@ class DecisionEditTool(Tool):
             step=1,
             layer1=None,
             user_intent=intent,
+        )
+        print(
+            "[debug][decision-edit][validation-done] "
+            f"file={target_file} success={validation.success} "
+            f"elapsed={time.monotonic() - started_at:.2f}s",
+            flush=True,
         )
 
         task_id = params.get("task_id")

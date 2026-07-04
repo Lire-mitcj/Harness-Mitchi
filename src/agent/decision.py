@@ -51,6 +51,7 @@ class CursorDecisionLLM:
         context_pack: ContextPack,
         hint: InterHint | None,
         evidence_flag: dict[str, Any] | None = None,
+        edit_only: bool = False,
     ) -> list[dict[str, str]]:
         hint_text = "unavailable"
         if hint is not None:
@@ -72,7 +73,9 @@ class CursorDecisionLLM:
                 f"{window.content}\n</file>"
             )
         schema = (
-            '{"action":"edit|answer|ask_clarify","answer":"",'
+            '{"action":"edit","answer":"","clarification":"","target_file":"","patch":"","suggested_completion":0}'
+            if edit_only
+            else '{"action":"edit|answer|ask_clarify","answer":"",'
             '"clarification":"","target_file":"","patch":"","suggested_completion":0}'
         )
         if evidence_flag is None:
@@ -81,9 +84,17 @@ class CursorDecisionLLM:
                 "can_answer": len(context_pack.windows) > 0,
             }
         evidence_flag_text = json.dumps(evidence_flag, ensure_ascii=False)
+        system_prompt = _decision_system_prompt(schema)
+        if edit_only:
+            system_prompt += (
+                "\n\nEDIT_ONLY_MODE: The caller already invoked `decision_edit`. "
+                "Return `action=edit` only. Never return `ask_clarify` or `answer`. "
+                "If a span seems incomplete, still produce the best local SEARCH/REPLACE "
+                "patch using the provided CURRENT_CONTEXT windows."
+            )
         return [{
             "role": "system",
-            "content": _decision_system_prompt(schema),
+            "content": system_prompt,
         }, {
             "role": "user",
             "content": (
@@ -95,7 +106,12 @@ class CursorDecisionLLM:
         }]
 
     @staticmethod
-    def parse(content: str, candidate_files: tuple[str, ...]) -> Decision:
+    def parse(
+        content: str,
+        candidate_files: tuple[str, ...],
+        *,
+        edit_only: bool = False,
+    ) -> Decision:
         try:
             data = json.loads(_strip_json_fence(content))
         except (TypeError, json.JSONDecodeError) as exc:
@@ -123,6 +139,11 @@ class CursorDecisionLLM:
             stage_completion = 0.0
 
         action = data["action"]
+        if edit_only and action != "edit":
+            raise DecisionError(
+                f"decision_schema: edit-only mode forbids action {action!r}; "
+                "return a SEARCH/REPLACE patch instead of clarifying."
+            )
         if action not in {"edit", "answer", "ask_clarify"}:
             raise DecisionError(f"decision_schema: unsupported action {action!r}")
         decision = Decision(

@@ -142,6 +142,12 @@ class MitKIISettings(BaseSettings):
     cursor_graph_bridge_semantic_threshold: float = Field(default=0.42, ge=0.0, le=1.0)
     cursor_graph_bridge_alias_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
     cursor_retrieval_timeout: float = Field(default=12.0, ge=0.1, le=120.0)
+    cursor_decision_timeout: float = Field(
+        default=90.0,
+        ge=5.0,
+        le=300.0,
+        description="Total deadline for the internal decision_edit patch-generation LLM call.",
+    )
     cursor_max_context_files: int = Field(default=3, ge=1, le=12)
     cursor_context_chars_per_file: int = Field(default=12_000, ge=1000, le=50_000)
     cursor_dependency_affinity_threshold: float = Field(

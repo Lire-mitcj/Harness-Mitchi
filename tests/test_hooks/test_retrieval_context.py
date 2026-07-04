@@ -260,10 +260,6 @@ def test_before_tool_fact_locking_range_coverage() -> None:
             )
         )
         assert res is not None
-        assert res.startswith("SUCCESS:")
-        data = json.loads(res.replace("SUCCESS: ", "", 1))
-        assert "my_func" in data["observation_code"]
-        assert data["span"] == [12, 15]
+        assert res.startswith("BLOCK:")
     finally:
         Path(tmp_name).unlink(missing_ok=True)
-
