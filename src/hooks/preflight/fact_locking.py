@@ -8,6 +8,11 @@ from collections.abc import Mapping, Set
 from pathlib import Path
 from typing import Any
 
+from src.tools.grep_match_symbols import (
+    grep_search_fingerprint,
+    history_entry_matches_fingerprint,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -378,6 +383,15 @@ async def inspect_fact_locking_async(
                             and sym == requested_symbol
                             and _anchor_has_complete_source(anchor)
                         ):
+                            anchor_file = str(anchor.get("file") or "").replace(
+                                "\\", "/"
+                            ).strip().lstrip("./")
+                            if (
+                                normalized_target_file
+                                and anchor_file
+                                and anchor_file != normalized_target_file
+                            ):
+                                continue
                             cached_code = anchor.get("code") or anchor.get("verbatim_code") or ""
                             file_name = anchor.get("file") or "unknown"
                             span = anchor.get("span") or [1, 1]
@@ -395,6 +409,15 @@ async def inspect_fact_locking_async(
                             and sym == requested_symbol
                             and _anchor_has_complete_source(anchor)
                         ):
+                            anchor_file = str(anchor.get("file") or "").replace(
+                                "\\", "/"
+                            ).strip().lstrip("./")
+                            if (
+                                normalized_target_file
+                                and anchor_file
+                                and anchor_file != normalized_target_file
+                            ):
+                                continue
                             cached_code = anchor.get("code") or anchor.get("verbatim_code") or ""
                             file_name = anchor.get("file") or "unknown"
                             span = anchor.get("span") or [1, 1]
@@ -403,9 +426,42 @@ async def inspect_fact_locking_async(
                                 f"({file_name}:{span[0]}-{span[1]}). Reuse it; do not re-fetch."
                             )
 
-    # 4. Redundant Search Prevention for grep_search
+    # 4. Redundant / empty grep prevention
     if tool_name == "grep_search":
-        pattern = arguments.get("pattern", "")
+        pattern = str(arguments.get("pattern") or "").strip()
+        patterns = arguments.get("patterns")
+        pattern_items: list[str] = []
+        if isinstance(patterns, list):
+            for item in patterns:
+                text = str(item or "").strip()
+                if text and text not in pattern_items:
+                    pattern_items.append(text)
+        if pattern and pattern not in pattern_items:
+            pattern_items.insert(0, pattern)
+        path = str(arguments.get("path") or ".").strip() or "."
+        include = arguments.get("include")
+        mode = str(arguments.get("mode") or "default").strip() or "default"
+        fingerprint = grep_search_fingerprint(
+            pattern_items or ([pattern] if pattern else []),
+            path=path,
+            include=str(include) if include else None,
+            mode=mode,
+        )
+
+        if search_history and fingerprint and pattern_items:
+            for entry in reversed(search_history):
+                if not entry.get("empty"):
+                    continue
+                if not history_entry_matches_fingerprint(entry, fingerprint):
+                    continue
+                prior_patterns = entry.get("patterns") or [entry.get("pattern")]
+                return (
+                    "BLOCK: Repeated empty grep_search. This exact query already returned "
+                    f"0 matches for {path!r} (patterns={prior_patterns!r}). "
+                    "Broaden patterns, change include/path, or use view_symbol_code on "
+                    "suggested_views / LOADED CODE ANCHORS instead of retrying."
+                )
+
         if pattern:
             if context_anchors_code:
                 for anchor in context_anchors_code:

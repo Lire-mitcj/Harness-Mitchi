@@ -124,6 +124,38 @@ async def test_grep_search_sql_match_suggests_view(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_grep_search_ranks_definition_before_mount(tmp_path: Path) -> None:
+    import json
+
+    (tmp_path / "main.py").write_text(
+        "from fastapi import FastAPI\n"
+        "app = FastAPI()\n"
+        "app.include_router(build_router(engine))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "list.py").write_text(
+        "def build_router(engine):\n    return engine\n",
+        encoding="utf-8",
+    )
+    tool = GrepSearchTool()
+    result = await tool.execute(
+        pattern="build_router",
+        path=str(tmp_path),
+        _project_root=tmp_path,
+    )
+    assert result.success
+    payload = json.loads(result.output)
+    kinds = payload.get("match_kinds_top") or []
+    assert kinds[0] == "definition"
+    views = payload["suggested_views"]
+    assert any(v["file"].endswith("list.py") and v["symbol"] == "build_router" for v in views)
+    assert any(
+        v["file"].endswith("main.py") and v.get("resolved_from") == "mount_context"
+        for v in views
+    )
+
+
+@pytest.mark.asyncio
 async def test_grep_search_modes(grep_tool: GrepSearchTool, sample_files: Path) -> None:
     import json
 
@@ -146,12 +178,11 @@ async def test_grep_search_modes(grep_tool: GrepSearchTool, sample_files: Path) 
     assert matches_imp[0]["span"] == [1, 1]
     assert "import helper" in matches_imp[0]["match_line"]
 
-    # 3. Structure mode: should return file level existence summaries
+    # 3. Structure mode: file summary plus suggested_views for representative hits
     res_struct = await grep_tool.execute(pattern="helper_func", path=str(sample_files), mode="structure")
     assert res_struct.success
     payload_struct = json.loads(res_struct.output)
     summary = payload_struct["file_level_summary"]
-    # helper_func exists in helper.py (def) and test_api.py (assert call)
     assert len(summary) == 2
-    assert any(item["file"].endswith("helper.py") and item["exists"] is True and item["match_count"] == 1 for item in summary)
-    assert any(item["file"].endswith("test_api.py") and item["exists"] is True and item["match_count"] == 1 for item in summary)
+    assert payload_struct.get("suggested_views")
+    assert payload_struct.get("next_action", {}).get("tool") == "view_symbol_code"

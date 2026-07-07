@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from src.agent.grep_discovery import grep_patterns_for_task, grep_scope_for_task
+
 MAX_BATCH_PATTERNS = 8
 
 _DEFAULT_FALLBACK_PATTERNS = [
@@ -79,6 +81,15 @@ def _grep_patterns_from_hint(hint_text: str) -> list[str]:
         add("get_current_user")
         add("Bearer")
 
+    if any(word in lowered for word in (
+        "exception", "handler", "异常", "错误处理", "logging", "日志", "统一",
+    )):
+        add("@app\\.exception_handler")
+        add("add_exception_handler")
+        add("async def handle_")
+        add("def _handle_")
+        add("logger\\.exception")
+
     return patterns
 
 
@@ -107,6 +118,8 @@ def normalize_grep_search_args(
         )
 
     patterns = _grep_patterns_from_hint(blob)
+    if not patterns and hint_text.strip():
+        patterns = grep_patterns_for_task(hint_text)
     if not patterns:
         for word in (
             "register", "signup", "transaction", "commit", "rollback",
@@ -126,6 +139,13 @@ def normalize_grep_search_args(
             patterns = list(_DEFAULT_FALLBACK_PATTERNS)
         else:
             return args
+
+    if hint_text.strip() and "include" not in args:
+        include, path_hint = grep_scope_for_task(hint_text)
+        if include:
+            args.setdefault("include", include)
+        if path_hint and args.get("path", ".") == ".":
+            args["path"] = path_hint
 
     if len(patterns) == 1:
         args["pattern"] = patterns[0]

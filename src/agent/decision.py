@@ -90,7 +90,9 @@ class CursorDecisionLLM:
                 "\n\nEDIT_ONLY_MODE: The caller already invoked `decision_edit`. "
                 "Return `action=edit` only. Never return `ask_clarify` or `answer`. "
                 "If a span seems incomplete, still produce the best local SEARCH/REPLACE "
-                "patch using the provided CURRENT_CONTEXT windows."
+                "patch using the provided CURRENT_CONTEXT windows. Multiple non-overlapping "
+                "SEARCH/REPLACE blocks in one file are allowed when several independent "
+                "sites must change."
             )
         return [{
             "role": "system",

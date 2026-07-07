@@ -18,7 +18,7 @@ def _make_state(
     validation_status: str = "not_run",
     no_gain_rounds: int = 0,
     view_last_round_all_duplicate: bool = False,
-    phase: str = "retrieving",
+    phase: RunPhase = RunPhase.RETRIEVING,
 ) -> SimpleNamespace:
     items = [EvidenceItem(id=name, need=name, status="MISSING") for name in missing]
     items += [
@@ -71,6 +71,174 @@ def test_insufficient_edit_mode_opens_retrieval_only() -> None:
     assert "decision_edit" not in allowed
 
 
+def test_insufficient_no_gain_two_reopens_grep_without_suggested_views() -> None:
+    """INSUFFICIENT + no actionable suggested_views: no_gain>=2 must not lock grep out."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 358),
+                    symbol="build_router",
+                    status="SATISFIED",
+                ),
+            ),
+            sufficiency=Sufficiency.INSUFFICIENT,
+        ),
+        validation=SimpleNamespace(status="not_run"),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=2,
+        view_last_round_all_duplicate=False,
+        grep_suggested_views=(),
+    )
+    state = SimpleNamespace(run_state=run_state)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == PRIMARY_RETRIEVAL
+    assert "decision_edit" not in allowed
+
+
+def test_insufficient_no_gain_two_duplicate_view_reopens_grep_only() -> None:
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 358),
+                    symbol="build_router",
+                    status="SATISFIED",
+                ),
+            ),
+            sufficiency=Sufficiency.INSUFFICIENT,
+        ),
+        validation=SimpleNamespace(status="not_run"),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=2,
+        view_last_round_all_duplicate=True,
+        grep_suggested_views=(
+            {"file": "main.py", "symbol": "handle_db_error"},
+        ),
+    )
+    state = SimpleNamespace(run_state=run_state)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == frozenset({"grep_search"})
+    assert "view_symbol_code" not in allowed
+
+
+def test_insufficient_no_gain_two_keeps_view_when_actionable_suggested_views_present() -> None:
+    """When grep already named concrete handler symbols, view-only convergence still applies."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 358),
+                    symbol="build_router",
+                    status="SATISFIED",
+                ),
+            ),
+            sufficiency=Sufficiency.INSUFFICIENT,
+        ),
+        validation=SimpleNamespace(status="not_run"),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=2,
+        view_last_round_all_duplicate=False,
+        grep_suggested_views=(
+            {"file": "main.py", "symbol": "handle_db_error"},
+        ),
+    )
+    state = SimpleNamespace(run_state=run_state)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == frozenset({"view_symbol_code"})
+    assert "grep_search" not in allowed
+
+
+def test_insufficient_no_gain_two_reopens_grep_when_only_trivial_suggested_views() -> None:
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 358),
+                    symbol="build_router",
+                    status="SATISFIED",
+                ),
+            ),
+            sufficiency=Sufficiency.INSUFFICIENT,
+        ),
+        validation=SimpleNamespace(status="not_run"),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=2,
+        view_last_round_all_duplicate=False,
+        grep_suggested_views=(
+            {"file": "main.py", "symbol": "logger", "span": [47, 47]},
+        ),
+    )
+    state = SimpleNamespace(run_state=run_state)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == PRIMARY_RETRIEVAL
+    assert "grep_search" in allowed
+
+
+def test_insufficient_duplicate_view_drops_view_at_one_no_gain() -> None:
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 358),
+                    symbol="build_router",
+                    status="SATISFIED",
+                ),
+            ),
+            sufficiency=Sufficiency.INSUFFICIENT,
+        ),
+        validation=SimpleNamespace(status="not_run"),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=1,
+        view_last_round_all_duplicate=True,
+    )
+    state = SimpleNamespace(run_state=run_state)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert "view_symbol_code" not in allowed
+    assert "grep_search" in allowed
+    assert "decision_edit" not in allowed
+
+
 def test_sufficient_for_edit_is_edit_only_when_no_gaps() -> None:
     state = _make_state(task_mode="edit", sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT)
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
@@ -88,7 +256,9 @@ def test_sufficient_for_edit_keeps_primary_retrieval_open_after_edit() -> None:
     )
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
-    assert allowed == frozenset({"decision_edit"})
+    assert "view_symbol_code" in allowed
+    assert "grep_search" in allowed
+    assert "decision_edit" in allowed
 
 
 def test_one_no_gain_round_is_edit_only_without_stale_gaps() -> None:
@@ -153,10 +323,36 @@ def test_diagnose_answer_when_sufficient_and_fresh() -> None:
     state = _make_state(
         task_mode="diagnose",
         sufficiency=Sufficiency.SUFFICIENT_FOR_ANSWER,
+        phase=RunPhase.RESPONDING,
     )
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
     assert allowed == frozenset()
+
+
+def test_diagnose_sufficient_while_retrieving_keeps_retrieval() -> None:
+    """Manifest sufficient must not drop tools before phase transitions to RESPONDING."""
+    state = _make_state(
+        task_mode="diagnose",
+        sufficiency=Sufficiency.SUFFICIENT_FOR_ANSWER,
+        phase=RunPhase.RETRIEVING,
+    )
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == PRIMARY_RETRIEVAL
+
+
+def test_diagnose_sufficient_retrieving_duplicate_view_prefers_grep() -> None:
+    state = _make_state(
+        task_mode="diagnose",
+        sufficiency=Sufficiency.SUFFICIENT_FOR_ANSWER,
+        phase=RunPhase.RETRIEVING,
+        no_gain_rounds=1,
+        view_last_round_all_duplicate=True,
+    )
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == frozenset({"grep_search"})
 
 
 def test_diagnose_insufficient_keeps_retrieval() -> None:
@@ -192,6 +388,47 @@ def test_validation_failed_allows_edit_and_refresh() -> None:
 
     assert "decision_edit" in allowed
     assert "view_symbol_code" in allowed
+
+
+def test_failure_items_duplicate_view_converges_to_edit_only() -> None:
+    """After DEAD_SQL_ALIAS + duplicate anchor replay, stop re-opening view."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 358),
+                    symbol="build_router",
+                    status="STALE",
+                    stale_reason="file modified by decision_edit",
+                ),
+                EvidenceItem(
+                    id="test_failure.dead_sql_alias",
+                    need="Schema validation failed: DEAD_SQL_ALIAS",
+                    type="test_failure",
+                    status="MISSING",
+                ),
+            ),
+            sufficiency=Sufficiency.INSUFFICIENT,
+        ),
+        validation=SimpleNamespace(
+            status="failed",
+            issues=("Schema validation failed: DEAD_SQL_ALIAS",),
+        ),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=3,
+        view_last_round_all_duplicate=True,
+    )
+    state = SimpleNamespace(run_state=run_state)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == frozenset({"decision_edit"})
 
 
 def test_dead_sql_alias_validation_recovery_is_edit_only() -> None:
@@ -291,6 +528,7 @@ def test_edit_burst_after_validated_edit_is_edit_only() -> None:
         validation_status="passed",
         phase=RunPhase.ACTING,
     )
+    state.checklist = ("[ ] Apply remaining schema migration",)
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
     assert allowed == frozenset({"decision_edit"})
@@ -306,6 +544,7 @@ def test_edit_burst_continues_edit_only_when_edited_file_is_stale() -> None:
         stale=("db/init/init.sql",),
         phase=RunPhase.ACTING,
     )
+    state.checklist = ("[ ] Wire handler in list.py",)
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
     assert allowed == frozenset({"decision_edit"})
@@ -399,6 +638,49 @@ def test_duplicate_view_round_closes_retrieval_when_edit_ready() -> None:
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
     assert allowed == frozenset({"decision_edit"})
+
+
+def test_duplicate_view_keeps_retrieval_open_when_wiring_gap() -> None:
+    """Wrong-file duplicate view must not force edit-only while caller wiring is missing."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:main.py:sqlalchemy_error_handler",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="main.py",
+                    span=(49, 55),
+                    symbol="sqlalchemy_error_handler",
+                    status="SATISFIED",
+                ),
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 350),
+                    symbol="build_router",
+                    status="SATISFIED",
+                ),
+            ),
+            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        ),
+        validation=SimpleNamespace(status="not_run"),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=1,
+        view_last_round_all_duplicate=True,
+        edit_patch_failed=False,
+    )
+    state = SimpleNamespace(run_state=run_state)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert "view_symbol_code" in allowed
+    assert "decision_edit" in allowed
 
 
 def test_duplicate_view_overrides_edit_patch_failed_recovery() -> None:
@@ -540,6 +822,52 @@ def test_verification_converges_to_edit_only_on_duplicate_view() -> None:
     assert allowed == frozenset({"decision_edit"})
 
 
+def test_post_edit_verification_opens_when_plan_edits_complete() -> None:
+    """After the last planned file is edited, reopen retrieval without waiting a round."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:main.py:create_app",
+                    need="main wiring",
+                    type="symbol",
+                    role="observed",
+                    file="main.py",
+                    span=(1, 80),
+                    symbol="create_app",
+                    status="STALE",
+                    stale_reason="file modified by decision_edit",
+                ),
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 358),
+                    symbol="build_router",
+                    status="SATISFIED",
+                ),
+            ),
+            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        ),
+        validation=SimpleNamespace(status="passed"),
+        changes=SimpleNamespace(files=("main.py",)),
+        retrieval_no_gain_rounds=1,
+        view_last_round_all_duplicate=False,
+        edit_patch_failed=False,
+        rounds_since_last_edit=0,
+    )
+    state = SimpleNamespace(run_state=run_state, checklist=())
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert "view_symbol_code" in allowed
+    assert "grep_search" in allowed
+    assert "decision_edit" in allowed
+
+
 def test_post_edit_verification_opens_when_checklist_complete() -> None:
     run_state = SimpleNamespace(
         task_mode="edit",
@@ -617,3 +945,43 @@ def test_missing_dependency_does_not_reopen_retrieval_without_manifest_gap() -> 
     )
 
     assert allowed == frozenset({"decision_edit"})
+
+
+def test_grep_pending_mount_keeps_view_open_after_large_symbol_loaded() -> None:
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 358),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        ),
+        sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+    )
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.RETRIEVING,
+        manifest=manifest,
+        validation=SimpleNamespace(status="not_run"),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=0,
+        view_last_round_all_duplicate=False,
+        grep_suggested_views=(
+            {
+                "file": "main.py",
+                "symbol": "wire_routes",
+                "span": [3, 5],
+                "resolved_from": "mount_context",
+            },
+        ),
+    )
+    state = SimpleNamespace(run_state=run_state, checklist=())
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert "view_symbol_code" in allowed
+    assert allowed != frozenset({"decision_edit"})

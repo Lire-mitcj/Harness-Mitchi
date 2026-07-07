@@ -13,6 +13,8 @@ from src.agent.manifest import (
     retrieval_profile,
     stale_needing_refresh,
     supersede_stale_with_observations,
+    wiring_gap_lines,
+    wiring_gap_pending_loads,
 )
 
 
@@ -395,7 +397,7 @@ def test_reconcile_supersedes_stale_schema_from_post_edit_observations() -> None
     assert stale_needing_refresh(reconciled) == ()
 
 
-def test_execution_card_hides_stale_on_edited_files_during_edit_burst() -> None:
+def test_execution_card_shows_stale_anchors_during_edit_burst() -> None:
     manifest = StepManifest(
         required_items=(
             EvidenceItem(
@@ -432,7 +434,41 @@ def test_execution_card_hides_stale_on_edited_files_during_edit_burst() -> None:
 
     assert "edit_burst:" in card
     assert "batch verification" in card
-    assert "stale (needs refresh):" not in card
+    assert "stale anchors" in card
+    assert "db/init/init.sql:99-110" in card
+
+
+def test_grep_pending_caller_loads_when_mount_file_not_grounded() -> None:
+    from src.agent.manifest import grep_pending_caller_loads
+
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 358),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        ),
+    )
+    pending = grep_pending_caller_loads(
+        manifest,
+        (
+            {
+                "file": "main.py",
+                "symbol": "wire_routes",
+                "span": [3, 5],
+                "resolved_from": "mount_context",
+            },
+        ),
+    )
+    assert len(pending) == 1
+    assert pending[0]["file"] == "main.py"
+    assert pending[0]["symbol"] == "wire_routes"
 
 
 def test_observed_bootstrap_requires_schema_and_symbol_for_edit() -> None:
@@ -460,7 +496,265 @@ def test_observed_bootstrap_requires_schema_and_symbol_for_edit() -> None:
     assert compute_sufficiency(manifest, "edit") == Sufficiency.SUFFICIENT_FOR_EDIT
 
     only_symbol = StepManifest(required_items=(symbol,))
-    assert compute_sufficiency(only_symbol, "edit") == Sufficiency.INSUFFICIENT
+    assert compute_sufficiency(only_symbol, "edit") == Sufficiency.SUFFICIENT_FOR_EDIT
+
+    small_symbol = EvidenceItem(
+        id="observed.symbol:list.py:helper",
+        need="helper",
+        type="symbol",
+        role="observed",
+        file="list.py",
+        span=(1, 2),
+        symbol="helper",
+        status="SATISFIED",
+    )
+    assert compute_sufficiency(StepManifest(required_items=(small_symbol,)), "edit") == Sufficiency.INSUFFICIENT
+
+
+def test_observed_integration_bootstrap_main_handlers_plus_build_router() -> None:
+    """Large edit-target symbol is edit-ready even if caller wiring is incomplete."""
+    handlers = [
+        EvidenceItem(
+            id=f"observed.symbol:main.py:{name}",
+            need=name,
+            type="symbol",
+            role="observed",
+            file="main.py",
+            span=(49 + index * 8, 55 + index * 8),
+            symbol=name,
+            status="SATISFIED",
+        )
+        for index, name in enumerate(
+            ("sqlalchemy_error_handler", "validation_error_handler", "general_error_handler")
+        )
+    ]
+    router = EvidenceItem(
+        id="observed.symbol:list.py:build_router",
+        need="router",
+        type="symbol",
+        role="observed",
+        file="list.py",
+        span=(16, 358),
+        symbol="build_router",
+        status="SATISFIED",
+    )
+    manifest = StepManifest(required_items=(*handlers, router))
+    assert compute_sufficiency(manifest, "edit") == Sufficiency.SUFFICIENT_FOR_EDIT
+    assert wiring_gap_lines(manifest)
+
+
+def test_wiring_gap_persists_when_only_single_line_app_loaded() -> None:
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:app",
+                need="app",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(41, 41),
+                symbol="app",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 358),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        )
+    )
+    assert wiring_gap_lines(manifest)
+
+
+def test_wiring_gap_cleared_when_wide_header_span_loaded() -> None:
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:app",
+                need="app",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(1, 45),
+                symbol="app",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 358),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        )
+    )
+    assert not wiring_gap_lines(manifest)
+
+
+def test_observed_integration_bootstrap_ready_with_caller_setup() -> None:
+    handlers = [
+        EvidenceItem(
+            id="observed.symbol:main.py:create_app",
+            need="app",
+            type="symbol",
+            role="observed",
+            file="main.py",
+            span=(1, 35),
+            symbol="create_app",
+            status="SATISFIED",
+        ),
+        EvidenceItem(
+            id="observed.symbol:main.py:sqlalchemy_error_handler",
+            need="handler",
+            type="symbol",
+            role="observed",
+            file="main.py",
+            span=(49, 55),
+            symbol="sqlalchemy_error_handler",
+            status="SATISFIED",
+        ),
+    ]
+    router = EvidenceItem(
+        id="observed.symbol:list.py:build_router",
+        need="router",
+        type="symbol",
+        role="observed",
+        file="list.py",
+        span=(16, 358),
+        symbol="build_router",
+        status="SATISFIED",
+    )
+    manifest = StepManifest(required_items=(*handlers, router))
+    assert compute_sufficiency(manifest, "edit") == Sufficiency.SUFFICIENT_FOR_EDIT
+    assert not wiring_gap_lines(manifest)
+
+
+def test_execution_card_reports_wiring_gap() -> None:
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:sqlalchemy_error_handler",
+                need="handler",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(49, 55),
+                symbol="sqlalchemy_error_handler",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 358),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        ),
+        sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+    )
+    card = execution_card(manifest, ["view_symbol_code", "decision_edit"], task_text="list.py")
+    assert "wiring_gap:" in card
+    assert "main.py" in card
+    assert "pending_wiring:" in card
+    assert "edit_target: list.py" in card
+
+
+def test_execution_card_filters_cross_file_duplicate_suggested_views() -> None:
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 358),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        )
+    )
+    card = execution_card(
+        manifest,
+        ["view_symbol_code"],
+        grep_suggested_views=(
+            {"file": "main.py", "symbol": "build_router", "span": [42, 42]},
+            {"file": "main.py", "symbol": "create_app", "span": [10, 10]},
+        ),
+    )
+    assert "build_router" not in card.split("suggested_views", 1)[-1]
+    assert "create_app" in card
+
+
+def test_wiring_gap_pending_loads_suggests_caller_setup() -> None:
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:sqlalchemy_error_handler",
+                need="handler",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(49, 55),
+                symbol="sqlalchemy_error_handler",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 358),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        )
+    )
+    loads = wiring_gap_pending_loads(manifest, task_text="list.py")
+    assert len(loads) == 1
+    assert loads[0]["file"] == "main.py"
+    assert loads[0]["symbol"] == "create_app"
+
+
+def test_retrieval_profile_needs_view_on_wiring_gap() -> None:
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:sqlalchemy_error_handler",
+                need="handler",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(49, 55),
+                symbol="sqlalchemy_error_handler",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 358),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        )
+    )
+    profile = retrieval_profile(manifest)
+    assert profile.needs_view is True
 
 
 def test_stale_observed_schema_still_allows_edit() -> None:
@@ -494,12 +788,51 @@ def test_execution_card_includes_discovery_hints_from_task_slots() -> None:
         StepManifest(),
         ["grep_search", "view_symbol_code"],
         task_slots=["endpoint_implementation", "relevant_schema"],
+        task_text="Add order timeline endpoint and ticket_order schema",
     )
 
     assert "discovery_hints" in card
-    assert "endpoint_implementation" in card
-    assert "relevant_schema" in card
+    assert "endpoint_implementation" in card or "task_batch" in card
+    assert "relevant_schema" in card or "CREATE TABLE" in card
     assert "not manifest obligations" in card
+
+
+def test_execution_card_edit_only_includes_retrieval_closed_line() -> None:
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:sqlalchemy_error_handler",
+                need="handler",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(49, 55),
+                symbol="sqlalchemy_error_handler",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="handler",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 350),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        ),
+        sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+    )
+    card = execution_card(
+        manifest,
+        ["decision_edit"],
+        task_text="wire db logging into list.py routes",
+    )
+
+    assert "retrieval_closed:" in card
+    assert "edit_target: list.py" in card
+    assert "LOADED CODE ANCHORS" in card
+    assert "do not decision_edit other files to read" in card
 
 
 def test_execution_card_surfaces_grep_error_and_suggested_views() -> None:

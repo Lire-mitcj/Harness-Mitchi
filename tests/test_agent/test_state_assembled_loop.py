@@ -293,6 +293,8 @@ def test_conversation_compaction_is_role_aware_and_excludes_tool_bodies() -> Non
     turn_summary = next(msg.content for msg in compacted.messages_history if "### TURN SUMMARY" in msg.content)
 
     assert "- 决策：" in turn_summary
+    assert "codebase_retrieve" in turn_summary
+    assert "检查鉴权并继续计划" not in turn_summary
     assert "- 已读取：" in turn_summary
     assert "SECRET" not in turn_summary
 
@@ -317,7 +319,8 @@ def test_conversation_compaction_drops_process_only_intent() -> None:
     )
     assert "Let me examine" not in summary
     assert "继续未完成" not in summary
-    assert "RUN STATE" in summary
+    assert "STEP EVIDENCE" in summary
+    assert "状态快照（折叠时）" in summary
 
 
 def test_run_phase_derives_actual_llm_tool_set() -> None:
@@ -2145,6 +2148,97 @@ def test_build_deduped_loaded_anchors_block_dedupes_raw_only() -> None:
     assert block.count("def foo():") == 1
 
 
+def test_build_deduped_loaded_anchors_block_edit_ready_keeps_cross_file_projections() -> None:
+    from src.agent.manifest import EvidenceItem, StepManifest, Sufficiency
+
+    cache = {
+        "symbol_projections": [
+            {
+                "file": "main.py",
+                "symbol": "sqlalchemy_error_handler",
+                "span": [49, 55],
+                "projection_code": "49| async def sqlalchemy_error_handler(...):",
+            },
+            {
+                "file": "list.py",
+                "symbol": "build_router",
+                "span": [16, 20],
+                "projection_code": "16| def build_router(engine):",
+            },
+            {
+                "file": "list.py",
+                "symbol": "passenger_snapshot",
+                "span": [80, 90],
+                "projection_code": "80| def passenger_snapshot(...):",
+            },
+        ],
+        "raw_evidence_store": [],
+    }
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:sqlalchemy_error_handler",
+                need="handler",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(49, 55),
+                symbol="sqlalchemy_error_handler",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="handler",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 350),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        ),
+        sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+    )
+
+    bootstrap = _build_deduped_loaded_anchors_block(cache)
+    edit_ready_block = _build_deduped_loaded_anchors_block(
+        cache,
+        edit_ready=True,
+        task_text="wire db logging into list.py routes",
+        manifest=manifest,
+    )
+
+    assert "sqlalchemy_error_handler" not in bootstrap
+    assert "sqlalchemy_error_handler" in edit_ready_block
+    assert "build_router" in edit_ready_block
+    assert "passenger_snapshot" in edit_ready_block
+
+
+def test_grep_sql_locator_does_not_ground_relevant_schema_slot() -> None:
+    from src.agent.state_assembled_loop import _run_evidence_event
+    from src.hooks.post_tool_context import apply_post_tool_context_hook
+
+    result = apply_post_tool_context_hook(
+        "grep_search",
+        {"patterns": ["CREATE TABLE"], "include": "*.sql"},
+        ToolResult(
+            success=True,
+            output="{}",
+            metadata={
+                "raw_evidence_store": [{
+                    "file": "db/init/init.sql",
+                    "span": [1, 1],
+                    "match_line": "CREATE TABLE ticket_order (",
+                }]
+            },
+        ),
+    )
+    event = _run_evidence_event(result)
+    assert event is not None
+    grounded = {item.slot for item in event.evidence}
+    assert "relevant_schema" not in grounded
+
+
 def test_turn_context_block_puts_execution_card_last() -> None:
     block = build_turn_context_block(
         loaded_anchors="def handler(): pass",
@@ -2153,6 +2247,7 @@ def test_turn_context_block_puts_execution_card_last() -> None:
 
     assert block.index("LOADED CODE ANCHORS") < block.index("### STEP EVIDENCE (current step)")
     assert block.rstrip().endswith("tools_available: grep_search")
+
 
 @pytest.mark.asyncio
 async def test_view_symbol_code_tool(temp_project: Path) -> None:
@@ -2254,7 +2349,21 @@ async def test_view_symbol_code_tool(temp_project: Path) -> None:
     assert "app = FastAPI()" in res5.metadata["verbatim_code"]
     assert res5.metadata["span"] == [2, 2]
 
-    # Test case 6: Non-existent symbol
+    # Factory pattern: probing generic `app` resolves to create_app body.
+    (temp_project / "factory_main.py").write_text(
+        "from fastapi import FastAPI\n\n"
+        "def create_app():\n"
+        "    app = FastAPI()\n"
+        "    app.include_router(build_router(engine))\n"
+        "    return app\n",
+        encoding="utf-8",
+    )
+    res_factory = await tool.execute(target_file="factory_main.py", symbol="app")
+    assert res_factory.success is True
+    assert res_factory.metadata["symbol"] == "create_app"
+    assert "def create_app" in res_factory.metadata["verbatim_code"]
+
+    # Non-existent symbol
     res6 = await tool.execute(target_file="helper.py", symbol="missing_func")
     assert res6.success is False
     assert "not found" in res6.error

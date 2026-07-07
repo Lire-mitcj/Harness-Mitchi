@@ -93,6 +93,50 @@ async def test_executor_metrics_validation_failure_rolls_back(tmp_path: Path) ->
     assert metrics.layer1.recall == 1.0
 
 
+class _CountingValidator(_Validator):
+    def __init__(self, project_root: Path, result: ValidationResult) -> None:
+        super().__init__(project_root, result)
+        self.call_count = 0
+
+    async def validate(self, **kwargs: object) -> ValidationResult:
+        self.call_count += 1
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_executor_batched_transaction_validates_once(tmp_path: Path) -> None:
+    target = tmp_path / "sample.py"
+    target.write_text("a = 1\nb = 1\n", encoding="utf-8")
+    patch_a = (
+        "<<<<<<< SEARCH\n"
+        "a = 1\n"
+        "=======\n"
+        "a = 2\n"
+        ">>>>>>> REPLACE"
+    )
+    patch_b = (
+        "<<<<<<< SEARCH\n"
+        "b = 1\n"
+        "=======\n"
+        "b = 2\n"
+        ">>>>>>> REPLACE"
+    )
+    validator = _CountingValidator(tmp_path, ValidationResult(success=True))
+    executor = CursorExecutor(tmp_path, CursorPatchApplier(tmp_path))
+
+    execution, validation, metrics = await executor.execute_batched_transaction(
+        "sample.py",
+        [patch_a, patch_b],
+        validator,
+    )
+
+    assert execution.success
+    assert validation.success
+    assert target.read_text(encoding="utf-8") == "a = 2\nb = 2\n"
+    assert validator.call_count == 1
+    assert metrics.layer2.committed
+
+
 @pytest.mark.asyncio
 async def test_executor_metrics_success_commits_and_evaluator_persists(
     tmp_path: Path,
@@ -277,3 +321,72 @@ def test_patch_applier_creates_new_file_and_applies_empty_search(tmp_path: Path)
     success, error = applier.apply_patch(empty_file, patch_empty)
     assert success is True
     assert (tmp_path / empty_file).read_text(encoding="utf-8") == "print('populated')\n"
+
+
+def test_patch_applier_applies_multiple_non_overlapping_blocks(tmp_path: Path) -> None:
+    applier = CursorPatchApplier(tmp_path)
+    target = "routes.py"
+    (tmp_path / target).write_text(
+        "@router.get('/a')\ndef a():\n    return 1\n\n"
+        "@router.get('/b')\ndef b():\n    return 2\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "<<<<<<< SEARCH\n"
+        "@router.get('/a')\n"
+        "def a():\n"
+        "=======\n"
+        "@wrap\n"
+        "@router.get('/a')\n"
+        "def a():\n"
+        ">>>>>>> REPLACE\n"
+        "<<<<<<< SEARCH\n"
+        "@router.get('/b')\n"
+        "def b():\n"
+        "=======\n"
+        "@wrap\n"
+        "@router.get('/b')\n"
+        "def b():\n"
+        ">>>>>>> REPLACE"
+    )
+
+    success, error = applier.apply_patch(target, patch)
+
+    assert success is True, error
+    updated = (tmp_path / target).read_text(encoding="utf-8")
+    assert updated.count("@wrap") == 2
+
+
+def test_patch_applier_mismatch_includes_search_and_closest_fragment(
+    tmp_path: Path,
+) -> None:
+    applier = CursorPatchApplier(tmp_path)
+    target = "list.py"
+    (tmp_path / target).write_text(
+        "    @router.get('/orders')\n"
+        "    def list_orders():\n"
+        "        return []\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "<<<<<<< SEARCH\n"
+        "    @_db_error_handler\n"
+        "    @router.get('/orders')\n"
+        "    def list_orders():\n"
+        "=======\n"
+        "    @_db_error_handler\n"
+        "    @router.get('/orders')\n"
+        "    def list_orders():\n"
+        ">>>>>>> REPLACE"
+    )
+
+    success, error = applier.apply_patch(target, patch)
+
+    assert success is False
+    assert "mismatch: block 1 SEARCH code not found" in error
+    assert "Diagnostic for block 1" in error
+    assert "SEARCH (first lines" in error
+    assert "@_db_error_handler" in error
+    assert "Closest file fragment" in error
+    assert "@router.get('/orders')" in error
+    assert "SEARCH must be the current on-disk code" in error

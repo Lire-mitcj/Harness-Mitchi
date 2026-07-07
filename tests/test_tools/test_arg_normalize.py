@@ -32,6 +32,18 @@ def test_normalize_grep_fills_patterns_from_hint_text() -> None:
     assert "order_timeline" in joined or "timeline" in joined
 
 
+def test_normalize_grep_fills_exception_handler_patterns_from_hint() -> None:
+    args = normalize_grep_search_args(
+        {},
+        hint_text="把统一数据库异常日志接口接到现有的与数据库有关的接口上",
+    )
+    assert "patterns" in args or "pattern" in args
+    joined = " ".join(args.get("patterns") or [args.get("pattern", "")])
+    assert "exception_handler" in joined or "handle_" in joined
+    assert args.get("include") == "main.py"
+    assert args.get("path") == "main.py"
+
+
 def test_normalize_grep_leaves_empty_without_hint_or_subtask() -> None:
     args = normalize_grep_search_args({"include": "*.py"})
     assert "pattern" not in args

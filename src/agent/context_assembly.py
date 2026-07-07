@@ -63,7 +63,11 @@ def build_turn_context_block(
     loaded_anchors: str,
     execution_card_text: str,
 ) -> str:
-    """Assemble per-turn context with recency-weighted ordering for the Core LLM."""
+    """Assemble per-turn context with recency-weighted ordering for the Core LLM.
+
+    STEP EVIDENCE is placed after LOADED CODE ANCHORS so the decision card
+    receives the strongest recency weight in the user message.
+    """
     blocks: list[str] = []
     if loaded_anchors.strip():
         blocks.append(build_loaded_code_anchor_block(loaded_anchors))

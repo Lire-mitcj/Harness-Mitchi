@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal
 
+from src.agent.evidence_slots import slots_for_task
 from src.agent.manifest import (
     EvidenceItem,
     StepManifest,
@@ -125,6 +126,7 @@ class RunState:
     retrieval_no_gain_rounds: int = 0
     view_last_round_all_duplicate: bool = False
     last_grep_error: str = ""
+    last_view_error: str = ""
     grep_suggested_views: tuple[dict[str, Any], ...] = ()
     edit_patch_failed: bool = False
     rounds_since_last_edit: int = 0
@@ -174,6 +176,7 @@ class RunEvent:
     retrieval_attempted: bool = False
     view_all_duplicate: bool = False
     grep_error: str = ""
+    view_error: str = ""
     grep_suggested_views: tuple[dict[str, Any], ...] = ()
     edit_applied_this_round: bool = False
 
@@ -185,58 +188,22 @@ class RunEffect:
     allowed_tools: frozenset[str] = frozenset()
 
 
+def detect_edit_mode(task_text: str) -> bool:
+    """Classify implementation/edit tasks vs diagnose-only questions."""
+    return bool(
+        re.search(
+            r"\b(?:fix|implement|change|edit|add|remove|refactor|supplement|support|optimize|adjust|create|build)\b|"
+            r"修复|修改|实现|新增|删除|重构|补充|完善|加上|添加|引入|支持|调整|优化|创建|构建|开发|"
+            r"接到|对接|连通|连接|统一|挂接|串联|接入|挂载",
+            task_text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def requirements_for_task(task_text: str) -> frozenset[str]:
-    lowered = task_text.casefold()
-    required = {"target_implementation"}
-    if any(word in lowered for word in ("endpoint", "route", "接口", "路由")):
-        required.add("endpoint_implementation")
-    if any(
-        word in lowered
-        for word in ("integrate", "integration", "mount", "caller", "接入", "挂载", "调用")
-    ):
-        required.add("integration_or_mount_point")
-    if any(
-        word in lowered
-        for word in (
-            "auth",
-            "login",
-            "token",
-            "current_user",
-            "登录态",
-            "认证",
-            "鉴权",
-        )
-    ):
-        required.add("authentication_context")
-    if any(
-        word in lowered
-        for word in ("role", "permission", "authorize", "角色", "权限", "授权")
-    ):
-        required.add("authorization_policy")
-    if any(
-        word in lowered
-        for word in ("owner", "ownership", "tenant", "归属", "数据范围")
-    ):
-        required.update(("ownership_relation", "relevant_schema"))
-    if any(
-        word in lowered
-        for word in (
-            "sql",
-            "schema",
-            "table",
-            "database",
-            "数据库",
-            "表结构",
-            "新建表",
-            "创建表",
-            "建表",
-            "数据表",
-        )
-    ):
-        required.add("relevant_schema")
-    if any(word in lowered for word in ("test", "verify", "验证", "测试")):
-        required.add("test_or_validation_path")
-    return frozenset(required)
+    """Evidence slots a task activates. Backed by the shared slot registry."""
+    return slots_for_task(task_text)
 
 
 def manifest_template_for_task(task_text: str, task_mode: TaskMode) -> StepManifest:
@@ -296,11 +263,16 @@ def reduce_run_state(
             transition_reason=event.reason or "evidence_stored",
         )
         if evidence.complete:
-            phase = (
-                RunPhase.RESPONDING
-                if state.task_mode == "diagnose"
-                else RunPhase.ACTING
-            )
+            if state.task_mode == "diagnose":
+                # The (slot-filtered) evidence ledger is the reducer-time signal.
+                # Concrete required obligations (core_items) still block answering;
+                # observed anchors are projected to SATISFIED later in the loop, so
+                # they must NOT be read here (they are MISSING at reducer time).
+                if manifest.has_missing:
+                    return next_state, ()
+                phase = RunPhase.RESPONDING
+            else:
+                phase = RunPhase.ACTING
             next_state = replace(
                 next_state,
                 phase=phase,
@@ -311,15 +283,26 @@ def reduce_run_state(
     if event.kind == "tool_round_observed":
         no_gain_rounds = state.retrieval_no_gain_rounds
         if event.retrieval_attempted:
-            no_gain_rounds = (
-                0 if state.retrieval_gain_in_round else no_gain_rounds + 1
-            )
+            from src.tools.grep_match_symbols import has_actionable_suggested_views
+
+            if has_actionable_suggested_views(event.grep_suggested_views):
+                # Productive grep: concrete handler/route targets — not a no-gain round.
+                no_gain_rounds = 0
+            else:
+                no_gain_rounds = (
+                    0 if state.retrieval_gain_in_round else no_gain_rounds + 1
+                )
         grep_error = state.last_grep_error
+        view_error = state.last_view_error
         grep_views = state.grep_suggested_views
         if event.grep_error:
             grep_error = event.grep_error
         elif state.retrieval_gain_in_round:
             grep_error = ""
+        if event.view_error:
+            view_error = event.view_error
+        elif state.retrieval_gain_in_round:
+            view_error = ""
         if event.grep_suggested_views:
             grep_views = event.grep_suggested_views
         edit_patch_failed = state.edit_patch_failed
@@ -338,6 +321,7 @@ def reduce_run_state(
                 view_last_round_all_duplicate=bool(event.view_all_duplicate),
                 edit_patch_failed=edit_patch_failed,
                 last_grep_error=grep_error,
+                last_view_error=view_error,
                 grep_suggested_views=grep_views,
                 rounds_since_last_edit=rounds_since_last_edit,
                 transition_reason=event.reason or "tool_round_observed",
@@ -502,6 +486,19 @@ def reduce_run_state(
                 transition_reason=terminal.reason,
             ),
             (),
+        )
+
+    if event.kind == "preflight_blocked":
+        edit_patch_failed = state.edit_patch_failed
+        if event.tool_name == "decision_edit":
+            edit_patch_failed = True
+        return (
+            replace(
+                state,
+                edit_patch_failed=edit_patch_failed,
+                transition_reason=event.reason or "preflight_blocked",
+            ),
+            (RunEffect("retry", event.reason),),
         )
 
     if event.kind == "tool_failed":

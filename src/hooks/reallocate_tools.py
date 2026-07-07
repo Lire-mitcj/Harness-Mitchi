@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from src.agent.checklist import checklist_plan_complete
+from src.agent.checklist import checklist_item_open, checklist_plan_complete
 from src.agent.manifest import (
     StepManifest,
     Sufficiency,
+    grep_pending_caller_loads,
     manifest_metrics,
     retrieval_profile,
     stale_needing_refresh,
+    wiring_gap_lines,
     _norm_file,
 )
 from src.agent.run_state import RunPhase
@@ -17,6 +19,7 @@ from src.hooks.retrieval_convergence import (
     PRIMARY_RETRIEVAL_TOOLS,
     RETRIEVAL_TOOLS,
 )
+from src.tools.grep_match_symbols import has_actionable_suggested_views
 
 if TYPE_CHECKING:
     from src.agent.state_assembled_loop import AssembledState
@@ -79,17 +82,13 @@ def _apply_retrieval_saturation(
     no_gain_rounds: int,
     view_last_round_all_duplicate: bool,
     has_open_gaps: bool,
+    wiring_gap_open: bool = False,
 ) -> frozenset[str]:
     """Throttle exploratory retrieval once manifest obligations are satisfied."""
     tools = set(retrieval) - HEAVY_RETRIEVAL_TOOLS
 
     if has_open_gaps:
-        profile = retrieval_profile(manifest) if manifest is not None else None
-        if (
-            view_last_round_all_duplicate
-            and profile is not None
-            and not profile.needs_view
-        ):
+        if view_last_round_all_duplicate and not wiring_gap_open:
             tools -= _VIEW_TOOLS
         return frozenset(tools) & default_tools
 
@@ -122,34 +121,144 @@ def _insufficient_retrieval_tools(
     return profile_tools | (PRIMARY_RETRIEVAL_TOOLS & default_tools)
 
 
+def _has_grounded_observations(manifest: StepManifest | None) -> bool:
+    """True when bootstrap observed memory has at least one SATISFIED/STALE anchor."""
+    if manifest is None:
+        return False
+    return any(
+        item.role == "observed" and item.status in {"SATISFIED", "STALE"}
+        for item in manifest.required_items
+    )
+
+
+def _has_wiring_gap(manifest: StepManifest | None) -> bool:
+    return bool(wiring_gap_lines(manifest)) if manifest is not None else False
+
+
+def _insufficient_allowed_tools(
+    *,
+    task_mode: str,
+    manifest: StepManifest | None,
+    default_tools: frozenset[str],
+    edit_tools: frozenset[str],
+    no_gain_rounds: int,
+    view_last_round_all_duplicate: bool,
+    has_missing: bool,
+    has_stale: bool,
+    grep_suggested_views: tuple[Any, ...] = (),
+) -> frozenset[str]:
+    """INSUFFICIENT phase with saturation and duplicate-round convergence."""
+    sufficiency = str(getattr(manifest, "sufficiency", Sufficiency.INSUFFICIENT))
+
+    if (
+        view_last_round_all_duplicate
+        and task_mode == "edit"
+        and sufficiency in {
+            Sufficiency.SUFFICIENT_FOR_EDIT,
+            Sufficiency.SUFFICIENT_FOR_VERIFY,
+        }
+        and not _has_wiring_gap(manifest)
+    ):
+        return edit_tools or default_tools
+
+    retrieval = _insufficient_retrieval_tools(
+        manifest,
+        default_tools,
+        no_gain_rounds=no_gain_rounds,
+    )
+    if no_gain_rounds == 0 and (has_missing or has_stale):
+        return retrieval or default_tools
+
+    saturated = _apply_retrieval_saturation(
+        retrieval,
+        default_tools,
+        manifest=manifest,
+        no_gain_rounds=no_gain_rounds,
+        view_last_round_all_duplicate=view_last_round_all_duplicate,
+        has_open_gaps=has_missing or has_stale,
+    )
+    if task_mode == "edit" and no_gain_rounds >= 2:
+        if sufficiency in {
+            Sufficiency.SUFFICIENT_FOR_EDIT,
+            Sufficiency.SUFFICIENT_FOR_VERIFY,
+        }:
+            return edit_tools or default_tools
+        # Partial bootstrap: prefer view, but reopen grep when view is stuck
+        # (duplicate replay, no actionable suggested_views, or symbol-not-found loop).
+        if view_last_round_all_duplicate:
+            return (_GREP_TOOLS & default_tools) or default_tools
+        if not has_actionable_suggested_views(grep_suggested_views):
+            return (PRIMARY_RETRIEVAL_TOOLS & default_tools) or default_tools
+        return (_VIEW_TOOLS & default_tools) or default_tools
+    return saturated or default_tools
+
+
+def _recovery_allowed_tools(
+    *,
+    task_mode: str,
+    manifest: StepManifest | None,
+    default_tools: frozenset[str],
+    edit_tools: frozenset[str],
+    has_missing: bool,
+    has_stale: bool,
+    no_gain_rounds: int,
+    view_last_round_all_duplicate: bool,
+    needs_retrieval: bool,
+) -> frozenset[str]:
+    """Edit recovery after validation/tool failures, with duplicate-round convergence."""
+    if not needs_retrieval:
+        return edit_tools or default_tools
+    if view_last_round_all_duplicate and task_mode == "edit":
+        return edit_tools or default_tools
+    if manifest is not None and manifest.missing_items:
+        retrieval = _insufficient_retrieval_tools(
+            manifest,
+            default_tools,
+            no_gain_rounds=no_gain_rounds,
+        )
+        if no_gain_rounds == 0 and not view_last_round_all_duplicate:
+            return frozenset(edit_tools | retrieval) or default_tools
+    else:
+        retrieval = _retrieval_tools_from_profile(
+            manifest,
+            default_tools,
+            allow_heavy=False,
+        )
+    saturated = _apply_retrieval_saturation(
+        retrieval,
+        default_tools,
+        manifest=manifest,
+        no_gain_rounds=no_gain_rounds,
+        view_last_round_all_duplicate=view_last_round_all_duplicate,
+        has_open_gaps=has_missing or has_stale,
+    )
+    return frozenset(edit_tools | saturated) or default_tools
+
+
 def _validation_recovery_tools(
     default_tools: frozenset[str],
     manifest: StepManifest | None,
     *,
     needs_evidence_refresh: bool,
     no_gain_rounds: int,
+    view_last_round_all_duplicate: bool = False,
+    task_mode: str = "edit",
+    has_missing: bool = False,
+    has_stale: bool = False,
 ) -> frozenset[str]:
     """Allow repair, adding retrieval only for manifest-declared gaps."""
     edit, _ = _split_tool_groups(default_tools)
-    allowed = set(edit)
-    if needs_evidence_refresh:
-        if manifest is not None and manifest.missing_items:
-            allowed.update(
-                _insufficient_retrieval_tools(
-                    manifest,
-                    default_tools,
-                    no_gain_rounds=no_gain_rounds,
-                )
-            )
-        else:
-            allowed.update(
-                _retrieval_tools_from_profile(
-                    manifest,
-                    default_tools,
-                    allow_heavy=False,
-                )
-            )
-    return frozenset(allowed) or default_tools
+    return _recovery_allowed_tools(
+        task_mode=task_mode,
+        manifest=manifest,
+        default_tools=default_tools,
+        edit_tools=edit,
+        has_missing=has_missing,
+        has_stale=has_stale,
+        no_gain_rounds=no_gain_rounds,
+        view_last_round_all_duplicate=view_last_round_all_duplicate,
+        needs_retrieval=needs_evidence_refresh,
+    )
 
 
 def _manifest_state(run_state: Any) -> tuple[str, bool, bool]:
@@ -202,6 +311,32 @@ def _edit_allowed(
     return not _blocks_edit(has_missing=has_missing, metrics=metrics)
 
 
+def _checklist_has_open_items(checklist: tuple[str, ...]) -> bool:
+    return bool(checklist) and any(checklist_item_open(item) for item in checklist)
+
+
+def _plan_edits_complete(
+    run_state: Any,
+    *,
+    checklist: tuple[str, ...] = (),
+) -> bool:
+    """True when no manifest/checklist signal says another file still needs editing."""
+    if _checklist_has_open_items(checklist):
+        return False
+    manifest = getattr(run_state, "manifest", None)
+    changes = getattr(run_state, "changes", None)
+    edited_files = getattr(changes, "files", ()) if changes is not None else ()
+    if not edited_files:
+        return False
+    if manifest is not None and manifest.missing_items:
+        return False
+    if _has_wiring_gap(manifest):
+        return False
+    if _external_stale_blocks_edit_burst(manifest, edited_files):
+        return False
+    return True
+
+
 def _post_edit_verification_ready(
     run_state: Any,
     *,
@@ -223,6 +358,8 @@ def _post_edit_verification_ready(
     if getattr(run_state, "edit_patch_failed", False):
         return False
     if checklist_plan_complete(checklist):
+        return True
+    if _plan_edits_complete(run_state, checklist=checklist):
         return True
     rounds = int(getattr(run_state, "rounds_since_last_edit", 0) or 0)
     return rounds >= 1
@@ -302,7 +439,7 @@ def determine_allowed_tools(
       (A) validation / compile failure -> edit (+ manifest-justified refresh)
       (B) manifest failure items     -> edit (+ refresh when stale/missing)
       (C) INSUFFICIENT               -> manifest-justified retrieval only
-      (D) diagnose + sufficient      -> no tools unless stale refresh needed
+      (D) diagnose + sufficient      -> no tools only once phase is RESPONDING
       (E) open manifest gaps         -> retrieval profile (+ edit when allowed)
       (F) saturated edit-ready       -> edit + saturation-throttled retrieval
     """
@@ -317,6 +454,9 @@ def determine_allowed_tools(
     no_gain_rounds = int(getattr(run_state, "retrieval_no_gain_rounds", 0) or 0)
     view_last_round_all_duplicate = bool(
         getattr(run_state, "view_last_round_all_duplicate", False)
+    )
+    grep_suggested_views = tuple(
+        getattr(run_state, "grep_suggested_views", ()) or ()
     )
     has_retrieval_gaps = _has_retrieval_gaps(
         has_missing=has_missing,
@@ -335,31 +475,37 @@ def determine_allowed_tools(
             manifest,
             needs_evidence_refresh=(has_missing or has_stale),
             no_gain_rounds=no_gain_rounds,
+            view_last_round_all_duplicate=view_last_round_all_duplicate,
+            task_mode=task_mode,
+            has_missing=has_missing,
+            has_stale=has_stale,
         )
 
     if manifest is not None and manifest.failure_items:
-        allowed = set(edit_tools)
-        if has_missing or has_stale:
-            allowed.update(
-                _retrieval_tools_from_profile(
-                    manifest,
-                    default_tools,
-                    allow_heavy=False,
-                )
-            )
-        return frozenset(allowed) or default_tools
+        return _recovery_allowed_tools(
+            task_mode=task_mode,
+            manifest=manifest,
+            default_tools=default_tools,
+            edit_tools=edit_tools,
+            has_missing=has_missing,
+            has_stale=has_stale,
+            no_gain_rounds=no_gain_rounds,
+            view_last_round_all_duplicate=view_last_round_all_duplicate,
+            needs_retrieval=has_missing or has_stale,
+        )
 
     if validation_status == "failed":
-        allowed = set(edit_tools)
-        if has_missing or has_stale:
-            allowed.update(
-                _retrieval_tools_from_profile(
-                    manifest,
-                    default_tools,
-                    allow_heavy=False,
-                )
-            )
-        return frozenset(allowed) or default_tools
+        return _recovery_allowed_tools(
+            task_mode=task_mode,
+            manifest=manifest,
+            default_tools=default_tools,
+            edit_tools=edit_tools,
+            has_missing=has_missing,
+            has_stale=has_stale,
+            no_gain_rounds=no_gain_rounds,
+            view_last_round_all_duplicate=view_last_round_all_duplicate,
+            needs_retrieval=has_missing or has_stale,
+        )
 
     # Post-plan verification reopens retrieval, but yields to duplicate-round
     # convergence: once the last view round replayed only cached evidence, the
@@ -380,6 +526,7 @@ def determine_allowed_tools(
         }
         and not has_missing
         and view_last_round_all_duplicate
+        and not _has_wiring_gap(manifest)
         and _edit_allowed(
             task_mode=task_mode,
             sufficiency=sufficiency,
@@ -402,21 +549,30 @@ def determine_allowed_tools(
         return edit_tools or default_tools
 
     if sufficiency == Sufficiency.INSUFFICIENT:
-        return _insufficient_retrieval_tools(
-            manifest,
-            default_tools,
+        return _insufficient_allowed_tools(
+            task_mode=task_mode,
+            manifest=manifest,
+            default_tools=default_tools,
+            edit_tools=edit_tools,
             no_gain_rounds=no_gain_rounds,
-        ) or default_tools
+            view_last_round_all_duplicate=view_last_round_all_duplicate,
+            has_missing=has_missing,
+            has_stale=has_stale,
+            grep_suggested_views=grep_suggested_views,
+        )
 
     if task_mode == "diagnose":
         if has_missing:
-            return (
-                _insufficient_retrieval_tools(
-                    manifest,
-                    default_tools,
-                    no_gain_rounds=no_gain_rounds,
-                )
-                or default_tools
+            return _insufficient_allowed_tools(
+                task_mode=task_mode,
+                manifest=manifest,
+                default_tools=default_tools,
+                edit_tools=edit_tools,
+                no_gain_rounds=no_gain_rounds,
+                view_last_round_all_duplicate=view_last_round_all_duplicate,
+                has_missing=has_missing,
+                has_stale=has_stale,
+                grep_suggested_views=grep_suggested_views,
             )
         if has_stale:
             return (
@@ -427,15 +583,47 @@ def determine_allowed_tools(
                 )
                 or default_tools
             )
+        phase = getattr(run_state, "phase", None)
+        if phase != RunPhase.RESPONDING:
+            if sufficiency == Sufficiency.INSUFFICIENT:
+                return _insufficient_allowed_tools(
+                    task_mode=task_mode,
+                    manifest=manifest,
+                    default_tools=default_tools,
+                    edit_tools=edit_tools,
+                    no_gain_rounds=no_gain_rounds,
+                    view_last_round_all_duplicate=view_last_round_all_duplicate,
+                    has_missing=has_missing,
+                    has_stale=has_stale,
+                    grep_suggested_views=grep_suggested_views,
+                )
+            retrieval = PRIMARY_RETRIEVAL_TOOLS & default_tools
+            return _apply_retrieval_saturation(
+                retrieval,
+                default_tools,
+                manifest=manifest,
+                no_gain_rounds=no_gain_rounds,
+                view_last_round_all_duplicate=view_last_round_all_duplicate,
+                has_open_gaps=False,
+            ) or default_tools
         return frozenset()
 
     profile = retrieval_profile(manifest) if manifest is not None else None
+    has_wiring_gap = _has_wiring_gap(manifest)
+    grep_pending = (
+        grep_pending_caller_loads(manifest, grep_suggested_views)
+        if manifest is not None
+        else ()
+    )
+    has_grep_pending = bool(grep_pending)
     edit_ready_closed = (
         sufficiency in {
             Sufficiency.SUFFICIENT_FOR_EDIT,
             Sufficiency.SUFFICIENT_FOR_VERIFY,
         }
         and not has_missing
+        and not has_wiring_gap
+        and not has_grep_pending
         and not blocks_edit
         and _edit_allowed(
             task_mode=task_mode,
@@ -447,6 +635,7 @@ def determine_allowed_tools(
     if (
         edit_ready_closed
         and not has_stale
+        and not has_grep_pending
         and profile is not None
         and not profile.needs_grep
         and not profile.needs_view
@@ -466,7 +655,8 @@ def determine_allowed_tools(
             manifest=manifest,
             no_gain_rounds=no_gain_rounds,
             view_last_round_all_duplicate=view_last_round_all_duplicate,
-            has_open_gaps=has_stale,
+            has_open_gaps=has_stale or has_wiring_gap,
+            wiring_gap_open=has_wiring_gap,
         )
 
     allowed = set(retrieval)

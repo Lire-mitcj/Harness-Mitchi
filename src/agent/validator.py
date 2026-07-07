@@ -13,6 +13,20 @@ from src.agent.sql_parser import UniversalSqlParser
 
 _VIEW_RE = re.compile(r"(?:\bview\b|view_|_view|视图)", re.IGNORECASE)
 _SQL_RE = re.compile(r"\b(select|from|join|create\s+view|update|insert)\b", re.IGNORECASE)
+_SQL_STATEMENT_RE = re.compile(
+    r"\b(?:"
+    r"select\b.+\bfrom\b|"
+    r"insert\s+into\b|"
+    r"update\s+[\w`.\"]+\s+set\b|"
+    r"delete\s+from\b|"
+    r"create\s+(?:or\s+replace\s+)?(?:view|trigger)\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+_PYTHON_IMPORT_LINE_RE = re.compile(
+    r"^\s*from\s+[\w.]+\s+import\b",
+    re.MULTILINE | re.IGNORECASE,
+)
 _PATCH_BLOCK_RE = re.compile(
     r"<<<<<<< SEARCH\n(?P<search>.*?)\n=======\n(?P<replace>.*?)\n>>>>>>> REPLACE",
     re.DOTALL,
@@ -114,10 +128,14 @@ class CursorValidator:
                 self.sql_parser.parse_file(patched_content, target_file or "<patch>")
             except Exception as exc:  # pragma: no cover - parser should be defensive
                 issues.append(f"sql_syntax_error:{exc}")
-        elif _SQL_RE.search(patched_content):
-            sql_fragments = _patch_sql_fragments(patch_blocks)
-            sql_scope = "\n".join(sql_fragments) if sql_fragments else patched_content
-            if _has_unbalanced_sql_quotes(sql_scope):
+        else:
+            sql_scope = _schema_sql_scope(
+                suffix=suffix,
+                patch_blocks=patch_blocks,
+                patch=patch,
+                patched_content=patched_content,
+            )
+            if sql_scope and _has_unbalanced_sql_quotes(sql_scope):
                 issues.append("sql_syntax_error:unbalanced_quote")
 
         result: dict[str, object] = {"pass": not issues, "issues": issues}
@@ -171,13 +189,14 @@ class CursorValidator:
 
         patch_blocks = _patch_blocks(patch)
         suffix = Path(target_file).suffix.casefold()
-        if suffix == ".sql":
-            sql_fragments = tuple(replace for _search, replace in patch_blocks)
-        else:
-            sql_fragments = _patch_sql_fragments(patch_blocks)
-        sql_scope = "\n".join(sql_fragments) if sql_fragments else patched_content
+        sql_scope = _schema_sql_scope(
+            suffix=suffix,
+            patch_blocks=patch_blocks,
+            patch=patch,
+            patched_content=patched_content,
+        )
 
-        if _SQL_RE.search(sql_scope):
+        if sql_scope and _contains_actionable_sql(sql_scope):
             alias_result = _sql_alias_safety(sql_scope)
             checks["alias_safety"] = alias_result
             if alias_result["checked"] and not alias_result["pass"]:
@@ -445,75 +464,119 @@ def _missing_patch_scope_symbols(
     return sorted(required - patched_symbols)
 
 
+def _contains_actionable_sql(content: str) -> bool:
+    """True when content contains a real SQL statement, not Python import lines."""
+    text = content.strip()
+    if not text:
+        return False
+    if _SQL_STATEMENT_RE.search(text):
+        return True
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if all(_PYTHON_IMPORT_LINE_RE.match(line) for line in lines):
+        return False
+    return bool(_SQL_RE.search(text))
+
+
+def _schema_sql_scope(
+    *,
+    suffix: str,
+    patch_blocks: tuple[tuple[str, str], ...],
+    patch: str,
+    patched_content: str,
+) -> str:
+    """Return SQL text worth schema-checking for this patch target."""
+    if suffix == ".sql":
+        if patch_blocks:
+            return "\n".join(replace for _search, replace in patch_blocks)
+        return patched_content
+
+    fragments = _patch_sql_fragments(patch_blocks)
+    if fragments:
+        return "\n".join(fragments)
+    if not patch_blocks:
+        stripped_patch = patch.strip()
+        if _contains_actionable_sql(stripped_patch):
+            return stripped_patch
+    return ""
+
+
 def _patch_sql_fragments(patch_blocks: tuple[tuple[str, str], ...]) -> tuple[str, ...]:
+    fragments: list[str] = []
+    seen: set[str] = set()
+    for _search, replace in patch_blocks:
+        for fragment in _sql_fragments_from_replace(replace):
+            if fragment not in seen:
+                seen.add(fragment)
+                fragments.append(fragment)
+    return tuple(fragments)
+
+
+def _sql_fragments_from_replace(replace: str) -> list[str]:
     import io
     import textwrap
     import tokenize
 
+    dedented = textwrap.dedent(replace)
     fragments: list[str] = []
-    for _search, replace in patch_blocks:
-        dedented = textwrap.dedent(replace)
+
+    def add_fragment(value: str) -> None:
+        if _contains_actionable_sql(value):
+            fragments.append(value)
+
+    try:
+        tree = ast.parse(dedented)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                add_fragment(node.value)
+    except SyntaxError:
+        pass
+
+    if not fragments:
         try:
-            tree = ast.parse(dedented)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    if _SQL_RE.search(node.value):
-                        fragments.append(node.value)
-        except SyntaxError:
+            tokens = []
+            gen = tokenize.generate_tokens(io.StringIO(dedented).readline)
+            while True:
+                try:
+                    tok = next(gen)
+                    tokens.append(tok)
+                except StopIteration:
+                    break
+                except tokenize.TokenError:
+                    break
+            for tok in tokens:
+                if tok.type in (tokenize.STRING, getattr(tokenize, "FSTRING_MIDDLE", -1)):
+                    val = tok.string
+                    if tok.type == getattr(tokenize, "FSTRING_MIDDLE", -1):
+                        add_fragment(val)
+                    else:
+                        try:
+                            val_eval = ast.literal_eval(val)
+                            if isinstance(val_eval, str):
+                                add_fragment(val_eval)
+                        except Exception:
+                            match = re.search(r"['\"]", val)
+                            if match:
+                                start_idx = match.start()
+                                quote_char = val[start_idx]
+                                if val[start_idx:].startswith(quote_char * 3):
+                                    body = val[start_idx + 3 : -3]
+                                else:
+                                    body = val[start_idx + 1 : -1]
+                                add_fragment(body)
+        except Exception:
             pass
 
+    if not fragments:
+        for match in _TRIPLE_STRING_RE.finditer(replace):
+            add_fragment(match.group("body"))
         if not fragments:
-            try:
-                tokens = []
-                gen = tokenize.generate_tokens(io.StringIO(dedented).readline)
-                while True:
-                    try:
-                        tok = next(gen)
-                        tokens.append(tok)
-                    except StopIteration:
-                        break
-                    except tokenize.TokenError:
-                        break
-                for tok in tokens:
-                    if tok.type in (tokenize.STRING, getattr(tokenize, "FSTRING_MIDDLE", -1)):
-                        val = tok.string
-                        if tok.type == getattr(tokenize, "FSTRING_MIDDLE", -1):
-                            if _SQL_RE.search(val):
-                                fragments.append(val)
-                        else:
-                            try:
-                                val_eval = ast.literal_eval(val)
-                                if isinstance(val_eval, str):
-                                    if _SQL_RE.search(val_eval):
-                                        fragments.append(val_eval)
-                            except Exception:
-                                match = re.search(r"['\"]", val)
-                                if match:
-                                    start_idx = match.start()
-                                    quote_char = val[start_idx]
-                                    if val[start_idx:].startswith(quote_char * 3):
-                                        body = val[start_idx + 3 : -3]
-                                    else:
-                                        body = val[start_idx + 1 : -1]
-                                    if _SQL_RE.search(body):
-                                        fragments.append(body)
-            except Exception:
-                pass
+            string_re = re.compile(r'(?P<quote>[\'"])(?P<body>.*?)(?P=quote)', re.DOTALL)
+            for match in string_re.finditer(replace):
+                add_fragment(match.group("body"))
 
-        if not fragments:
-            for match in _TRIPLE_STRING_RE.finditer(replace):
-                body = match.group("body")
-                if _SQL_RE.search(body):
-                    fragments.append(body)
-            if not fragments:
-                string_re = re.compile(r'(?P<quote>[\'"])(?P<body>.*?)(?P=quote)', re.DOTALL)
-                for match in string_re.finditer(replace):
-                    body = match.group("body")
-                    if _SQL_RE.search(body):
-                        fragments.append(body)
-            if not fragments and _SQL_RE.search(replace):
-                fragments.append(replace)
-    return tuple(fragments)
+    return fragments
 
 
 def _has_unbalanced_sql_quotes(content: str) -> bool:

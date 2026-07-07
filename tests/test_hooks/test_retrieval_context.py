@@ -228,6 +228,28 @@ def test_grep_json_is_not_parsed_as_sql() -> None:
     assert "STRUCTURED SQL SEMANTIC TRUTH" not in result.output
 
 
+def test_before_tool_fact_locking_allows_same_symbol_on_different_file() -> None:
+    from src.hooks.before_tool import inspect_tool_request_async
+    import asyncio
+
+    res = asyncio.run(
+        inspect_tool_request_async(
+            "view_symbol_code",
+            {"target_file": "main.py", "symbol": "build_router"},
+            allowed_tools={"view_symbol_code"},
+            context_anchors_code=[
+                {
+                    "file": "list.py",
+                    "symbol": "build_router",
+                    "span": [16, 358],
+                    "code": "def build_router():\n    pass\n",
+                }
+            ],
+        )
+    )
+    assert res is None
+
+
 def test_before_tool_fact_locking_range_coverage() -> None:
     from src.hooks.before_tool import inspect_tool_request_async
     import asyncio

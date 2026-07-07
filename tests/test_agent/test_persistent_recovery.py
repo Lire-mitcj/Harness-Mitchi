@@ -245,3 +245,90 @@ def test_validator_schema_accepts_order_timeline_trigger(tmp_path: Path) -> None
 
     assert result["pass"] is True
     assert "DEAD_SQL_ALIAS" not in result["issues"]
+
+
+def test_validator_schema_skips_python_import_only_patch(tmp_path: Path) -> None:
+    original = (
+        "from fastapi import APIRouter, HTTPException\n"
+        "from sqlalchemy import text\n"
+        "from sqlalchemy.engine import Engine\n\n"
+        "def build_router(engine: Engine) -> APIRouter:\n"
+        "    router = APIRouter()\n"
+        "    with engine.connect() as conn:\n"
+        '        conn.execute(text("SELECT o.id FROM ticket_order o"), {})\n'
+        "    return router\n"
+    )
+    patched = (
+        "import logging\n"
+        "from fastapi import APIRouter, HTTPException\n"
+        "from sqlalchemy import text\n"
+        "from sqlalchemy.engine import Engine\n"
+        "from sqlalchemy.exc import SQLAlchemyError\n\n"
+        "logger = logging.getLogger(__name__)\n\n"
+        "def _handle_db_error(exc: Exception, route_name: str) -> None:\n"
+        '    logger.exception("Database error in %s", route_name, exc)\n'
+        '    raise HTTPException(status_code=500, detail="db error")\n\n'
+        "def build_router(engine: Engine) -> APIRouter:\n"
+        "    router = APIRouter()\n"
+        "    with engine.connect() as conn:\n"
+        '        conn.execute(text("SELECT o.id FROM ticket_order o"), {})\n'
+        "    return router\n"
+    )
+    patch = (
+        "<<<<<<< SEARCH\n"
+        "from fastapi import APIRouter, HTTPException\n"
+        "from sqlalchemy import text\n"
+        "from sqlalchemy.engine import Engine\n\n"
+        "def build_router(engine: Engine) -> APIRouter:\n"
+        "=======\n"
+        "import logging\n"
+        "from fastapi import APIRouter, HTTPException\n"
+        "from sqlalchemy import text\n"
+        "from sqlalchemy.engine import Engine\n"
+        "from sqlalchemy.exc import SQLAlchemyError\n\n"
+        "logger = logging.getLogger(__name__)\n\n"
+        "def _handle_db_error(exc: Exception, route_name: str) -> None:\n"
+        '    logger.exception("Database error in %s", route_name, exc)\n'
+        '    raise HTTPException(status_code=500, detail="db error")\n\n'
+        "def build_router(engine: Engine) -> APIRouter:\n"
+        ">>>>>>> REPLACE"
+    )
+    validator = CursorValidator(tmp_path)
+
+    result = validator.validate_schema(
+        target_file="list.py",
+        patch=patch,
+        original_content=original,
+        patched_content=patched,
+    )
+
+    assert result["pass"] is True
+    assert "DEAD_SQL_ALIAS" not in result["issues"]
+
+
+def test_validator_schema_still_flags_dead_alias_inside_sql_literal(tmp_path: Path) -> None:
+    original = (
+        "from sqlalchemy import text\n\n"
+        'SQL = "SELECT o.id FROM ticket_order o"\n'
+    )
+    patched = (
+        "from sqlalchemy import text\n\n"
+        'SQL = "SELECT bad_alias.id FROM ticket_order o"\n'
+    )
+    patch = (
+        "<<<<<<< SEARCH\n"
+        'SQL = "SELECT o.id FROM ticket_order o"\n'
+        "=======\n"
+        'SQL = "SELECT bad_alias.id FROM ticket_order o"\n'
+        ">>>>>>> REPLACE"
+    )
+    validator = CursorValidator(tmp_path)
+
+    result = validator.validate_schema(
+        target_file="list.py",
+        patch=patch,
+        original_content=original,
+        patched_content=patched,
+    )
+
+    assert "DEAD_SQL_ALIAS" in result["issues"]

@@ -78,11 +78,6 @@ def inspect_context_window_disk(
                 f"[{start_line}, {end_line}] is empty in {ref_file}."
             )
 
-        if end_line > line_count:
-            return (
-                f"Invalid decision_edit: context_window index {idx} span "
-                f"[{start_line}, {end_line}] exceeds {ref_file} length "
-                f"({line_count} lines)."
-            )
+        # end_line past EOF is allowed — decision_edit clips to file length when reading.
 
     return None

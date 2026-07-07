@@ -7,6 +7,7 @@ from typing import Any
 from pathlib import Path
 
 from src.hooks.preflight.context_window import inspect_context_window_disk
+from src.hooks.preflight.decision_edit_intent import inspect_decision_edit_intent
 from src.hooks.preflight.fact_locking import inspect_fact_locking_async
 from src.hooks.preflight.static_constraints import inspect_static_constraints
 
@@ -65,6 +66,14 @@ async def inspect_tool_request_async(
         tool_name,
         arguments,
         project_root=project_root,
+        manifest=manifest,
+    )
+    if err:
+        return err
+
+    err = inspect_decision_edit_intent(
+        tool_name,
+        arguments,
         manifest=manifest,
     )
     if err:

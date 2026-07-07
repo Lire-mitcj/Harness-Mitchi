@@ -20,16 +20,24 @@ from src.agent.context_assembly import (
     build_runtime_state_block,
     build_turn_context_block,
 )
-from src.agent.manifest import execution_card, manifest_metrics, observations_from_edited_file, project_manifest
+from src.agent.manifest import (
+    Sufficiency,
+    execution_card,
+    manifest_metrics,
+    observations_from_edited_file,
+    project_manifest,
+)
 from src.agent.run_state import (
     ArtifactRefs,
     Evidence,
     RunEvent,
     RunPhase,
     RunState,
+    detect_edit_mode,
     reduce_run_state,
     start_run,
 )
+from src.agent.turn_summary import build_turn_summary, summarize_tool_call
 from src.agent.events import (
     PARALLEL_RETRIEVAL_TOOLS,
     AgentEvent,
@@ -53,6 +61,7 @@ from src.agent.types import (
     system_message,
     tool_message,
 )
+from src.tools.grep_match_symbols import grep_search_fingerprint
 from src.tools.grep_tool_args import prepare_grep_search_args
 from src.hooks.after_tool import apply_after_tool_output_limit
 from src.hooks.post_tool_context import apply_post_tool_context_hook
@@ -103,6 +112,7 @@ class AssembledState:
     core_context_history: tuple[dict[str, Any], ...] = ()
     retrieval_outcome: dict[str, Any] = field(default_factory=dict)
     run_state: RunState = field(default_factory=lambda: start_run("", edit_mode=False))
+    last_core_tools: frozenset[str] = frozenset()
 
     def getMessagesAfterCompactBoundary(self) -> tuple[Message, ...]:
         for idx in range(len(self.messages_history) - 1, -1, -1):
@@ -162,40 +172,11 @@ class ConversationShaper:
         to_keep = messages[fold_end:]
         prior_part = messages[:fold_start]
 
-        summary_lines = ["### TURN SUMMARY"]
-        decisions: list[str] = []
-        reads: list[str] = []
-        edits: list[str] = []
-        errors: list[str] = []
-        for m in to_fold:
-            if m.tool_calls:
-                for tc in m.tool_calls:
-                    if tc.name in PARALLEL_RETRIEVAL_TOOLS:
-                        reads.append(_summarize_tool_call(tc))
-                    elif tc.name == "decision_edit":
-                        edits.append(_summarize_tool_call(tc))
-            if m.role == "assistant" and m.content.strip() and "[CONTEXT COLLAPSE" not in m.content:
-                normalized = " ".join(m.content.split())
-                if _is_process_only_intent(normalized):
-                    continue
-                if len(normalized) <= 400:
-                    decisions.append(normalized)
-                else:
-                    sentences = [part.strip() for part in re.split(r"(?<=[。！？.!?])\s+", normalized) if part.strip()]
-                    concise = next((part for part in reversed(sentences) if len(part) <= 400), "")
-                    decisions.append(concise or "执行已记录的工具调用与 checklist")
-            elif m.role == "tool":
-                reads.extend(re.findall(r"(?:file|anchor):\s*`?([^`\s]+)", m.content))
-                if "Error:" in m.content or "failed" in m.content.lower():
-                    errors.append(" ".join(m.content.split())[:300])
-        summary_lines.extend([
-            f"- 决策：{decisions[-1] if decisions else '沿用当前计划'}",
-            f"- 已读取：{', '.join(dict.fromkeys(reads)) if reads else '无'}",
-            f"- 编辑：{', '.join(dict.fromkeys(edits)) if edits else '无'}",
-            f"- 验证/错误：{errors[-1] if errors else '无'}",
-            "- 下一步：严格依据 RUN STATE 的缺失证据行动",
-        ])
-        summary_text = "\n".join(summary_lines)
+        summary_text = build_turn_summary(
+            to_fold,
+            run_state=state.run_state,
+            tools_available=state.last_core_tools or None,
+        )
 
         summary_msg = Message(role="system", content=summary_text)
         boundary_msg = Message(role="system", content="[COMPACT_BOUNDARY] Context compressed.")
@@ -215,16 +196,6 @@ class RuntimeShaper:
         return active_files
 
 
-def _is_process_only_intent(text: str) -> bool:
-    lowered = text.casefold().strip()
-    patterns = (
-        r"^(?:let me|i need to)\s+(?:first\s+)?(?:examine|look|read|analy[sz]e|inspect)",
-        r"\b(?:read|look|examine)\s+more\s+thoroughly\b",
-        r"\bunderstand\s+the\s+(?:full|current)\s+(?:picture|state|system)\b",
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns)
-
-
 def _retrieval_tool_signal(
     tc: ToolCall,
     result: Any,
@@ -237,7 +208,7 @@ def _retrieval_tool_signal(
         if arguments is not None
         else tc
     )
-    summary = _summarize_tool_call(call)
+    summary = summarize_tool_call(call)
     status = retrieval_tool_signal_status(tc.name, result)
     if status != "failed":
         return f"{summary} -> {status}"
@@ -303,40 +274,6 @@ def _observe_grep_round(
         return (round_grep_error or err), round_suggested_views
     views = (result.metadata or {}).get("suggested_views")
     return round_grep_error, _merge_suggested_views(round_suggested_views, views)
-
-
-def _summarize_tool_call(tc: ToolCall) -> str:
-    args = tc.arguments or {}
-    if tc.name == "view_symbol_code":
-        target = args.get("target_file") or args.get("file") or "unknown"
-        symbol = args.get("symbol") or args.get("name")
-        if symbol:
-            return f"view_symbol_code({target}::{symbol})"
-        return f"view_symbol_code({target})"
-    if tc.name == "grep_search":
-        pattern = str(args.get("pattern") or "").strip()
-        path = str(args.get("path") or ".").strip()
-        include = str(args.get("include") or "").strip()
-        scope = path if not include else f"{path}, include={include}"
-        patterns = args.get("patterns") or []
-        if isinstance(patterns, list) and patterns:
-            preview = ", ".join(repr(str(item)) for item in patterns[:4])
-            if len(patterns) > 4:
-                preview += ", ..."
-            return f"grep_search([{preview}] @ {scope})"
-        return f"grep_search({pattern!r} @ {scope})"
-    if tc.name == "codebase_retrieve":
-        query = str(args.get("query") or "").strip()
-        if len(query) > 140:
-            query = query[:137] + "..."
-        return f"codebase_retrieve({query!r})"
-    if tc.name == "decision_edit":
-        target = args.get("target_file") or "unknown"
-        intent = " ".join(str(args.get("intent") or "").split())
-        if len(intent) > 160:
-            intent = intent[:157] + "..."
-        return f"decision_edit({target}: {intent})" if intent else f"decision_edit({target})"
-    return tc.name
 
 
 def _loaded_code_anchor_block(context_block: str) -> str:
@@ -998,6 +935,20 @@ def _fact_lock_replay_result(
     )
 
 
+def _filter_grounded_slots(
+    slots: tuple[str, ...] | list[str],
+    refs: ArtifactRefs,
+) -> tuple[str, ...]:
+    """Grep locators must not satisfy schema slots without a verbatim schema anchor."""
+    schema_only = frozenset({"relevant_schema"})
+    filtered: list[str] = []
+    for slot in slots:
+        if slot in schema_only and not refs.schemas:
+            continue
+        filtered.append(str(slot))
+    return tuple(filtered)
+
+
 def _run_evidence_event(result: ToolResult) -> RunEvent | None:
     """Translate tool evidence metadata into the reducer's immutable event."""
     metadata = result.metadata or {}
@@ -1031,6 +982,7 @@ def _run_evidence_event(result: ToolResult) -> RunEvent | None:
 
     evidence: list[Evidence] = []
     grounded_slots = payload.get("grounded_slots") or ()
+    grounded_slots = _filter_grounded_slots(grounded_slots, refs)
     if available_refs:
         source = raw_items[0]
         artifact_id = next(iter(available_refs))
@@ -1247,17 +1199,72 @@ def _format_raw_anchor(item: dict[str, Any]) -> str:
     return f"{header}\n```python\n{code}\n```"
 
 
-def _build_deduped_loaded_anchors_block(search_cache: dict[str, Any]) -> str:
+def _norm_anchor_file(file: str | None) -> str:
+    return str(file or "").replace("\\", "/").lstrip("./")
+
+
+def _priority_anchor_files(
+    search_cache: dict[str, Any],
+    *,
+    task_text: str = "",
+    manifest: Any = None,
+) -> frozenset[str]:
+    """Files whose anchors must stay visible when edit_ready (not just last projections)."""
+    priority: set[str] = set()
+
+    if manifest is not None:
+        for item in getattr(manifest, "required_items", ()) or ():
+            if getattr(item, "status", None) in {"SATISFIED", "STALE"} and getattr(item, "file", None):
+                priority.add(_norm_anchor_file(item.file))
+
+    for match in re.finditer(r"[\w./-]+\.py", task_text):
+        priority.add(_norm_anchor_file(match.group(0)))
+
+    raw_anchors = search_cache.get("raw_evidence_store") or []
+    if isinstance(raw_anchors, list):
+        evidence_files = {
+            _norm_anchor_file(str(item.get("file")))
+            for item in raw_anchors
+            if isinstance(item, dict) and item.get("file")
+        }
+        if len(evidence_files) >= 2:
+            priority.update(evidence_files)
+
+    return frozenset(priority)
+
+
+def _build_deduped_loaded_anchors_block(
+    search_cache: dict[str, Any],
+    *,
+    edit_ready: bool = False,
+    task_text: str = "",
+    manifest: Any = None,
+) -> str:
     """Build one deduplicated loaded-code section for the Core LLM prompt."""
     seen: set[tuple[Any, ...]] = set()
     blocks: list[str] = []
     projected_symbols: set[str] = set()
+    priority_files = _priority_anchor_files(
+        search_cache,
+        task_text=task_text,
+        manifest=manifest,
+    )
 
     projections = search_cache.get("symbol_projections") or []
     if isinstance(projections, list):
-        for item in projections[-2:]:
-            if not isinstance(item, dict):
-                continue
+        if edit_ready and priority_files:
+            selected = [
+                item
+                for item in projections
+                if isinstance(item, dict)
+                and _norm_anchor_file(str(item.get("file") or "")) in priority_files
+            ]
+            if not selected:
+                selected = list(projections)
+        else:
+            selected = list(projections[-2:])
+
+        for item in selected:
             key = _anchor_key(item)
             if key in seen:
                 continue
@@ -1275,9 +1282,13 @@ def _build_deduped_loaded_anchors_block(search_cache: dict[str, Any]) -> str:
         for item in raw_anchors:
             if not isinstance(item, dict):
                 continue
+            file_path = _norm_anchor_file(str(item.get("file") or ""))
+            if edit_ready and priority_files and file_path not in priority_files:
+                continue
             sym = item.get("symbol")
             if sym and str(sym) in projected_symbols:
-                continue
+                if not (edit_ready and priority_files and file_path in priority_files):
+                    continue
             key = _anchor_key(item)
             if key in seen:
                 continue
@@ -1608,6 +1619,24 @@ class StateAssembledLoop:
             return res
         finally:
             await queue.put(None)
+
+    def _repo_map_snapshot(self) -> Any:
+        context_builder = getattr(self, "context_builder", None)
+        if context_builder is None:
+            return None
+        service = getattr(context_builder, "repo_map_service", None)
+        if service is None:
+            return None
+        try:
+            return getattr(service, "map", None)
+        except Exception:
+            return None
+
+    def _inject_grep_execute_args(self, tool_args: dict[str, Any]) -> None:
+        tool_args["_project_root"] = self.harness.project_root
+        repo_map = self._repo_map_snapshot()
+        if repo_map is not None:
+            tool_args["_repo_map"] = repo_map
 
     def get_context_records(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._core_context_records)
@@ -2129,7 +2158,7 @@ class StateAssembledLoop:
         if tc.name == "decision_edit":
             self._dispatch_run_event(
                 RunEvent(
-                    "tool_failed",
+                    "preflight_blocked",
                     tool_name="decision_edit",
                     reason=err,
                 )
@@ -2315,14 +2344,7 @@ class StateAssembledLoop:
 
         system_prompt = self.context_assembly.load_system_prompt()
         user_context = user_msg
-        edit_mode = bool(
-            re.search(
-                r"\b(?:fix|implement|change|edit|add|remove|refactor|supplement|support|optimize|adjust|create|build)\b|"
-                r"修复|修改|实现|新增|删除|重构|补充|完善|加上|添加|引入|支持|调整|优化|创建|构建|开发",
-                user_msg,
-                re.IGNORECASE,
-            )
-        )
+        edit_mode = detect_edit_mode(user_msg)
         self._run_events = []
         self._retrieval_history = ()
         self._grep_search_history = []
@@ -2485,6 +2507,10 @@ class StateAssembledLoop:
                 has_compile_error=bool(self._validation_error()),
                 validation_error=self._validation_error(),
             )
+            self.state = replace(
+                self.state,
+                last_core_tools=self._current_step_tools,
+            )
             self._trace_manifest(
                 self.state.run_state.manifest,
                 allowed_tools=self._current_step_tools,
@@ -2504,7 +2530,17 @@ class StateAssembledLoop:
             if ready_final:
                 context_block = _response_evidence_summary(self.state)
             else:
-                context_block = _build_deduped_loaded_anchors_block(projected_search_cache)
+                manifest = self.state.run_state.manifest
+                edit_ready = manifest.sufficiency in {
+                    Sufficiency.SUFFICIENT_FOR_EDIT,
+                    Sufficiency.SUFFICIENT_FOR_VERIFY,
+                }
+                context_block = _build_deduped_loaded_anchors_block(
+                    projected_search_cache,
+                    edit_ready=edit_ready,
+                    task_text=self._task_text,
+                    manifest=manifest,
+                )
 
             rules_block = (
                 f"\n\n### PROJECT RULES & USER CONTEXT ###\n{shaped_rules_text}\n"
@@ -2534,7 +2570,9 @@ class StateAssembledLoop:
                         self.state.run_state.retrieval_no_gain_rounds
                     ),
                     task_slots=sorted(self.state.run_state.evidence.required),
+                    task_text=self._task_text,
                     last_grep_error=self.state.run_state.last_grep_error,
+                    last_view_error=self.state.run_state.last_view_error,
                     grep_suggested_views=self.state.run_state.grep_suggested_views,
                     edit_burst=bool(self.state.run_state.changes.files)
                     and self.state.run_state.validation.status == "passed"
@@ -2794,7 +2832,9 @@ class StateAssembledLoop:
                 run_state=replace(run_state, edit_patch_failed=False),
             )
         if name == "grep_search" and result.success:
-            path = arguments.get("path", ".")
+            path = str(arguments.get("path") or ".").strip() or "."
+            include = arguments.get("include")
+            mode = str(arguments.get("mode") or "default").strip() or "default"
             has_compile_error = bool(self._validation_error())
             searched = list(
                 dict.fromkeys(
@@ -2803,6 +2843,26 @@ class StateAssembledLoop:
                     or ([arguments.get("pattern")] if arguments.get("pattern") else [])
                 )
             )
+            metadata = result.metadata or {}
+            is_empty = bool(metadata.get("empty_result"))
+            if not is_empty:
+                try:
+                    payload = json.loads(result.output)
+                    if isinstance(payload, dict):
+                        is_empty = (
+                            int(payload.get("returned_matches") or 0) == 0
+                            and int(payload.get("total_matches") or 0) == 0
+                        )
+                except Exception:
+                    is_empty = False
+            fingerprint = str(metadata.get("search_fingerprint") or "")
+            if not fingerprint and searched:
+                fingerprint = grep_search_fingerprint(
+                    searched,
+                    path=path,
+                    include=str(include) if include else None,
+                    mode=mode,
+                )
             novelty = self._last_novelty_value
             for pattern in searched:
                 if not str(pattern or "").strip():
@@ -2811,7 +2871,17 @@ class StateAssembledLoop:
                     str(pattern), path, self._grep_search_history, has_compile_error
                 )
                 novelty = arguments.get("_novelty_score", evaluation["novelty"])
-                self._grep_search_history.append({"file": path, "pattern": str(pattern)})
+                entry: dict[str, Any] = {
+                    "file": path,
+                    "pattern": str(pattern),
+                    "patterns": searched,
+                    "include": include,
+                    "mode": mode,
+                    "fingerprint": fingerprint,
+                }
+                if is_empty:
+                    entry["empty"] = True
+                self._grep_search_history.append(entry)
                 self._last_novelty_value = novelty
             uncertainty = 1.0 if has_compile_error else 0.2
             retrieval_weight = 0.3 * novelty + 0.7 * uncertainty
@@ -2865,6 +2935,7 @@ class StateAssembledLoop:
         retrieval_round_results: list[tuple[str, ToolResult]] = []
         first_error_to_structure = None
         round_grep_error = ""
+        round_view_error = ""
         round_suggested_views: list[dict[str, Any]] = []
         edit_applied_this_round = False
 
@@ -2913,6 +2984,10 @@ class StateAssembledLoop:
                     tool_cache = _search_cache_view(self.state)
                     if tool_cache:
                         tool_args["_search_cache"] = tool_cache
+                    if tc.name == "decision_edit":
+                        tool_args["_manifest"] = self.state.run_state.manifest
+                    if tc.name == "grep_search":
+                        self._inject_grep_execute_args(tool_args)
 
                     # Run preflight constraints and convergence checks
                     embedder_instance = getattr(self, "_embedder", None)
@@ -2983,6 +3058,8 @@ class StateAssembledLoop:
                             )
                             success = True
                         else:
+                            if repo_map is not None and tc.name in {"decision_edit", "grep_search"}:
+                                tool_args["_repo_map"] = repo_map
                             result = await self.tools.call(tc.name, tool_args)
                             result = apply_after_tool_output_limit(tc.name, result)
                             result = apply_post_tool_context_hook(tc.name, tc.arguments, result)
@@ -3174,6 +3251,8 @@ class StateAssembledLoop:
                 tool_cache = _search_cache_view(self.state)
                 if tool_cache:
                     tool_args["_search_cache"] = tool_cache
+                if tc.name == "grep_search":
+                    self._inject_grep_execute_args(tool_args)
 
                 preflight_err = await self._inspect_tool_preflight_async(tc.name, tool_args)
                 if preflight_err:
@@ -3350,6 +3429,8 @@ class StateAssembledLoop:
                 if not result.success:
                     if not first_error_to_structure:
                         first_error_to_structure = result.error or result.output
+                    if tc.name == "view_symbol_code":
+                        round_view_error = str(result.error or result.output or "")
 
                 if result.success:
                     if result.metadata:
@@ -3533,6 +3614,7 @@ class StateAssembledLoop:
             ),
             view_all_duplicate=view_round_all_duplicate(retrieval_round_results),
             grep_error=round_grep_error,
+            view_error=round_view_error,
             grep_suggested_views=tuple(round_suggested_views),
             edit_applied_this_round=edit_applied_this_round,
         ))

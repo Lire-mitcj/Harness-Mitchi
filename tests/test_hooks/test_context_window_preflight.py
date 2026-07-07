@@ -32,6 +32,28 @@ async def test_context_window_rejects_span_beyond_file_length(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_context_window_allows_end_past_eof(tmp_path: Path) -> None:
+    lines = "\n".join(f"line{i}" for i in range(1, 11))
+    (tmp_path / "list.py").write_text(lines + "\n", encoding="utf-8")
+
+    err = await inspect_tool_request_async(
+        "decision_edit",
+        {
+            "target_file": "list.py",
+            "intent": "Patch middle section",
+            "focus_symbols": ["handler"],
+            "context_window": [
+                {"file": "list.py", "span": [2, 500], "reason": "body"},
+            ],
+        },
+        allowed_tools={"decision_edit"},
+        project_root=tmp_path,
+    )
+
+    assert err is None
+
+
+@pytest.mark.asyncio
 async def test_context_window_allows_anchor_span_without_focus_symbol(tmp_path: Path) -> None:
     from src.agent.manifest import EvidenceItem, StepManifest
 

@@ -24,6 +24,182 @@ class CursorExecutor:
         success, error = self.patch_applier.apply_patch(file_path, patch)
         return ExecutionResult(success=success, file=file_path, error=error)
 
+    async def execute_batched_transaction(
+        self,
+        target_file: str,
+        patches: list[str],
+        validator: CursorValidator,
+        *,
+        step: int = 1,
+        layer1: Layer1Metrics | None = None,
+        user_intent: str = "",
+    ) -> tuple[ExecutionResult, ValidationResult, FullPipelineMetrics]:
+        """Apply multiple patches sequentially, then validate once (rollback all on failure)."""
+        layer1 = layer1 or Layer1Metrics()
+        non_empty_patches = [patch for patch in patches if patch and patch.strip()]
+        if not non_empty_patches:
+            execution = ExecutionResult(
+                success=False,
+                file=target_file,
+                error="no patches to apply",
+            )
+            validation = ValidationResult(
+                success=False,
+                error="validation skipped: no patches",
+            )
+            return (
+                execution,
+                validation,
+                _metrics(
+                    step=step,
+                    target_file=target_file,
+                    layer1=layer1,
+                    patch_correctness=0.0,
+                    execution_success=0.0,
+                    code_diff_correctness=0.0,
+                    task_passed=False,
+                    committed=False,
+                    observation="no patches to apply",
+                    validation=_validation_payload(validation),
+                ),
+            )
+
+        async with CursorHarnessContext(self.project_root, target_file) as harness:
+            target_path = (self.project_root / target_file).resolve()
+            try:
+                original_content = target_path.read_text(encoding="utf-8")
+            except OSError:
+                original_content = ""
+
+            for patch in non_empty_patches:
+                success, error = await asyncio.to_thread(
+                    self.patch_applier.apply_patch, target_file, patch
+                )
+                if not success:
+                    execution = ExecutionResult(
+                        success=False,
+                        file=target_file,
+                        error=error,
+                        original_content=original_content,
+                        rolled_back=True,
+                    )
+                    validation = ValidationResult(
+                        success=False,
+                        error="validation skipped due to patch failure",
+                    )
+                    return (
+                        execution,
+                        validation,
+                        _metrics(
+                            step=step,
+                            target_file=target_file,
+                            layer1=layer1,
+                            patch_correctness=0.0,
+                            execution_success=0.0,
+                            code_diff_correctness=0.0,
+                            task_passed=False,
+                            committed=harness.committed,
+                            observation=error,
+                            validation=_validation_payload(validation),
+                        ),
+                    )
+
+            try:
+                patched_content = target_path.read_text(encoding="utf-8")
+            except OSError:
+                patched_content = ""
+
+            original_lines = original_content.splitlines(keepends=True)
+            patched_lines = patched_content.splitlines(keepends=True)
+            diff_lines = list(
+                difflib.unified_diff(
+                    original_lines,
+                    patched_lines,
+                    fromfile=f"a/{target_file}",
+                    tofile=f"b/{target_file}",
+                )
+            )
+            if diff_lines:
+                diff_text = "".join(diff_lines)
+                console = Console()
+                console.print(
+                    Panel(
+                        Syntax(diff_text, "diff", theme="monokai", line_numbers=False),
+                        title=f"[bold yellow]⚡ Applying Batched Edit to {target_file}[/]",
+                        title_align="left",
+                        border_style="yellow",
+                    )
+                )
+
+            combined_patch = "\n".join(non_empty_patches)
+            val_result = await validator.validate(
+                target_file=target_file,
+                patch=combined_patch,
+                original_content=original_content,
+                patched_content=patched_content,
+                user_intent=user_intent,
+            )
+            validation_decision = _effective_decision(val_result)
+            if validation_decision != "commit":
+                truncated_error = self._truncate_error(val_result.error)
+                execution = ExecutionResult(
+                    success=True,
+                    file=target_file,
+                    original_content=original_content,
+                    attempted_content=patched_content,
+                    rolled_back=True,
+                )
+                validation = ValidationResult(
+                    success=False,
+                    error=truncated_error,
+                    ast=val_result.ast,
+                    semantic=val_result.semantic,
+                    execution=val_result.execution,
+                    decision=validation_decision,
+                    score=val_result.score,
+                )
+                return (
+                    execution,
+                    validation,
+                    _metrics(
+                        step=step,
+                        target_file=target_file,
+                        layer1=layer1,
+                        patch_correctness=1.0,
+                        execution_success=_execution_score(val_result),
+                        code_diff_correctness=_ast_score(val_result),
+                        task_passed=False,
+                        committed=harness.committed,
+                        observation=truncated_error,
+                        validation=_validation_payload(validation),
+                    ),
+                )
+
+            harness.commit()
+            execution = ExecutionResult(
+                success=True,
+                file=target_file,
+                original_content=original_content,
+                attempted_content=patched_content,
+                rolled_back=False,
+            )
+            return (
+                execution,
+                val_result,
+                _metrics(
+                    step=step,
+                    target_file=target_file,
+                    layer1=layer1,
+                    patch_correctness=1.0,
+                    execution_success=_execution_score(val_result),
+                    code_diff_correctness=_ast_score(val_result),
+                    task_passed=True,
+                    committed=harness.committed,
+                    observation="batched validation decision: commit",
+                    validation=_validation_payload(val_result),
+                ),
+            )
+
     async def execute_transaction(
         self,
         target_file: str,

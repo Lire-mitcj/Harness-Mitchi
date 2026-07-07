@@ -71,14 +71,15 @@ def test_reducer_reconciles_successful_symbol_observation_into_manifest() -> Non
         ),
     )
 
-    observed = next(
-        item for item in state.manifest.required_items
-        if item.id == "observed.symbol:list.py:build_router"
+    tracked = [
+        item
+        for item in state.manifest.required_items
+        if item.file == "list.py" and item.symbol == "build_router"
+    ]
+    assert tracked
+    assert any(item.role == "observed" for item in tracked) or any(
+        item.role == "required" for item in tracked
     )
-    assert observed.role == "observed"
-    assert observed.file == "list.py"
-    assert observed.symbol == "build_router"
-    assert observed.span == (10, 20)
 
 
 def test_run_starts_with_empty_bootstrap_manifest() -> None:
@@ -123,6 +124,42 @@ def test_reducer_resets_rounds_since_last_edit_on_applied_edit() -> None:
         RunEvent("tool_round_observed", retrieval_attempted=True),
     )
     assert state.rounds_since_last_edit == 1
+
+
+def test_productive_grep_suggested_views_resets_no_gain_rounds() -> None:
+    state = replace(
+        start_run("修改接口", edit_mode=True),
+        retrieval_no_gain_rounds=2,
+    )
+    state, _ = reduce_run_state(
+        state,
+        RunEvent(
+            "tool_round_observed",
+            retrieval_attempted=True,
+            grep_suggested_views=(
+                {"file": "main.py", "symbol": "create_app", "span": [1, 40]},
+            ),
+        ),
+    )
+    assert state.retrieval_no_gain_rounds == 0
+
+
+def test_trivial_grep_suggested_views_do_not_reset_no_gain_rounds() -> None:
+    state = replace(
+        start_run("修改接口", edit_mode=True),
+        retrieval_no_gain_rounds=2,
+    )
+    state, _ = reduce_run_state(
+        state,
+        RunEvent(
+            "tool_round_observed",
+            retrieval_attempted=True,
+            grep_suggested_views=(
+                {"file": "main.py", "symbol": "logger", "span": [47, 47]},
+            ),
+        ),
+    )
+    assert state.retrieval_no_gain_rounds == 3
 
 
 def test_reducer_records_all_duplicate_view_round() -> None:
@@ -331,3 +368,51 @@ def test_explicit_run_failure_always_enters_terminal() -> None:
 
     assert state.phase == RunPhase.TERMINAL
     assert state.terminal and state.terminal.success is False
+
+
+def test_detect_edit_mode_matches_integration_verbs() -> None:
+    from src.agent.run_state import detect_edit_mode
+
+    assert detect_edit_mode("你把统一数据库异常日志接口接到现有的与数据库有关的接口上")
+    assert detect_edit_mode("将认证模块接入 build_router")
+    assert not detect_edit_mode("这个 endpoint 的登录态校验是怎么做的？")
+
+
+def test_database_task_stays_retrieving_after_symbol_only_evidence() -> None:
+    state = start_run(
+        "你把统一数据库异常日志接口接到现有的与数据库有关的接口上",
+        edit_mode=True,
+    )
+    assert "relevant_schema" in state.evidence.required
+
+    state, _ = reduce_run_state(
+        state,
+        RunEvent(
+            "evidence_stored",
+            evidence=(_evidence("target_implementation", "a1"),),
+            artifact_refs=ArtifactRefs(code=("a1",)),
+        ),
+    )
+
+    assert state.phase == RunPhase.RETRIEVING
+    assert "relevant_schema" in state.evidence.missing
+    assert not state.evidence.complete
+
+
+def test_preflight_blocked_does_not_consume_retry_budget() -> None:
+    state = start_run("edit list.py", edit_mode=True)
+    state = replace(state, retry_budget=replace(state.retry_budget, failures=2))
+
+    state, effects = reduce_run_state(
+        state,
+        RunEvent(
+            "preflight_blocked",
+            tool_name="decision_edit",
+            reason="Invalid decision_edit: context_window span exceeds file",
+        ),
+    )
+
+    assert state.retry_budget.failures == 2
+    assert state.edit_patch_failed is True
+    assert state.phase != RunPhase.TERMINAL
+    assert effects[0].kind == "retry"

@@ -19,17 +19,148 @@ from src.tools.base import Tool
 
 log = logging.getLogger(__name__)
 
+_SPAN_MERGE_GAP = 5
+_CHARS_PER_TIMEOUT_SECOND = 800.0
+_TIMEOUT_PER_CONTEXT_SPAN = 12.0
+_MAX_DECISION_TIMEOUT = 300.0
+_MAX_FAILED_PATCH_FEEDBACK_CHARS = 6000
+
+
+def _norm_file_path(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
+
+
+def merge_context_spans(
+    spans: list[tuple[str, int, int]],
+    *,
+    gap: int = _SPAN_MERGE_GAP,
+) -> list[tuple[str, int, int]]:
+    """Merge overlapping or nearby spans on the same file (reduces window count)."""
+    if not spans:
+        return []
+
+    canonical_path: dict[str, str] = {}
+    by_file: dict[str, list[tuple[int, int]]] = {}
+    file_order: list[str] = []
+    for file_path, start, end in spans:
+        norm = _norm_file_path(file_path)
+        canonical_path.setdefault(norm, file_path)
+        if norm not in by_file:
+            by_file[norm] = []
+            file_order.append(norm)
+        by_file[norm].append((start, end))
+
+    merged: list[tuple[str, int, int]] = []
+    for norm in file_order:
+        intervals = sorted(by_file[norm])
+        current_start, current_end = intervals[0]
+        for start, end in intervals[1:]:
+            if start <= current_end + gap + 1:
+                current_end = max(current_end, end)
+            else:
+                merged.append((canonical_path[norm], current_start, current_end))
+                current_start, current_end = start, end
+        merged.append((canonical_path[norm], current_start, current_end))
+    return merged
+
+
+def decision_timeout_for_context(
+    base_timeout: float,
+    *,
+    context_chars: int,
+    span_count: int,
+) -> float:
+    """First-token (connect) deadline for decision_edit streaming.
+
+    Active streams are bounded by per-chunk idle timeout on the LLM client,
+    not this value as a total wall-clock cap.
+    """
+    scaled = (
+        base_timeout
+        + (max(context_chars, 0) / _CHARS_PER_TIMEOUT_SECOND)
+        + (max(span_count, 0) * _TIMEOUT_PER_CONTEXT_SPAN)
+    )
+    return min(_MAX_DECISION_TIMEOUT, max(base_timeout, scaled))
+
+
+def is_mechanical_patch_error(error: str) -> bool:
+    """True when patch applier rejected the patch without changing the file."""
+    if not error:
+        return False
+    return error.startswith(("mismatch:", "invalid_patch:"))
+
+
+def _patch_retry_hint(error: str) -> str:
+    if "overlaps another block" in error:
+        return (
+            "Each SEARCH/REPLACE block must target disjoint line ranges. "
+            "Shrink SEARCH to 3–8 lines per site; never reuse the same lines in two blocks."
+        )
+    if error.startswith("mismatch:"):
+        return (
+            "SEARCH must be verbatim code from CURRENT_CONTEXT (before edit). "
+            "Put new code only in REPLACE; split independent sites into non-overlapping blocks."
+        )
+    if "patch produces no change" in error:
+        return "REPLACE must differ from SEARCH; ensure the patch actually edits the file."
+    if "expected SEARCH/REPLACE blocks only" in error:
+        return "Return only SEARCH/REPLACE marker blocks in patch; no prose or Markdown fences."
+    return (
+        "Regenerate action=edit with corrected SEARCH/REPLACE blocks using CURRENT_CONTEXT only."
+    )
+
+
+def build_patch_retry_state_text(
+    base_state_text: str,
+    *,
+    attempt: int,
+    max_attempts: int,
+    error: str,
+    failed_patch: str,
+) -> str:
+    """Augment CURRENT_STATE for an inner decision_edit retry."""
+    patch_excerpt = failed_patch.strip()
+    if len(patch_excerpt) > _MAX_FAILED_PATCH_FEEDBACK_CHARS:
+        patch_excerpt = (
+            patch_excerpt[:_MAX_FAILED_PATCH_FEEDBACK_CHARS]
+            + "\n... (truncated failed patch)"
+        )
+    return (
+        f"{base_state_text.strip()}\n\n"
+        f"PATCH_RETRY_FEEDBACK (attempt {attempt + 1}/{max_attempts})\n"
+        f"The previous patch failed to apply:\n```\n{error.strip()}\n```\n"
+        f"Failed patch excerpt:\n```\n{patch_excerpt}\n```\n"
+        f"Fix: {_patch_retry_hint(error)}\n"
+        "Return a new action=edit JSON with corrected patch only."
+    )
+
+
+def _build_state_text(
+    target_file: str,
+    intent: str,
+    focus_symbols: list[str],
+) -> str:
+    """Pass Core plan step through to Decision LLM without internal re-batching."""
+    lines = [
+        f"Apply the following modification intent to target file `{target_file}`:",
+        intent.strip(),
+    ]
+    symbols = [str(symbol).strip() for symbol in focus_symbols if str(symbol).strip()]
+    if symbols:
+        lines.append(f"\nFocus symbols for this plan step: {', '.join(symbols)}")
+    return "\n".join(lines)
+
 
 class DecisionEditTool(Tool):
     name = "decision_edit"
     description = (
-        "Apply a scoped edit to exactly one file when STEP EVIDENCE shows edit_ready:yes "
-        "and the change is grounded in loaded code anchors. Generates a SEARCH/REPLACE "
-        "patch via the Decision LLM, then runs lint/tests/syntax checks; rolls back on "
-        "failure. Required: target_file, intent, focus_symbols, and context_window "
-        "entries with frozen file+span evidence from loaded anchors. One call modifies "
-        "one file only—do not batch multi-file changes. Do NOT use to inspect, grep, "
-        "or load code. Do not call in parallel with retrieval reads the patch depends on."
+        "Apply edits to exactly one file when STEP EVIDENCE shows edit_ready:yes "
+        "and the change is grounded in loaded code anchors. One call per plan step "
+        "and target file: pass intent, focus_symbols, and context_window from Core; "
+        "Decision LLM consumes them in a single patch generation and validate pass. "
+        "Split multi-step work across multiple decision_edit calls at the Core/plan "
+        "layer — do not expect internal symbol batching inside this tool. "
+        "Do NOT use to inspect, grep, or load code."
     )
     risk_level = RiskLevel.MODERATE
     parameters = {
@@ -41,12 +172,18 @@ class DecisionEditTool(Tool):
             },
             "intent": {
                 "type": "string",
-                "description": "对单个目标文件进行修改的意图与要求（如修改逻辑、添加功能等）。修订意图必须局限在当前 target_file 内部。"
+                "description": (
+                    "本步（当前 plan 条目）对目标文件的修改意图，只描述这一步要做什么，"
+                    "不要把多步 plan 的其他步骤写进来。多步任务由 Core 拆成多次 decision_edit。"
+                ),
             },
             "focus_symbols": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "本次修改重点关注/涉及的符号列表（如函数名、类名）。"
+                "description": (
+                    "本步要改的符号名（函数/类/helper）。列出当前 step 涉及的全部符号；"
+                    "Decision LLM 一次消费，不在工具内再分批。"
+                ),
             },
             "context_window": {
                 "type": "array",
@@ -59,13 +196,19 @@ class DecisionEditTool(Tool):
                             "items": {"type": "integer"},
                             "minItems": 2,
                             "maxItems": 2,
-                            "description": "参考代码片段的起止行号，如 [10, 50]"
+                            "description": (
+                                "起止行号，如 [10, 120]。来自 LOADED CODE ANCHORS，"
+                                "由 Core 按本步需要选择最小充分 span。"
+                            ),
                         },
                         "reason": {"type": "string", "description": "该参考片段被纳为上下文的原因/用途说明"}
                     },
                     "required": ["file", "span"]
                 },
-                "description": "为本次编辑显式注入的、已冻结的上下文片段列表。如果提供此字段，编辑工具将严格仅从这些片段提取依赖上下文，绝不自行检索或搜寻其他代码。"
+                "description": (
+                    "已冻结的证据片段（来自 LOADED CODE ANCHORS）。同文件相邻 span "
+                    "会在工具内机械合并后交给 Decision LLM。"
+                ),
             },
             "task_id": {
                 "type": "string",
@@ -100,12 +243,19 @@ class DecisionEditTool(Tool):
         self.settings = settings
         self.decision_llm = decision_llm
         self.harness = harness
-        configured_timeout = getattr(settings, "cursor_decision_timeout", 90.0)
-        self.decision_timeout = (
+        configured_timeout = getattr(settings, "cursor_decision_timeout", 120.0)
+        self.decision_timeout_base = (
             float(configured_timeout)
             if isinstance(configured_timeout, (int, float))
-            else 90.0
+            else 120.0
         )
+        configured_patch_retries = getattr(settings, "cursor_decision_patch_retries", 2)
+        self.patch_retry_max = (
+            int(configured_patch_retries)
+            if isinstance(configured_patch_retries, int)
+            else 2
+        )
+        self.patch_retry_max = max(0, min(self.patch_retry_max, 3))
 
         self.decision = CursorDecisionLLM(self.decision_llm)
         self.patch_applier = CursorPatchApplier(self.project_root)
@@ -142,6 +292,8 @@ class DecisionEditTool(Tool):
     def validate_params(self, params: dict[str, Any]) -> dict[str, Any]:
         if "context_window" not in params:
             params = {**params, "context_window": []}
+        if "focus_symbols" not in params:
+            params = {**params, "focus_symbols": []}
         return super().validate_params(params)
 
     def _read_file_span(self, file_path: str, start_line: int, end_line: int) -> str | None:
@@ -171,7 +323,7 @@ class DecisionEditTool(Tool):
     ) -> ContextPack:
         windows = []
 
-        norm_target = target_file.replace("\\", "/").lstrip("./")
+        norm_target = _norm_file_path(target_file)
         target_spans: list[tuple[str, int, int]] = []
         reference_spans: list[tuple[str, int, int]] = []
 
@@ -181,12 +333,15 @@ class DecisionEditTool(Tool):
                 span = item.get("span")
                 if not file_path or not span or len(span) < 2:
                     continue
-                norm_file = str(file_path).replace("\\", "/").lstrip("./")
+                norm_file = _norm_file_path(str(file_path))
                 entry = (str(file_path), int(span[0]), int(span[1]))
                 if norm_file == norm_target:
                     target_spans.append(entry)
                 else:
                     reference_spans.append(entry)
+
+            target_spans = merge_context_spans(target_spans)
+            reference_spans = merge_context_spans(reference_spans)
 
         if target_spans:
             for index, (file_path, start_line, end_line) in enumerate(target_spans):
@@ -290,7 +445,36 @@ class DecisionEditTool(Tool):
         target_file: str,
         search_cache: dict[str, Any] | None,
         context_pack: ContextPack,
+        *,
+        context_window: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        norm_target = _norm_file_path(target_file)
+        if context_window:
+            frozen_spans: list[dict[str, Any]] = []
+            for item in context_window:
+                if not isinstance(item, dict):
+                    continue
+                file_path = str(item.get("file") or "")
+                span = item.get("span")
+                if not file_path or not isinstance(span, list) or len(span) < 2:
+                    continue
+                frozen = {
+                    "file": file_path,
+                    "span": [int(span[0]), int(span[1])],
+                    "status": "frozen",
+                }
+                reason = item.get("reason")
+                if isinstance(reason, str) and reason.strip():
+                    frozen["reason"] = reason.strip()[:160]
+                frozen_spans.append(frozen)
+            return {
+                "target_file": target_file,
+                "context_mode": "frozen_context_window",
+                "context_window_spans": frozen_spans,
+                "available_context_files": list(context_pack.candidate_files),
+                "can_edit": bool(context_pack.windows),
+            }
+
         anchors: list[dict[str, Any]] = []
         if search_cache:
             raw = search_cache.get("raw_evidence_store") or []
@@ -319,7 +503,7 @@ class DecisionEditTool(Tool):
             compact = {"file": file_path, "span": list(span), "status": "loaded"}
             if anchor.get("symbol"):
                 compact["symbol"] = anchor["symbol"]
-            (target_anchors if file_path == target_file else reference_anchors).append(compact)
+            (target_anchors if _norm_file_path(file_path) == norm_target else reference_anchors).append(compact)
             for function in anchor.get("related_functions") or []:
                 if not isinstance(function, dict) or not function.get("name"):
                     continue
@@ -340,200 +524,350 @@ class DecisionEditTool(Tool):
             "can_edit": bool(context_pack.windows),
         }
 
+    async def _generate_patch(
+        self,
+        *,
+        target_file: str,
+        state_text: str,
+        context_pack: ContextPack,
+        evidence_flag: dict[str, Any],
+        effective_timeout: float,
+        started_at: float,
+        batch_label: str = "",
+    ) -> tuple[Any, Any]:
+        """Call Decision LLM and return (parsed_decision, response)."""
+        decision_messages = self.decision.build_messages(
+            state_text=state_text,
+            context_pack=context_pack,
+            hint=None,
+            evidence_flag=evidence_flag,
+            edit_only=True,
+        )
+        trimmed_messages = await self.harness.before_llm_call(decision_messages)
+
+        connect_timeout = effective_timeout
+        stream_idle_timeout = float(
+            getattr(self.decision_llm, "stream_idle_timeout", 60) or 60
+        )
+        use_stream = hasattr(self.decision_llm, "chat_stream")
+        response = None
+        content_chunks: list[str] = []
+
+        def count_diff_lines(text: str) -> tuple[int, int]:
+            normalized = text.replace("\\n", "\n")
+            added = 0
+            removed = 0
+            state = "normal"
+            for line in normalized.splitlines():
+                clean_line = line.strip().strip('"\'')
+                if "<<<<<<< SEARCH" in clean_line:
+                    state = "search"
+                elif "=======" in clean_line:
+                    state = "replace"
+                elif ">>>>>>> REPLACE" in clean_line:
+                    state = "normal"
+                else:
+                    if state == "search":
+                        removed += 1
+                    elif state == "replace":
+                        added += 1
+            return added, removed
+
+        label = f" {batch_label}" if batch_label else ""
+        print(
+            "[debug][decision-edit][decision-llm-start]"
+            f"{label} file={target_file} connect_timeout={connect_timeout:g}s"
+            f" idle_timeout={stream_idle_timeout:g}s",
+            flush=True,
+        )
+        first_chunk_at: float | None = None
+
+        async def _consume_stream() -> None:
+            nonlocal response, first_chunk_at
+            if (
+                hasattr(self.harness, "progress_callback")
+                and self.harness.progress_callback
+            ):
+                self.harness.progress_callback(f"正在编辑文件: {target_file}… [+0 -0]")
+
+            stream_iter = self.decision_llm.chat_stream(
+                trimmed_messages,
+                tools=None,
+                timeout=connect_timeout,
+            )
+            async for content_chunk, final_response in stream_iter:
+                if content_chunk and first_chunk_at is None:
+                    first_chunk_at = time.monotonic()
+                    print(
+                        "[debug][decision-edit][decision-llm-ttft]"
+                        f"{label} file={target_file} "
+                        f"ttft={first_chunk_at - started_at:.2f}s",
+                        flush=True,
+                    )
+                if content_chunk:
+                    content_chunks.append(content_chunk)
+                    added, removed = count_diff_lines("".join(content_chunks))
+                    if (
+                        hasattr(self.harness, "progress_callback")
+                        and self.harness.progress_callback
+                    ):
+                        self.harness.progress_callback(
+                            f"正在编辑文件: {target_file}… [+{added} -{removed}]"
+                        )
+                if final_response is not None:
+                    if getattr(final_response, "model", "") == "error":
+                        raise TimeoutError(final_response.content or "LLM stream timed out")
+                    response = final_response
+
+        if use_stream:
+            probe = self.decision_llm.chat_stream(
+                trimmed_messages,
+                tools=None,
+                timeout=connect_timeout,
+            )
+            if inspect.iscoroutine(probe):
+                probe.close()
+                use_stream = False
+
+        if use_stream:
+            await _consume_stream()
+        else:
+            async with asyncio.timeout(connect_timeout):
+                response = await self.decision_llm.chat(
+                    trimmed_messages,
+                    tools=None,
+                    stream=False,
+                    timeout=connect_timeout,
+                )
+
+        if response is None and content_chunks:
+            from src.agent.types import LLMResponse
+
+            response = LLMResponse(
+                content="".join(content_chunks),
+                tool_calls=None,
+                usage=None,
+                model=getattr(self.decision_llm, "model", "unknown"),
+            )
+
+        if first_chunk_at is None and use_stream:
+            print(
+                "[debug][decision-edit][decision-llm-ttft]"
+                f"{label} file={target_file} ttft=none (no stream chunks before deadline)",
+                flush=True,
+            )
+
+        print(
+            "[debug][decision-edit][decision-llm-done]"
+            f"{label} file={target_file} elapsed={time.monotonic() - started_at:.2f}s",
+            flush=True,
+        )
+
+        if response:
+            await self.harness.after_llm_call(response, response.usage)
+
+        session_id = getattr(self.harness, "session_id", "default_session")
+        subtask_id = f"step_{getattr(self.harness, 'current_step', 1)}_edit"
+        if hasattr(self.harness, "session_storage"):
+            for msg in trimmed_messages:
+                self.harness.session_storage.append_sidechain_message(
+                    session_id, subtask_id, msg.get("role", "system"), msg.get("content", "")
+                )
+            if response:
+                self.harness.session_storage.append_sidechain_message(
+                    session_id, subtask_id, "assistant", response.content or ""
+                )
+
+        parsed_decision = self.decision.parse(
+            response.content or "",
+            context_pack.candidate_files,
+            edit_only=True,
+        )
+        return parsed_decision, response
+
     async def execute(self, **params: Any) -> ToolResult:
         started_at = time.monotonic()
         validated = self.validate_params(params)
         target_file = validated["target_file"]
         intent = validated["intent"]
+        focus_symbols = list(validated.get("focus_symbols") or [])
         search_cache = params.get("_search_cache")
         context_window = params.get("context_window")
 
-        # Build context pack dynamically containing target file and context files
         context_pack = self._build_context_pack(
             target_file,
             search_cache,
             context_window=context_window,
         )
         context_chars = sum(len(window.content) for window in context_pack.windows)
-        context_lines = sum(len(window.content.splitlines()) for window in context_pack.windows)
+        context_lines = sum(
+            len(window.content.splitlines()) for window in context_pack.windows
+        )
+        span_count = len(context_window or [])
+        effective_timeout = decision_timeout_for_context(
+            self.decision_timeout_base,
+            context_chars=context_chars,
+            span_count=span_count,
+        )
         print(
             "[debug][decision-edit][context] "
             f"file={target_file} windows={len(context_pack.windows)} "
-            f"lines={context_lines} chars={context_chars} "
+            f"lines={context_lines} chars={context_chars} spans={span_count} "
+            f"focus_symbols={len(focus_symbols)} "
+            f"connect_timeout={effective_timeout:.0f}s "
             f"elapsed={time.monotonic() - started_at:.2f}s",
             flush=True,
         )
 
-        evidence_flag = self._build_evidence_flag(target_file, search_cache, context_pack)
+        evidence_flag = self._build_evidence_flag(
+            target_file,
+            search_cache,
+            context_pack,
+            context_window=context_window,
+        )
+        state_text = _build_state_text(target_file, intent, focus_symbols)
+        max_attempts = self.patch_retry_max + 1
+        feedback_state = state_text
+        parsed_decision = None
+        execution = None
+        validation = None
+        pipeline_metrics = None
+        patch_attempt = 0
 
-        # Build state text and prompt DecisionLLM to get patch
-        state_text = f"Apply the following modification intent to target file:\n{intent}"
-        try:
-            decision_messages = self.decision.build_messages(
-                state_text=state_text,
-                context_pack=context_pack,
-                hint=None,
-                evidence_flag=evidence_flag,
-                edit_only=True,
+        while patch_attempt < max_attempts:
+            patch_attempt += 1
+            try:
+                parsed_decision, _response = await self._generate_patch(
+                    target_file=target_file,
+                    state_text=feedback_state,
+                    context_pack=context_pack,
+                    evidence_flag=evidence_flag,
+                    effective_timeout=effective_timeout,
+                    started_at=started_at,
+                    batch_label=f"attempt={patch_attempt}",
+                )
+            except TimeoutError:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        "DecisionLLM patch generation timed out after "
+                        f"{effective_timeout:g}s for {target_file}."
+                    ),
+                    metadata={"patch_attempts": patch_attempt},
+                )
+            except Exception as exc:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"DecisionLLM generation/parsing failed: {exc}",
+                    metadata={"patch_attempts": patch_attempt},
+                )
+
+            if parsed_decision.action != "edit":
+                return ToolResult(
+                    success=False,
+                    output=(
+                        "Decision LLM did not generate an edit. "
+                        f"Action taken: {parsed_decision.action}. "
+                        f"Message: {parsed_decision.answer or parsed_decision.clarification}"
+                    ),
+                    error=f"Action is not edit: {parsed_decision.action}",
+                    metadata={"patch_attempts": patch_attempt},
+                )
+
+            execution, validation, pipeline_metrics = await self.executor.execute_transaction(
+                parsed_decision.target_file,
+                parsed_decision.patch,
+                self.validator,
+                step=1,
+                layer1=None,
+                user_intent=intent,
             )
-            trimmed_messages = await self.harness.before_llm_call(decision_messages)
-
-            use_stream = hasattr(self.decision_llm, "chat_stream")
-            response = None
-            content_chunks = []
-
-            def count_diff_lines(text: str) -> tuple[int, int]:
-                normalized = text.replace("\\n", "\n")
-                added = 0
-                removed = 0
-                state = "normal"
-                for line in normalized.splitlines():
-                    clean_line = line.strip().strip('"\'')
-                    if "<<<<<<< SEARCH" in clean_line:
-                        state = "search"
-                    elif "=======" in clean_line:
-                        state = "replace"
-                    elif ">>>>>>> REPLACE" in clean_line:
-                        state = "normal"
-                    else:
-                        if state == "search":
-                            removed += 1
-                        elif state == "replace":
-                            added += 1
-                return added, removed
-
-            if use_stream:
-                try:
-                    stream_generator = self.decision_llm.chat_stream(
-                        trimmed_messages,
-                        tools=None,
-                    )
-                    if not hasattr(stream_generator, "__aiter__"):
-                        if inspect.iscoroutine(stream_generator):
-                            stream_generator.close()
-                        use_stream = False
-                except Exception:
-                    use_stream = False
 
             print(
-                "[debug][decision-edit][decision-llm-start] "
-                f"file={target_file} timeout={self.decision_timeout:g}s",
-                flush=True,
-            )
-            async with asyncio.timeout(self.decision_timeout):
-                if use_stream:
-                    if (
-                        hasattr(self.harness, "progress_callback")
-                        and self.harness.progress_callback
-                    ):
-                        self.harness.progress_callback(f"正在编辑文件: {target_file}… [+0 -0]")
-
-                    async for content_chunk, final_response in stream_generator:
-                        if content_chunk:
-                            content_chunks.append(content_chunk)
-                            added, removed = count_diff_lines("".join(content_chunks))
-                            if (
-                                hasattr(self.harness, "progress_callback")
-                                and self.harness.progress_callback
-                            ):
-                                self.harness.progress_callback(
-                                    f"正在编辑文件: {target_file}… [+{added} -{removed}]"
-                                )
-                        if final_response is not None:
-                            response = final_response
-                else:
-                    response = await self.decision_llm.chat(
-                        trimmed_messages,
-                        tools=None,
-                        stream=False,
-                    )
-
-            print(
-                "[debug][decision-edit][decision-llm-done] "
-                f"file={target_file} elapsed={time.monotonic() - started_at:.2f}s",
+                "[debug][decision-edit][validation-done] "
+                f"file={target_file} success={validation.success} "
+                f"patch_attempt={patch_attempt}/{max_attempts} "
+                f"apply_success={execution.success} "
+                f"elapsed={time.monotonic() - started_at:.2f}s",
                 flush=True,
             )
 
-            if response:
-                await self.harness.after_llm_call(response, response.usage)
+            if execution.success:
+                break
 
-            session_id = getattr(self.harness, "session_id", "default_session")
-            subtask_id = f"step_{getattr(self.harness, 'current_step', 1)}_edit"
-            if hasattr(self.harness, "session_storage"):
-                for msg in trimmed_messages:
-                    self.harness.session_storage.append_sidechain_message(
-                        session_id, subtask_id, msg.get("role", "system"), msg.get("content", "")
-                    )
-                if response:
-                    self.harness.session_storage.append_sidechain_message(
-                        session_id, subtask_id, "assistant", response.content or ""
-                    )
-
-            parsed_decision = self.decision.parse(
-                response.content or "",
-                context_pack.candidate_files,
-                edit_only=True,
+            error_detail = execution.error or ""
+            can_retry = (
+                patch_attempt < max_attempts
+                and is_mechanical_patch_error(error_detail)
             )
-        except TimeoutError:
-            return ToolResult(
-                success=False,
-                output="",
-                error=(
-                    "DecisionLLM patch generation timed out after "
-                    f"{self.decision_timeout:g}s for {target_file}."
-                ),
-            )
-        except Exception as exc:
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"DecisionLLM generation/parsing failed: {exc}",
-            )
+            if can_retry:
+                print(
+                    "[debug][decision-edit][patch-retry] "
+                    f"file={target_file} attempt={patch_attempt}/{max_attempts} "
+                    f"error={error_detail.splitlines()[0][:120]}",
+                    flush=True,
+                )
+                feedback_state = build_patch_retry_state_text(
+                    state_text,
+                    attempt=patch_attempt,
+                    max_attempts=max_attempts,
+                    error=error_detail,
+                    failed_patch=parsed_decision.patch,
+                )
+                continue
 
-        if parsed_decision.action != "edit":
-            return ToolResult(
-                success=False,
-                output=f"Decision LLM did not generate an edit. Action taken: {parsed_decision.action}. Message: {parsed_decision.answer or parsed_decision.clarification}",
-                error=f"Action is not edit: {parsed_decision.action}",
-            )
-
-        # Run transaction
-        execution, validation, pipeline_metrics = await self.executor.execute_transaction(
-            parsed_decision.target_file,
-            parsed_decision.patch,
-            self.validator,
-            step=1,
-            layer1=None,
-            user_intent=intent,
-        )
-        print(
-            "[debug][decision-edit][validation-done] "
-            f"file={target_file} success={validation.success} "
-            f"elapsed={time.monotonic() - started_at:.2f}s",
-            flush=True,
-        )
-
-        task_id = params.get("task_id")
-        task_label = f" 任务 `{task_id}`" if task_id else ""
-
-        if not execution.success:
+            task_id = params.get("task_id")
+            task_label = f" 任务 `{task_id}`" if task_id else ""
+            retry_hint = ""
+            if error_detail.startswith("mismatch:"):
+                retry_hint = (
+                    "\n\n重试建议：① SEARCH 必须是文件中**现有**代码的逐字复制，"
+                    "REPLACE 才是改后内容；② 同一文件多处修改请拆成多个互不重叠的 "
+                    "SEARCH/REPLACE 块；③ 对照 Diagnostic 核对缩进与引号；"
+                    "④ 缩小本步 focus_symbols 或拆成下一次 decision_edit plan step。"
+                )
+            elif "overlaps another block" in error_detail:
+                retry_hint = (
+                    "\n\n重试建议：① 每个 SEARCH/REPLACE 块的行范围必须互不重叠；"
+                    "② 每块只包 3–8 行定位代码；③ 若改动点过多，请让 Core 拆成多次 decision_edit。"
+                )
+            inner_note = ""
+            if patch_attempt > 1:
+                inner_note = (
+                    f"\n（Decision LLM 内层已重试 {patch_attempt - 1} 次，"
+                    "仍无法应用补丁。）"
+                )
             return ToolResult(
                 success=False,
                 output=(
-                    f"❌ 【补丁生成失败】：{task_label}对文件 `{target_file}` 的补丁无法匹配到物理内容。\n"
-                    f"原因分析：可能因为你在 intent 中提供的描述有误，或者你参考了过期的代码快照。\n"
-                    f"具体底层错误：{execution.error}"
+                    f"❌ 【补丁生成失败】：{task_label}对文件 `{target_file}` 的补丁无法匹配到物理内容。"
+                    f"{inner_note}\n"
+                    f"具体错误与诊断：\n```\n{error_detail}\n```"
+                    f"{retry_hint}"
                 ),
-                error=execution.error,
+                error=error_detail,
                 metadata={
                     "pipeline_metrics": pipeline_metrics,
                     "execution": execution,
                     "validation": validation,
-                }
+                    "patch_attempts": patch_attempt,
+                },
+            )
+
+        task_id = params.get("task_id")
+        task_label = f" 任务 `{task_id}`" if task_id else ""
+
+        if execution is None or validation is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error="decision_edit: no patch execution result",
+                metadata={"patch_attempts": patch_attempt},
             )
 
         if not validation.success:
-            # 编译或测试挂了，但是补丁已经被应用过（虽然现在回滚了）
             return ToolResult(
                 success=False,
                 output=(
@@ -547,15 +881,20 @@ class DecisionEditTool(Tool):
                     "pipeline_metrics": pipeline_metrics,
                     "execution": execution,
                     "validation": validation,
-                }
+                    "patch_attempts": patch_attempt,
+                },
             )
 
         return ToolResult(
             success=True,
-            output=f"✅ 【应用成功】：针对文件 `{target_file}`{task_label} 的补丁已通过编译与自动化测试验证，修改已持久化提交（Committed）。",
+            output=(
+                f"✅ 【应用成功】：针对文件 `{target_file}`{task_label} "
+                f"的补丁已通过编译与自动化测试验证，修改已持久化提交（Committed）。"
+            ),
             metadata={
                 "pipeline_metrics": pipeline_metrics,
                 "execution": execution,
                 "validation": validation,
-            }
+                "patch_attempts": patch_attempt,
+            },
         )

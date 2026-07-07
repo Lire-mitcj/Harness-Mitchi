@@ -143,10 +143,23 @@ class MitKIISettings(BaseSettings):
     cursor_graph_bridge_alias_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
     cursor_retrieval_timeout: float = Field(default=12.0, ge=0.1, le=120.0)
     cursor_decision_timeout: float = Field(
-        default=90.0,
+        default=120.0,
         ge=5.0,
         le=300.0,
-        description="Total deadline for the internal decision_edit patch-generation LLM call.",
+        description=(
+            "First-token connect deadline (seconds) for decision_edit streaming; "
+            "scaled with context size. Long patch generation uses stream idle timeout, "
+            "not this value as a total wall-clock cap."
+        ),
+    )
+    cursor_decision_patch_retries: int = Field(
+        default=2,
+        ge=0,
+        le=3,
+        description=(
+            "Inner decision_edit retries when patch apply fails with mechanical errors "
+            "(mismatch, invalid_patch overlap, empty patch). Does not retry validator failures."
+        ),
     )
     cursor_max_context_files: int = Field(default=3, ge=1, le=12)
     cursor_context_chars_per_file: int = Field(default=12_000, ge=1000, le=50_000)

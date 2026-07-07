@@ -38,7 +38,11 @@ Interpret STEP EVIDENCE as follows:
 - `edit_ready: no` means continue closing concrete `missing` targets.
 - `required_coverage` counts required obligations only.
 - `retrieval_no_gain_rounds` controls convergence: `0` permits productive discovery,
-  `1` permits only an exact target read, and `2+` means stop retrieving and edit.
+  `1` permits only an exact target read, and `2+` means stop grep loops and load
+  named symbols with `view_symbol_code` (or `decision_edit` once `edit_ready: yes`).
+- Grep hits only **locate** targets. Once `grep_search` returns matches or
+  `suggested_views`, load each concrete file+symbol with `view_symbol_code` — do
+  not repeat grep with synonym variants of the same query.
 
 1. `bootstrap`
    - No concrete target has been verified yet. Run one **discovery batch** per turn:
@@ -90,10 +94,14 @@ Interpret STEP EVIDENCE as follows:
 ## Retrieval discipline
 
 - Unknown does not mean nonexistent. Retrieve only facts needed for the active task.
+- Prefer `view_symbol_code` to load a **named function, class, or DDL block** after
+  grep (or STEP EVIDENCE `suggested_views`) names a concrete file+symbol. Use
+  `grep_search` only to discover/locate — not to read implementation bodies.
 - Prefer `view_symbol_code` / `grep_search` to load missing symbols before the first
-  edit when retrieval tools are available. Once you call `decision_edit`, patch
-  placement and insertion anchors are resolved by DecisionLLM from `intent` and
-  `context_window` — do not second-guess spans in narration.
+  edit when retrieval tools are available. Execute the plan **one step per**
+  `decision_edit` call: `intent`, `focus_symbols`, and `context_window` describe
+  **only the active step**. Split multi-step or multi-site work across multiple
+  Core `decision_edit` calls — each call triggers one Decision LLM patch generation.
 - When STEP EVIDENCE lists a symbol under `loaded (reuse; do not re-fetch)` or
   LOADED CODE ANCHORS already contain it, proceed with `decision_edit` — do not
   call `view_symbol_code` again for reassurance.

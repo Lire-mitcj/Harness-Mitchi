@@ -4,16 +4,23 @@ import asyncio
 import json
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 from src.agent.types import RiskLevel, ToolResult
 from src.tools.base import Tool
 from src.tools.grep_match_symbols import (
-    extract_symbol_from_match_line,
-    suggested_views_from_matches,
+    enrich_grep_matches,
+    grep_search_fingerprint,
+    normalize_match_path,
+    parse_rg_hit_line,
 )
 
 MAX_BATCH_PATTERNS = 8
+_CONTEXT_AFTER_PATTERN = re.compile(
+    r"exception_handler|add_exception_handler|@(?:app|router)\.|"
+    r"include_router|FastAPI\s*\(|create_app|wire_routes",
+)
 
 
 class GrepSearchTool(Tool):
@@ -26,7 +33,7 @@ class GrepSearchTool(Tool):
         "CREATE TABLE, @router) — not single vague words like 'order'. Prefer one call "
         "with `patterns` (batch) or regex alternation (`foo|bar|baz`). Supports modes: "
         "default (literal/regex), symbol (definitions only), import, structure "
-        "(file summary — requires pattern; avoid for bootstrap). A hit only locates the "
+        "(per-file hit summary plus suggested_views for top files). A hit only locates the "
         "next read; follow suggested_views with view_symbol_code."
     )
     risk_level = RiskLevel.SAFE
@@ -78,10 +85,13 @@ class GrepSearchTool(Tool):
             },
         },
         "anyOf": [
-            {"required": ["pattern"]},
+            {        "required": ["pattern"]},
             {"required": ["patterns"]},
         ],
     }
+
+    def __init__(self, *, project_root: Path | None = None) -> None:
+        self.project_root = project_root.resolve() if project_root is not None else None
 
     @staticmethod
     def _normalize_pattern_list(validated: dict[str, Any]) -> list[str]:
@@ -128,8 +138,13 @@ class GrepSearchTool(Tool):
         cmd_base: list[str],
         search_pat: str,
         path: str,
+        *,
+        context_after: int = 0,
     ) -> tuple[int, str, str]:
-        cmd = list(cmd_base) + ["--", search_pat, path]
+        cmd = list(cmd_base)
+        if context_after > 0:
+            cmd.extend(["-A", str(context_after)])
+        cmd.extend(["--", search_pat, path])
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -159,7 +174,7 @@ class GrepSearchTool(Tool):
         if mode == "symbol":
             has_regex = any(c in pattern for c in "*+?()[]{}|\\^$")
             pat_escaped = pattern if has_regex else re.escape(pattern)
-            search_pat = rf"\b(def|class|async\s+def|function|fn)\b.*{pat_escaped}"
+            search_pat = rf"\b(?:async\s+def|def|class)\s+{pat_escaped}\b"
             return await self._run_rg(cmd_base, search_pat, path)
         if mode == "import":
             has_regex = any(c in pattern for c in "*+?()[]{}|\\^$")
@@ -167,19 +182,39 @@ class GrepSearchTool(Tool):
             search_pat = rf"\b(import|from)\b.*{pat_escaped}"
             return await self._run_rg(cmd_base, search_pat, path)
 
+        context_after = 2 if _CONTEXT_AFTER_PATTERN.search(pattern) else 0
+
         words = pattern.split()
         is_multi_word = len(words) > 1 and not any(c in pattern for c in "*+?()[]{}|\\^$")
         is_identifier = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", pattern) is not None
 
         if mode == "default" and is_identifier:
-            def_pattern = rf"\b(def|class|async\s+def|function|fn)\s+{pattern}\b"
+            def_pattern = rf"\b(?:async\s+def|def|class)\s+{pattern}\b"
             code, out, err = await self._run_rg(cmd_base, def_pattern, path)
-            if code == 0 and out.strip():
-                return code, out, err
-            return await self._run_rg(cmd_base, rf"\b{pattern}\b", path)
+            def_lines = out.strip().splitlines() if code == 0 and out.strip() else []
+            fallback_code, fallback_out, fallback_err = await self._run_rg(
+                cmd_base,
+                rf"\b{pattern}\b",
+                path,
+                context_after=context_after,
+            )
+            fallback_lines = (
+                fallback_out.strip().splitlines()
+                if fallback_code == 0 and fallback_out.strip()
+                else []
+            )
+            merged = list(dict.fromkeys([*def_lines, *fallback_lines]))
+            if merged:
+                return 0, "\n".join(merged), err or fallback_err
+            return fallback_code, fallback_out, fallback_err
         if is_multi_word:
             first_word = words[0]
-            code, out, err = await self._run_rg(cmd_base, first_word, path)
+            code, out, err = await self._run_rg(
+                cmd_base,
+                first_word,
+                path,
+                context_after=context_after,
+            )
             if code != 0:
                 return code, out, err
             filtered_lines = []
@@ -191,31 +226,59 @@ class GrepSearchTool(Tool):
                     filtered_lines.append(line)
             stdout_data = "\n".join(filtered_lines)
             return (0 if filtered_lines else 1), stdout_data, err
-        return await self._run_rg(cmd_base, pattern, path)
+        return await self._run_rg(
+            cmd_base,
+            pattern,
+            path,
+            context_after=context_after,
+        )
 
     @staticmethod
-    def _matches_from_raw_lines(raw_lines: list[str], *, limit: int) -> list[dict[str, Any]]:
+    def _matches_from_raw_lines(
+        raw_lines: list[tuple[str, str]],
+        *,
+        limit: int,
+        project_root: Path | None = None,
+    ) -> list[dict[str, Any]]:
         matches: list[dict[str, Any]] = []
-        for line in raw_lines[:limit]:
-            parts = line.split(":", 2)
-            if len(parts) < 3:
-                continue
-            file_path = parts[0]
-            try:
-                line_num = int(parts[1])
-            except ValueError:
-                line_num = 1
-            content = parts[2]
-            symbol_name = extract_symbol_from_match_line(content)
-            matches.append(
-                {
-                    "file": file_path,
-                    "symbol": symbol_name,
-                    "span": [line_num, line_num],
-                    "match_line": content.strip(),
-                }
+        for line, matched_pattern in raw_lines[:limit]:
+            parsed = parse_rg_hit_line(
+                line,
+                matched_pattern,
+                project_root=project_root,
             )
+            if parsed is not None:
+                matches.append(parsed)
         return matches
+
+    @staticmethod
+    def _structure_seed_lines(
+        raw_lines: list[tuple[str, str]],
+        *,
+        max_files: int = 12,
+    ) -> list[tuple[str, str]]:
+        per_file: dict[str, tuple[str, str]] = {}
+        for line, pattern in raw_lines:
+            parts = line.split(":", 2)
+            if not parts:
+                continue
+            file_key = parts[0]
+            if file_key not in per_file:
+                per_file[file_key] = (line, pattern)
+            if len(per_file) >= max_files:
+                break
+        return list(per_file.values())
+
+    @staticmethod
+    def _build_next_action(suggested_views: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not suggested_views:
+            return None
+        symbols = [str(item.get("symbol") or "") for item in suggested_views if item.get("symbol")]
+        return {
+            "tool": "view_symbol_code",
+            "symbols": symbols,
+            "suggested_views": suggested_views,
+        }
 
     def _empty_payload(self, *, mode: str) -> dict[str, Any]:
         if mode == "structure":
@@ -231,11 +294,14 @@ class GrepSearchTool(Tool):
 
     def _result_from_raw_lines(
         self,
-        raw_lines: list[str],
+        raw_lines: list[tuple[str, str]],
         *,
         mode: str,
         max_results: int,
         searched_patterns: list[str],
+        project_root: Path | None = None,
+        repo_map: Any = None,
+        search_fingerprint: str = "",
     ) -> ToolResult:
         if not raw_lines:
             payload = self._empty_payload(mode=mode)
@@ -247,20 +313,43 @@ class GrepSearchTool(Tool):
                     "returned_matches": 0,
                     "truncated": False,
                     "searched_patterns": searched_patterns,
+                    "search_fingerprint": search_fingerprint,
+                    "empty_result": True,
                 },
             )
 
         if mode == "structure":
-            file_counts = Counter()
-            for line in raw_lines:
+            file_counts: Counter[str] = Counter()
+            for line, _pattern in raw_lines:
                 parts = line.split(":", 2)
                 if parts:
-                    file_counts[parts[0]] += 1
+                    file_counts[normalize_match_path(parts[0], project_root)] += 1
             summary = [
                 {"file": file_path, "exists": True, "match_count": count}
                 for file_path, count in file_counts.items()
             ]
-            payload = {"file_level_summary": summary}
+            seed_lines = self._structure_seed_lines(raw_lines)
+            matches, suggested_views = enrich_grep_matches(
+                self._matches_from_raw_lines(
+                    seed_lines,
+                    limit=len(seed_lines),
+                    project_root=project_root,
+                ),
+                searched_patterns=searched_patterns,
+                project_root=project_root,
+                repo_map=repo_map,
+            )
+            next_action = self._build_next_action(suggested_views)
+            payload = {
+                "file_level_summary": summary,
+                "matches": matches,
+                "returned_matches": len(matches),
+                "total_matches": len(raw_lines),
+                "truncated": False,
+                "next_action": next_action,
+                "searched_patterns": searched_patterns,
+                "suggested_views": suggested_views,
+            }
             return ToolResult(
                 success=True,
                 output=json.dumps(payload, ensure_ascii=False, indent=2),
@@ -269,7 +358,9 @@ class GrepSearchTool(Tool):
                     "returned_matches": len(summary),
                     "truncated": False,
                     "searched_patterns": searched_patterns,
-                    "raw_evidence_store": [
+                    "suggested_views": suggested_views,
+                    "search_fingerprint": search_fingerprint,
+                    "raw_evidence_store": matches or [
                         {"file": item["file"], "match_count": item["match_count"]}
                         for item in summary
                     ],
@@ -277,18 +368,18 @@ class GrepSearchTool(Tool):
             )
 
         truncated = len(raw_lines) > max_results
-        matches = self._matches_from_raw_lines(raw_lines, limit=max_results)
-        suggested_views = suggested_views_from_matches(matches)
-        symbols = [item["symbol"] for item in suggested_views]
-        next_action = (
-            {
-                "tool": "view_symbol_code",
-                "symbols": symbols,
-                "suggested_views": suggested_views,
-            }
-            if suggested_views
-            else None
+        matches, suggested_views = enrich_grep_matches(
+            self._matches_from_raw_lines(
+                raw_lines,
+                limit=max_results,
+                project_root=project_root,
+            ),
+            searched_patterns=searched_patterns,
+            project_root=project_root,
+            repo_map=repo_map,
         )
+        top_kinds = [str(item.get("match_kind") or "") for item in matches[:5]]
+        next_action = self._build_next_action(suggested_views)
         payload = {
             "matches": matches,
             "returned_matches": len(matches),
@@ -297,6 +388,7 @@ class GrepSearchTool(Tool):
             "next_action": next_action,
             "searched_patterns": searched_patterns,
             "suggested_views": suggested_views,
+            "match_kinds_top": top_kinds,
         }
         return ToolResult(
             success=True,
@@ -308,6 +400,7 @@ class GrepSearchTool(Tool):
                 "next_action": next_action,
                 "searched_patterns": searched_patterns,
                 "suggested_views": suggested_views,
+                "search_fingerprint": search_fingerprint,
                 "raw_evidence_store": matches,
             },
         )
@@ -357,24 +450,40 @@ class GrepSearchTool(Tool):
         except Exception as exc:
             return ToolResult(success=False, output="", error=str(exc))
 
-        merged_lines: list[str] = []
+        merged_lines: list[tuple[str, str]] = []
         seen_lines: set[str] = set()
         last_error = ""
-        for exit_code, stdout_data, stderr_data in results:
+        for pattern, (exit_code, stdout_data, stderr_data) in zip(pattern_list, results):
             if exit_code > 1:
                 last_error = stderr_data.strip() or f"rg exit {exit_code}"
                 continue
             for line in stdout_data.strip().splitlines():
                 if line not in seen_lines:
                     seen_lines.add(line)
-                    merged_lines.append(line)
+                    merged_lines.append((line, pattern))
 
         if last_error and not merged_lines:
             return ToolResult(success=False, output="", error=f"rg error: {last_error}")
+
+        project_root = params.get("_project_root")
+        if project_root is not None and not isinstance(project_root, Path):
+            project_root = Path(str(project_root))
+        if project_root is None and self.project_root is not None:
+            project_root = self.project_root
+        repo_map = params.get("_repo_map")
+        fingerprint = grep_search_fingerprint(
+            pattern_list,
+            path=path,
+            include=include,
+            mode=mode,
+        )
 
         return self._result_from_raw_lines(
             merged_lines,
             mode=mode,
             max_results=max_results,
             searched_patterns=pattern_list,
+            project_root=project_root,
+            repo_map=repo_map,
+            search_fingerprint=fingerprint,
         )

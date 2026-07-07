@@ -9,6 +9,7 @@ from typing import Any
 
 from src.agent.types import RiskLevel, ToolResult
 from src.tools.base import Tool
+from src.tools.grep_match_symbols import wiring_symbol_suggestions
 
 log = logging.getLogger(__name__)
 
@@ -16,6 +17,7 @@ MAX_SYMBOL_OUTPUT_LINES = 120
 MAX_SYMBOL_OUTPUT_CHARS = 8_000
 _SKIPPED_SEARCH_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build"}
 _SQL_DEFINITION_KINDS = "TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|EVENT"
+_WIRING_PROBE_SYMBOLS = frozenset({"app", "application", "router", "logger", "create_app"})
 
 
 def _find_symbol_span_in_python_file(content: str, symbol_name: str) -> tuple[int, int] | None:
@@ -51,14 +53,21 @@ def _find_symbol_span_in_python_file(content: str, symbol_name: str) -> tuple[in
                     end = getattr(node, "end_lineno", start)
                     return start, end
 
-        # Second pass: try matching Variable/Constant assignments (e.g. app = FastAPI())
-        for node in ast.walk(tree):
+        # Second pass: module-level assignments (e.g. app = FastAPI()).
+        # Nested assignments inside create_app() must not satisfy a module-level probe.
+        for node in tree.body:
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id == symbol_name:
                         start = getattr(node, "lineno", 1)
                         end = getattr(node, "end_lineno", start)
                         return start, end
+            if isinstance(node, ast.AnnAssign):
+                target = node.target
+                if isinstance(target, ast.Name) and target.id == symbol_name:
+                    start = getattr(node, "lineno", 1)
+                    end = getattr(node, "end_lineno", start)
+                    return start, end
     except Exception as exc:
         log.warning("view_symbol_code AST parsing failed: %s", exc)
     return None
@@ -194,6 +203,47 @@ def _find_symbol_definitions(
     return candidates
 
 
+def _find_caller_setup_fallback(
+    content: str,
+    requested_symbol: str,
+) -> tuple[tuple[int, int], str] | None:
+    """Resolve generic wiring probes (app/create_app) to real setup spans."""
+    lines = content.splitlines()
+    suggestions = wiring_symbol_suggestions(lines)
+    probe_symbols = {requested_symbol, *suggestions}
+    for candidate in suggestions:
+        if candidate in probe_symbols or requested_symbol in _WIRING_PROBE_SYMBOLS:
+            span = _find_symbol_span_in_python_file(content, candidate)
+            if span is None:
+                span = _find_symbol_span_by_regex(content, candidate)
+            if span is not None:
+                return span, candidate
+    if requested_symbol in _WIRING_PROBE_SYMBOLS and lines:
+        end = min(len(lines), 80)
+        if end >= 3:
+            return (1, end), requested_symbol
+    return None
+
+
+def _format_missing_symbol_error(
+    requested_file: str,
+    symbol: str,
+    content: str,
+) -> str:
+    suggestions = wiring_symbol_suggestions(content.splitlines())
+    base = (
+        f"Symbol '{symbol}' not found in {requested_file} "
+        "via AST, regex, or retrieval cache."
+    )
+    if not suggestions:
+        return (
+            f"{base} Try grep_search(pattern='include_router|create_app|FastAPI\\('', "
+            f"path={requested_file!r}) or view_symbol_code with symbol='*' for the module header."
+        )
+    alts = ", ".join(f"{requested_file}::{name}" for name in suggestions[:3])
+    return f"{base} Symbols present in file: {alts}."
+
+
 class ViewSymbolCodeTool(Tool):
     name = "view_symbol_code"
     description = (
@@ -283,6 +333,13 @@ class ViewSymbolCodeTool(Tool):
         if not span and target_file.endswith(".py"):
             span = _find_symbol_span_in_python_file(content, symbol)
 
+        resolved_symbol = symbol
+        if not span and symbol in _WIRING_PROBE_SYMBOLS:
+            fallback = _find_caller_setup_fallback(content, symbol)
+            if fallback is not None:
+                span, resolved_symbol = fallback
+                symbol = resolved_symbol
+
         if not span:
             span = _find_symbol_span_by_regex(content, symbol)
 
@@ -326,13 +383,21 @@ class ViewSymbolCodeTool(Tool):
                 )
 
         if not span:
+            fallback = _find_caller_setup_fallback(content, symbol)
+            if fallback is not None:
+                span, resolved_symbol = fallback
+                symbol = resolved_symbol
+
+        if not span:
             return ToolResult(
                 success=False,
                 output="",
-                error=(
-                    f"Symbol '{symbol}' not found in {target_file} "
-                    "via AST, regex, or retrieval cache."
-                ),
+                error=_format_missing_symbol_error(requested_file, symbol, content),
+                metadata={
+                    "wiring_symbol_suggestions": wiring_symbol_suggestions(
+                        content.splitlines()
+                    ),
+                },
             )
 
         # 4. Extract verbatim slice
