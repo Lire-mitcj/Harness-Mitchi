@@ -19,6 +19,12 @@ from src.hooks.retrieval_convergence import (
     PRIMARY_RETRIEVAL_TOOLS,
     RETRIEVAL_TOOLS,
 )
+from src.hooks.tool_scorer import (
+    DEFAULT_TEMPERATURE,
+    ToolAllocation,
+    ToolScoringContext,
+    allocate,
+)
 from src.tools.grep_match_symbols import has_actionable_suggested_views
 
 if TYPE_CHECKING:
@@ -41,12 +47,13 @@ def _retrieval_tools_from_profile(
     default_tools: frozenset[str],
     *,
     allow_heavy: bool,
+    task_text: str = "",
 ) -> frozenset[str]:
     """Map manifest gaps to the minimal justified retrieval tool set."""
     if manifest is None:
         return PRIMARY_RETRIEVAL_TOOLS & default_tools
 
-    profile = retrieval_profile(manifest)
+    profile = retrieval_profile(manifest, task_text=task_text)
     tools: set[str] = set()
     if profile.needs_grep:
         tools.add("grep_search")
@@ -62,11 +69,12 @@ def _allow_heavy_retrieval(
     *,
     sufficiency: str,
     no_gain_rounds: int,
+    task_text: str = "",
 ) -> bool:
     """Heavy semantic retrieval is a bootstrap / stuck-discovery fallback only."""
     if manifest is None or sufficiency != Sufficiency.INSUFFICIENT:
         return False
-    profile = retrieval_profile(manifest)
+    profile = retrieval_profile(manifest, task_text=task_text)
     if not profile.needs_heavy:
         return False
     if profile.bootstrap:
@@ -88,8 +96,12 @@ def _apply_retrieval_saturation(
     tools = set(retrieval) - HEAVY_RETRIEVAL_TOOLS
 
     if has_open_gaps:
-        if view_last_round_all_duplicate and not wiring_gap_open:
+        if no_gain_rounds >= 2 and view_last_round_all_duplicate:
+            return frozenset()
+        if view_last_round_all_duplicate:
             tools -= _VIEW_TOOLS
+            if wiring_gap_open:
+                tools |= _GREP_TOOLS
         return frozenset(tools) & default_tools
 
     if no_gain_rounds >= 2:
@@ -107,6 +119,7 @@ def _insufficient_retrieval_tools(
     default_tools: frozenset[str],
     *,
     no_gain_rounds: int,
+    task_text: str = "",
 ) -> frozenset[str]:
     """Retrieval-only phase: manifest gaps plus the primary grep→view workflow."""
     profile_tools = _retrieval_tools_from_profile(
@@ -116,7 +129,9 @@ def _insufficient_retrieval_tools(
             manifest,
             sufficiency=Sufficiency.INSUFFICIENT,
             no_gain_rounds=no_gain_rounds,
+            task_text=task_text,
         ),
+        task_text=task_text,
     )
     return profile_tools | (PRIMARY_RETRIEVAL_TOOLS & default_tools)
 
@@ -131,8 +146,20 @@ def _has_grounded_observations(manifest: StepManifest | None) -> bool:
     )
 
 
-def _has_wiring_gap(manifest: StepManifest | None) -> bool:
-    return bool(wiring_gap_lines(manifest)) if manifest is not None else False
+def _has_wiring_gap(
+    manifest: StepManifest | None,
+    *,
+    task_text: str = "",
+) -> bool:
+    return (
+        bool(wiring_gap_lines(manifest, task_text=task_text))
+        if manifest is not None
+        else False
+    )
+
+
+def _task_text_from_run_state(run_state: Any) -> str:
+    return str(getattr(run_state, "task_text", "") or "").strip()
 
 
 def _insufficient_allowed_tools(
@@ -146,6 +173,7 @@ def _insufficient_allowed_tools(
     has_missing: bool,
     has_stale: bool,
     grep_suggested_views: tuple[Any, ...] = (),
+    task_text: str = "",
 ) -> frozenset[str]:
     """INSUFFICIENT phase with saturation and duplicate-round convergence."""
     sufficiency = str(getattr(manifest, "sufficiency", Sufficiency.INSUFFICIENT))
@@ -157,7 +185,7 @@ def _insufficient_allowed_tools(
             Sufficiency.SUFFICIENT_FOR_EDIT,
             Sufficiency.SUFFICIENT_FOR_VERIFY,
         }
-        and not _has_wiring_gap(manifest)
+        and not _has_wiring_gap(manifest, task_text=task_text)
     ):
         return edit_tools or default_tools
 
@@ -165,6 +193,7 @@ def _insufficient_allowed_tools(
         manifest,
         default_tools,
         no_gain_rounds=no_gain_rounds,
+        task_text=task_text,
     )
     if no_gain_rounds == 0 and (has_missing or has_stale):
         return retrieval or default_tools
@@ -204,6 +233,7 @@ def _recovery_allowed_tools(
     no_gain_rounds: int,
     view_last_round_all_duplicate: bool,
     needs_retrieval: bool,
+    task_text: str = "",
 ) -> frozenset[str]:
     """Edit recovery after validation/tool failures, with duplicate-round convergence."""
     if not needs_retrieval:
@@ -215,6 +245,7 @@ def _recovery_allowed_tools(
             manifest,
             default_tools,
             no_gain_rounds=no_gain_rounds,
+            task_text=task_text,
         )
         if no_gain_rounds == 0 and not view_last_round_all_duplicate:
             return frozenset(edit_tools | retrieval) or default_tools
@@ -223,6 +254,7 @@ def _recovery_allowed_tools(
             manifest,
             default_tools,
             allow_heavy=False,
+            task_text=task_text,
         )
     saturated = _apply_retrieval_saturation(
         retrieval,
@@ -245,6 +277,7 @@ def _validation_recovery_tools(
     task_mode: str = "edit",
     has_missing: bool = False,
     has_stale: bool = False,
+    task_text: str = "",
 ) -> frozenset[str]:
     """Allow repair, adding retrieval only for manifest-declared gaps."""
     edit, _ = _split_tool_groups(default_tools)
@@ -258,6 +291,7 @@ def _validation_recovery_tools(
         no_gain_rounds=no_gain_rounds,
         view_last_round_all_duplicate=view_last_round_all_duplicate,
         needs_retrieval=needs_evidence_refresh,
+        task_text=task_text,
     )
 
 
@@ -330,7 +364,8 @@ def _plan_edits_complete(
         return False
     if manifest is not None and manifest.missing_items:
         return False
-    if _has_wiring_gap(manifest):
+    task_text = _task_text_from_run_state(run_state)
+    if _has_wiring_gap(manifest, task_text=task_text):
         return False
     if _external_stale_blocks_edit_burst(manifest, edited_files):
         return False
@@ -405,6 +440,15 @@ def _edit_burst_active(
     manifest = getattr(run_state, "manifest", None)
     if manifest is not None and manifest.failure_items:
         return False
+    if manifest is not None:
+        edited = {_norm_file(path) for path in edited_files if path}
+        partner_stale = [
+            item
+            for item in stale_needing_refresh(manifest)
+            if item.file and _norm_file(item.file) not in edited
+        ]
+        if partner_stale:
+            return False
     if _external_stale_blocks_edit_burst(manifest, edited_files):
         return False
     return True
@@ -446,6 +490,7 @@ def determine_allowed_tools(
     run_state = getattr(state, "run_state", None)
     checklist = tuple(getattr(state, "checklist", ()) or ())
     _ = gravity_controller
+    task_text = _task_text_from_run_state(run_state) if run_state is not None else ""
     task_mode = str(getattr(run_state, "task_mode", "diagnose") or "diagnose")
     edit_tools, _ = _split_tool_groups(default_tools)
     manifest = getattr(run_state, "manifest", None)
@@ -479,6 +524,7 @@ def determine_allowed_tools(
             task_mode=task_mode,
             has_missing=has_missing,
             has_stale=has_stale,
+            task_text=task_text,
         )
 
     if manifest is not None and manifest.failure_items:
@@ -492,6 +538,7 @@ def determine_allowed_tools(
             no_gain_rounds=no_gain_rounds,
             view_last_round_all_duplicate=view_last_round_all_duplicate,
             needs_retrieval=has_missing or has_stale,
+            task_text=task_text,
         )
 
     if validation_status == "failed":
@@ -505,6 +552,7 @@ def determine_allowed_tools(
             no_gain_rounds=no_gain_rounds,
             view_last_round_all_duplicate=view_last_round_all_duplicate,
             needs_retrieval=has_missing or has_stale,
+            task_text=task_text,
         )
 
     # Post-plan verification reopens retrieval, but yields to duplicate-round
@@ -526,7 +574,10 @@ def determine_allowed_tools(
         }
         and not has_missing
         and view_last_round_all_duplicate
-        and not _has_wiring_gap(manifest)
+        and (
+            not _has_wiring_gap(manifest, task_text=task_text)
+            or int(getattr(run_state, "retrieval_no_gain_rounds", 0) or 0) >= 2
+        )
         and _edit_allowed(
             task_mode=task_mode,
             sufficiency=sufficiency,
@@ -559,6 +610,7 @@ def determine_allowed_tools(
             has_missing=has_missing,
             has_stale=has_stale,
             grep_suggested_views=grep_suggested_views,
+            task_text=task_text,
         )
 
     if task_mode == "diagnose":
@@ -573,6 +625,7 @@ def determine_allowed_tools(
                 has_missing=has_missing,
                 has_stale=has_stale,
                 grep_suggested_views=grep_suggested_views,
+                task_text=task_text,
             )
         if has_stale:
             return (
@@ -580,6 +633,7 @@ def determine_allowed_tools(
                     manifest,
                     default_tools,
                     allow_heavy=False,
+                    task_text=task_text,
                 )
                 or default_tools
             )
@@ -596,6 +650,7 @@ def determine_allowed_tools(
                     has_missing=has_missing,
                     has_stale=has_stale,
                     grep_suggested_views=grep_suggested_views,
+                    task_text=task_text,
                 )
             retrieval = PRIMARY_RETRIEVAL_TOOLS & default_tools
             return _apply_retrieval_saturation(
@@ -608,8 +663,12 @@ def determine_allowed_tools(
             ) or default_tools
         return frozenset()
 
-    profile = retrieval_profile(manifest) if manifest is not None else None
-    has_wiring_gap = _has_wiring_gap(manifest)
+    profile = (
+        retrieval_profile(manifest, task_text=task_text)
+        if manifest is not None
+        else None
+    )
+    has_wiring_gap = _has_wiring_gap(manifest, task_text=task_text)
     grep_pending = (
         grep_pending_caller_loads(manifest, grep_suggested_views)
         if manifest is not None
@@ -647,6 +706,7 @@ def determine_allowed_tools(
         manifest,
         default_tools,
         allow_heavy=False,
+        task_text=task_text,
     )
     if not blocks_edit and not has_missing:
         retrieval = _apply_retrieval_saturation(
@@ -673,6 +733,7 @@ def determine_allowed_tools(
                 manifest,
                 default_tools,
                 no_gain_rounds=no_gain_rounds,
+                task_text=task_text,
             )
             or default_tools
         )
@@ -687,3 +748,106 @@ def post_edit_verification_ready(
 ) -> bool:
     """Public wrapper for execution-card and loop integration."""
     return _post_edit_verification_ready(run_state, checklist=checklist)
+
+
+def _build_scoring_context(
+    run_state: Any,
+    *,
+    checklist: tuple[str, ...],
+    has_compile_error: bool,
+    validation_error: str | None,
+) -> ToolScoringContext:
+    """Flatten manifest + runtime signals into the tool scorer's input."""
+    task_mode = str(getattr(run_state, "task_mode", "diagnose") or "diagnose")
+    task_text = _task_text_from_run_state(run_state)
+    manifest = getattr(run_state, "manifest", None)
+    metrics = manifest_metrics(manifest) if manifest is not None else None
+    profile = (
+        retrieval_profile(manifest, task_text=task_text)
+        if manifest is not None
+        else None
+    )
+    sufficiency, has_missing, has_stale = _manifest_state(run_state)
+    grep_suggested_views = tuple(
+        getattr(run_state, "grep_suggested_views", ()) or ()
+    )
+    grep_pending = (
+        bool(grep_pending_caller_loads(manifest, grep_suggested_views))
+        if manifest is not None
+        else False
+    )
+    validation = getattr(run_state, "validation", None)
+    validation_status = str(getattr(validation, "status", "not_run") or "not_run")
+    concrete_error = bool((validation_error or "").strip()) or has_compile_error
+    phase = getattr(run_state, "phase", None)
+    has_failures = bool(getattr(manifest, "failure_items", ()))
+
+    # Mirror the gate waterfall precedence: verification reopens retrieval ahead of
+    # edit_burst, so the two phase flags must be mutually exclusive for the scorer
+    # (otherwise edit_burst's edit-bias would drown out verification's view-bias).
+    verification_mode = _verification_mode_active(run_state, checklist=checklist)
+    edit_burst = _edit_burst_active(
+        run_state,
+        validation_error=(validation_error or "").strip(),
+        has_compile_error=has_compile_error,
+    ) and not verification_mode
+
+    return ToolScoringContext(
+        task_mode=task_mode,
+        is_responding=phase == RunPhase.RESPONDING,
+        sufficiency=sufficiency,
+        coverage=metrics.coverage if metrics is not None else 0.0,
+        missing_ratio=metrics.missing_ratio if metrics is not None else 0.0,
+        stale_ratio=metrics.stale_ratio if metrics is not None else 0.0,
+        critical_missing=bool(metrics.critical_missing) if metrics is not None else False,
+        has_missing=has_missing,
+        has_stale=has_stale,
+        wiring_gap=_has_wiring_gap(manifest, task_text=task_text),
+        grep_pending=grep_pending,
+        validation_failed=validation_status == "failed" or concrete_error,
+        edit_burst=edit_burst,
+        verification_mode=verification_mode,
+        no_gain_rounds=int(getattr(run_state, "retrieval_no_gain_rounds", 0) or 0),
+        view_last_round_all_duplicate=bool(
+            getattr(run_state, "view_last_round_all_duplicate", False)
+        ),
+        edit_patch_failed=bool(getattr(run_state, "edit_patch_failed", False)),
+        has_failures=has_failures,
+        actionable_suggested_views=has_actionable_suggested_views(grep_suggested_views),
+        bootstrap=bool(profile.bootstrap) if profile is not None else False,
+    )
+
+
+def allocate_tools(
+    state: AssembledState | Any,
+    gravity_controller: Any,
+    default_tools: frozenset[str],
+    has_compile_error: bool = False,
+    *,
+    validation_error: str | None = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> ToolAllocation:
+    """Gate tools via the existing waterfall, then rank them with the scorer.
+
+    ``determine_allowed_tools`` is the hard-gate authority (safety constraints),
+    so its result becomes ``allowed``. The probabilistic scorer then ranks that
+    gated set so the Core LLM is steered toward the highest-probability tool.
+    """
+    allowed = determine_allowed_tools(
+        state,
+        gravity_controller,
+        default_tools,
+        has_compile_error=has_compile_error,
+        validation_error=validation_error,
+    )
+    run_state = getattr(state, "run_state", None)
+    if run_state is None:
+        return ToolAllocation(allowed=allowed, temperature=temperature)
+    checklist = tuple(getattr(state, "checklist", ()) or ())
+    ctx = _build_scoring_context(
+        run_state,
+        checklist=checklist,
+        has_compile_error=has_compile_error,
+        validation_error=validation_error,
+    )
+    return allocate(ctx, allowed, temperature=temperature)

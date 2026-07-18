@@ -102,6 +102,12 @@ def build_reference_edges(
             targets = resolve_import_targets(
                 dst, module_index=module_index, file_nodes=file_nodes
             )
+            if not targets:
+                targets = symbol_targets_by_name(
+                    dst,
+                    name_to_ids=name_to_ids,
+                    src_file=src,
+                )
             for tgt in targets:
                 if tgt != file_nodes[src]:
                     edges.append((file_nodes[src], tgt))

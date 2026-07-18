@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import litellm
 
 from src.agent.types import Message
-
-if TYPE_CHECKING:
-    from src.config.settings import MitKIISettings
+from src.config.settings import MitKIISettings
+from src.indexer.project_stack import apply_project_stack_to_settings
 
 from src.harness.checkpoint.rollback import RollbackManager
 from src.harness.checkpoint.store import CheckpointStore
@@ -149,4 +148,6 @@ class HarnessEngine:
     def create(cls, settings: MitKIISettings, project_root: Path | None = None) -> HarnessEngine:
         """Build a fully-initialised ``HarnessEngine`` from application settings."""
         settings.ensure_dirs()
-        return cls(settings, project_root=project_root)
+        root = (project_root or settings.project_root or Path.cwd()).resolve()
+        settings = apply_project_stack_to_settings(settings, root)
+        return cls(settings, project_root=root)

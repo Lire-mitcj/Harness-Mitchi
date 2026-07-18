@@ -49,6 +49,7 @@ async def inspect_tool_request_async(
     manifest: Any = None,
     project_root: Path | None = None,
     edit_recovery: bool = False,
+    rounds_since_last_edit: int = 0,
 ) -> str | None:
     """Run static constraints, then fact-locking preflight hooks."""
     # 1. Layer 1: Static Constraints precheck
@@ -96,4 +97,5 @@ async def inspect_tool_request_async(
         modified_files=modified_files,
         manifest=manifest,
         edit_recovery=edit_recovery,
+        rounds_since_last_edit=rounds_since_last_edit,
     )

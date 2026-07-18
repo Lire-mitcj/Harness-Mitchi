@@ -10,6 +10,7 @@ from typing import Any
 from src.agent.sql_parser import UniversalSqlParser
 from src.indexer.ctags import CtagsIndexResult, CtagsSymbol, index_project
 from src.indexer.graph import build_reference_edges
+from src.indexer.proto_links import build_proto_reference_edges, proto_ctags_symbols
 from src.indexer.pagerank import pagerank
 from src.indexer.scanner import ProjectScanner
 
@@ -487,6 +488,7 @@ def build_repo_map(
     if indexed is None:
         indexed = index_project(root)
     indexed_symbols = _merge_sql_structural_symbols(root, indexed.symbols)
+    indexed_symbols = _merge_proto_symbols(root, indexed_symbols)
 
     name_to_ids: dict[str, list[str]] = {}
     file_nodes: dict[str, str] = {}
@@ -509,6 +511,14 @@ def build_repo_map(
             file_nodes=file_nodes,
             symbol_nodes=symbol_nodes,
             name_to_ids=name_to_ids,
+        )
+    )
+    edges.extend(
+        build_proto_reference_edges(
+            root,
+            symbol_nodes=symbol_nodes,
+            name_to_ids=name_to_ids,
+            file_nodes=file_nodes,
         )
     )
 
@@ -572,6 +582,19 @@ def build_repo_map(
         build_ms=elapsed,
         symbol_count=len(indexed_symbols),
     )
+
+
+def _merge_proto_symbols(
+    root: Path,
+    indexed_symbols: list[CtagsSymbol],
+) -> list[CtagsSymbol]:
+    merged: dict[tuple[str, str, int], CtagsSymbol] = {
+        (sym.file_path, sym.name, sym.start_line): sym
+        for sym in indexed_symbols
+    }
+    for symbol in proto_ctags_symbols(root):
+        merged.setdefault((symbol.file_path, symbol.name, symbol.start_line), symbol)
+    return list(merged.values())
 
 
 def _merge_sql_structural_symbols(

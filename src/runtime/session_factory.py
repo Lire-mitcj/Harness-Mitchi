@@ -8,6 +8,7 @@ from src.config.settings import MitKIISettings, get_settings
 from src.context.builder import ContextBuilder
 from src.context.file_tracker import FileTracker
 from src.harness.engine import HarnessEngine
+from src.indexer.project_stack import apply_project_stack_to_settings
 from src.indexer.repo_map_service import RepoMapService
 from src.llm.client import LLMClient
 from src.tools.registry import ToolRegistry, create_default_registry
@@ -53,6 +54,7 @@ def create_mitkii_session(
     settings = settings or get_settings()
     settings.ensure_dirs()
     root = (project_root or settings.project_root or Path.cwd()).resolve()
+    settings = apply_project_stack_to_settings(settings, root)
 
     file_tracker = FileTracker()
     repo_map_service: RepoMapService | None = None

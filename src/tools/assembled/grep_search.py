@@ -15,6 +15,13 @@ from src.tools.grep_match_symbols import (
     normalize_match_path,
     parse_rg_hit_line,
 )
+from src.indexer.language_profiles import (
+    build_import_mode_pattern,
+    build_symbol_mode_pattern,
+    default_profiles,
+    profiles_from_include_glob,
+)
+from src.indexer.project_stack import detect_project_stack
 
 MAX_BATCH_PATTERNS = 8
 _CONTEXT_AFTER_PATTERN = re.compile(
@@ -162,6 +169,18 @@ class GrepSearchTool(Tool):
                 pass
             raise TimeoutError("Search timed out after 30s") from exc
 
+    def _resolve_profiles(
+        self,
+        *,
+        include: str | None,
+    ) -> tuple[Any, ...]:
+        narrowed = profiles_from_include_glob(include)
+        if narrowed:
+            return narrowed
+        if self.project_root is not None:
+            return detect_project_stack(self.project_root).profiles()
+        return default_profiles()
+
     async def _collect_stdout_for_pattern(
         self,
         *,
@@ -170,16 +189,14 @@ class GrepSearchTool(Tool):
         path: str,
         mode: str,
         case_insensitive: bool,
+        include: str | None = None,
     ) -> tuple[int, str, str]:
+        profiles = self._resolve_profiles(include=include)
         if mode == "symbol":
-            has_regex = any(c in pattern for c in "*+?()[]{}|\\^$")
-            pat_escaped = pattern if has_regex else re.escape(pattern)
-            search_pat = rf"\b(?:async\s+def|def|class)\s+{pat_escaped}\b"
+            search_pat = build_symbol_mode_pattern(pattern, profiles)
             return await self._run_rg(cmd_base, search_pat, path)
         if mode == "import":
-            has_regex = any(c in pattern for c in "*+?()[]{}|\\^$")
-            pat_escaped = pattern if has_regex else re.escape(pattern)
-            search_pat = rf"\b(import|from)\b.*{pat_escaped}"
+            search_pat = build_import_mode_pattern(pattern, profiles)
             return await self._run_rg(cmd_base, search_pat, path)
 
         context_after = 2 if _CONTEXT_AFTER_PATTERN.search(pattern) else 0
@@ -189,7 +206,7 @@ class GrepSearchTool(Tool):
         is_identifier = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", pattern) is not None
 
         if mode == "default" and is_identifier:
-            def_pattern = rf"\b(?:async\s+def|def|class)\s+{pattern}\b"
+            def_pattern = build_symbol_mode_pattern(pattern, profiles)
             code, out, err = await self._run_rg(cmd_base, def_pattern, path)
             def_lines = out.strip().splitlines() if code == 0 and out.strip() else []
             fallback_code, fallback_out, fallback_err = await self._run_rg(
@@ -443,6 +460,7 @@ class GrepSearchTool(Tool):
                         path=path,
                         mode=mode,
                         case_insensitive=case_insensitive,
+                        include=include,
                     )
                     for pattern in pattern_list
                 ]

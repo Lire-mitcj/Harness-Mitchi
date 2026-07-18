@@ -290,6 +290,13 @@ class CLIRenderer:
 # ------------------------------------------------------------------
 
 
+def _has_grep_display_fields(params: dict[str, Any]) -> bool:
+    if str(params.get("pattern") or "").strip():
+        return True
+    patterns = params.get("patterns")
+    return isinstance(patterns, list) and any(str(item or "").strip() for item in patterns)
+
+
 def _format_compact_tool_call(name: str, params: dict[str, Any]) -> str:
     if name == "read_file":
         path = params.get("path", "?")
@@ -306,6 +313,8 @@ def _format_compact_tool_call(name: str, params: dict[str, Any]) -> str:
             return ", ".join(shown) + suffix
         return "?"
     if name == "grep_search":
+        if isinstance(params.get("_raw"), str) and not _has_grep_display_fields(params):
+            return "（流式参数补全中）"
         patterns = params.get("patterns")
         if isinstance(patterns, list) and patterns:
             preview = ", ".join(repr(str(item)) for item in patterns[:3])

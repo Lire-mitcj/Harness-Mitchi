@@ -170,6 +170,13 @@ class MitKIISettings(BaseSettings):
         description="Minimum DDL affinity required before it is emitted as Layer-2 soft evidence.",
     )
     cursor_validator_command: list[str] = Field(default_factory=lambda: ["pytest"])
+    cursor_validator_auto: bool = Field(
+        default=True,
+        description=(
+            "When true and cursor_validator_command is still the default pytest, "
+            "bind validator to the detected project stack (go test, mvn test, etc.)."
+        ),
+    )
     cursor_validator_timeout: float = Field(default=120.0, ge=1.0, le=1800.0)
     cursor_validator_model: str = "openai/Qwen/Qwen2.5-32B-Instruct"
     cursor_validator_semantic_timeout: float = Field(default=30.0, ge=1.0, le=120.0)
@@ -377,6 +384,20 @@ class MitKIISettings(BaseSettings):
         ge=5.0,
         le=600.0,
         description="Seconds to wait for background repo map build before Planner.",
+    )
+    repo_map_include_globs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "When non-empty, only index repo_map symbols from paths matching these globs "
+            "(e.g. cmd/**, internal/**, api/**)."
+        ),
+    )
+    repo_map_exclude_globs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Exclude matching paths from repo_map indexing "
+            "(e.g. agentmesh_orchestrator/**, **/testdata/**)."
+        ),
     )
     context_retriever_enabled: bool = Field(
         default=True,

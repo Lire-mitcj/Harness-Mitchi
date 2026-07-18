@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.tools.arg_normalize import normalize_grep_search_args, normalize_shell_exec_args
+from src.tools.arg_normalize import (
+    normalize_grep_search_args,
+    normalize_shell_exec_args,
+    unwrap_raw_tool_arguments,
+)
 
 
 class MockSubtask:
@@ -64,3 +68,18 @@ def test_normalize_shell_defaults_cwd(tmp_path: Path) -> None:
         project_root=tmp_path,
     )
     assert args["working_dir"] == str(tmp_path.resolve())
+
+
+def test_unwrap_raw_salvages_truncated_json_fields() -> None:
+    args = unwrap_raw_tool_arguments({"_raw": '{"include": "*.'})
+    assert args.get("include") == "*."
+
+
+def test_normalize_grep_from_raw_partial_json_fills_pattern_from_hint() -> None:
+    args = normalize_grep_search_args(
+        {"_raw": '{"include": "*.'},
+        hint_text="优化 grpc_server @mention 检测并更新 noise_policy.yaml bot_nicknames",
+    )
+    assert "pattern" in args or "patterns" in args
+    joined = " ".join(args.get("patterns") or [args.get("pattern", "")]).casefold()
+    assert "mention" in joined or "bot" in joined or "noise" in joined

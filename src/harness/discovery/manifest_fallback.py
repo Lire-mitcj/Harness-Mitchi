@@ -11,7 +11,7 @@ from src.harness.discovery.manifest import (
 )
 
 _GREP_PATH = re.compile(
-    r"^\.?/?([\w./-]+\.(?:py|sql|js|ts|go|java|rb|yml|yaml))(?::\d+)?:",
+    r"^\.?/?([\w./-]+\.(?:py|sql|js|ts|go|java|rb|yml|yaml|xml|proto))(?::\d+)?:",
     re.M,
 )
 _READ_FILES_HEADER = re.compile(

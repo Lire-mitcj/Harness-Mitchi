@@ -130,6 +130,7 @@ class RunState:
     grep_suggested_views: tuple[dict[str, Any], ...] = ()
     edit_patch_failed: bool = False
     rounds_since_last_edit: int = 0
+    task_text: str = ""
 
     @property
     def retrieval_complete(self) -> bool:
@@ -228,6 +229,7 @@ def start_run(
         evidence=EvidenceLedger(required=requirements_for_task(task_text)),
         retry_budget=RetryBudget(limit=retry_limit),
         manifest=manifest_template_for_task(task_text, task_mode),
+        task_text=task_text.strip(),
     )
 
 
@@ -369,8 +371,15 @@ def reduce_run_state(
     if event.kind == "edit_applied":
         files = tuple(dict.fromkeys((*state.changes.files, event.file or "")))
         files = tuple(item for item in files if item)
+        edited = _norm_path(event.file or "")
+        stale_targets = {edited} if edited else set()
+        from src.agent.manifest import cross_file_partner_files
+
+        stale_targets |= set(cross_file_partner_files(state.manifest, edited))
         manifest = _mark_stale_for_files(
-            state.manifest, {event.file or ""}, "file modified by decision_edit"
+            state.manifest,
+            stale_targets,
+            "file modified by decision_edit",
         )
         return (
             replace(

@@ -679,8 +679,94 @@ def test_duplicate_view_keeps_retrieval_open_when_wiring_gap() -> None:
     state = SimpleNamespace(run_state=run_state)
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
-    assert "view_symbol_code" in allowed
+    assert "grep_search" in allowed
     assert "decision_edit" in allowed
+    assert "view_symbol_code" not in allowed
+
+
+def test_duplicate_view_closes_retrieval_when_wiring_gap_saturated() -> None:
+    """After repeated duplicate views, drop retrieval even if wiring_gap remains."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:main.py:sqlalchemy_error_handler",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="main.py",
+                    span=(49, 55),
+                    symbol="sqlalchemy_error_handler",
+                    status="SATISFIED",
+                ),
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 350),
+                    symbol="build_router",
+                    status="SATISFIED",
+                ),
+            ),
+            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        ),
+        validation=SimpleNamespace(status="not_run"),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=2,
+        view_last_round_all_duplicate=True,
+        edit_patch_failed=False,
+        task_text="wire list.py router into main.py include_router",
+    )
+    state = SimpleNamespace(run_state=run_state)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == frozenset({"decision_edit"})
+
+
+def test_mention_task_skips_wiring_gap_for_tool_allocation() -> None:
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:main.py:sqlalchemy_error_handler",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="main.py",
+                    span=(49, 55),
+                    symbol="sqlalchemy_error_handler",
+                    status="SATISFIED",
+                ),
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 350),
+                    symbol="build_router",
+                    status="SATISFIED",
+                ),
+            ),
+            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        ),
+        validation=SimpleNamespace(status="not_run"),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=1,
+        view_last_round_all_duplicate=True,
+        edit_patch_failed=False,
+        task_text="在 noise_policy.yaml 添加 bot_nicknames，优化 @mention 检测",
+    )
+    state = SimpleNamespace(run_state=run_state)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == frozenset({"decision_edit"})
 
 
 def test_duplicate_view_overrides_edit_patch_failed_recovery() -> None:
@@ -823,7 +909,7 @@ def test_verification_converges_to_edit_only_on_duplicate_view() -> None:
 
 
 def test_post_edit_verification_opens_when_plan_edits_complete() -> None:
-    """After the last planned file is edited, reopen retrieval without waiting a round."""
+    """After a cross-file edit, partner-file staleness reopens view for verification."""
     run_state = SimpleNamespace(
         task_mode="edit",
         phase=RunPhase.ACTING,
@@ -854,7 +940,7 @@ def test_post_edit_verification_opens_when_plan_edits_complete() -> None:
             sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
         ),
         validation=SimpleNamespace(status="passed"),
-        changes=SimpleNamespace(files=("main.py",)),
+        changes=SimpleNamespace(files=("list.py",)),
         retrieval_no_gain_rounds=1,
         view_last_round_all_duplicate=False,
         edit_patch_failed=False,
@@ -864,7 +950,6 @@ def test_post_edit_verification_opens_when_plan_edits_complete() -> None:
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
     assert "view_symbol_code" in allowed
-    assert "grep_search" in allowed
     assert "decision_edit" in allowed
 
 

@@ -181,7 +181,15 @@ def get_tool_status_text(name: str, arguments: dict[str, Any]) -> str:
             path = arguments.get("path", "")
             return f"正在删除文件: {path}…" if path else "正在删除文件…"
         case "grep_search":
-            query = arguments.get("query", "")
+            pattern = str(arguments.get("pattern") or "").strip()
+            patterns = arguments.get("patterns")
+            if isinstance(patterns, list):
+                preview = ", ".join(str(item) for item in patterns[:3] if str(item).strip())
+            else:
+                preview = ""
+            query = preview or pattern
+            if not query and isinstance(arguments.get("_raw"), str):
+                query = "（参数补全中）"
             return f"正在搜索代码: {query}…" if query else "正在搜索代码…"
         case "glob_files":
             pattern = arguments.get("pattern", "")

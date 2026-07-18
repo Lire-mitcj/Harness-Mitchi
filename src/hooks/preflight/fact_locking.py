@@ -254,6 +254,7 @@ async def inspect_fact_locking_async(
     modified_files: list[str] | None = None,
     manifest: Any = None,
     edit_recovery: bool = False,
+    rounds_since_last_edit: int = 0,
 ) -> str | None:
     """Layer 2: Async Fact Locking, line span matching, and semantic query gating.
 
@@ -549,8 +550,14 @@ async def inspect_fact_locking_async(
 
         # Redundancy gating to prevent no-novelty grep loops. Tool-opening policy
         # (convergence / gravity) is owned by reallocate_tools, not fact locking.
-        # After a blocked edit, allow one recovery grep/view without semantic blocks.
-        if not has_compile_error and not edit_recovery:
+        # After a blocked edit or post-edit refresh window, allow recovery grep/view.
+        post_edit_refresh = bool(
+            modified_files
+            and rounds_since_last_edit <= 1
+            and manifest is not None
+            and getattr(manifest, "has_stale", False)
+        )
+        if not has_compile_error and not edit_recovery and not post_edit_refresh:
             # C. Symbol Dominance Gate
             if structural_connection == 1.0 and (lexical_similarity > 0.8 or semantic_similarity > 0.8):
                 return (

@@ -3,6 +3,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.indexer.language_profiles import LanguageProfile
+
+from src.indexer.language_profiles import profile_for_extension
 
 
 @dataclass
@@ -45,7 +51,48 @@ class CodeParser:
             return self._parse_python(str(path), content)
         if suffix == ".sql":
             return self._parse_sql(str(path), content)
+        profile = profile_for_extension(suffix)
+        if profile is not None:
+            return self._parse_with_profile(str(path), content, profile)
         return self._parse_generic(str(path), content)
+
+    def _parse_with_profile(
+        self,
+        path: str,
+        content: str,
+        profile: LanguageProfile,
+    ) -> ParseResult:
+        result = ParseResult(path=path)
+        lines = content.splitlines()
+        seen: set[tuple[str, int]] = set()
+        for index, line in enumerate(lines, 1):
+            for pattern in profile.symbol_extractors:
+                match = pattern.search(line)
+                if not match:
+                    continue
+                name = next((g for g in match.groups() if g), None)
+                if not name:
+                    continue
+                key = (name, index)
+                if key in seen:
+                    break
+                seen.add(key)
+                kind = "class" if profile.id in {"java", "proto"} and "class" in pattern.pattern else "function"
+                if profile.id == "go" and "type" in pattern.pattern:
+                    kind = "class"
+                result.functions.append(
+                    Symbol(
+                        name=name,
+                        kind=kind,
+                        start_line=index,
+                        end_line=index,
+                        signature=line.strip()[:160],
+                    )
+                )
+                break
+            if profile.import_line_re.search(line):
+                result.imports.append(line.strip())
+        return result
 
     def _parse_python(self, path: str, content: str) -> ParseResult:
         result = ParseResult(path=path)

@@ -127,7 +127,12 @@ class RepoMapService:
                 source = indexed.source
 
         if indexed is None or not indexed.symbols:
-            indexed = index_project(self.project_root)
+            include_globs, exclude_globs = self._repo_map_globs()
+            indexed = index_project(
+                self.project_root,
+                include_globs=include_globs,
+                exclude_globs=exclude_globs,
+            )
             source = indexed.source
             if self._cache is not None:
                 self._cache.replace_all(indexed)
@@ -190,24 +195,43 @@ class RepoMapService:
         return self._map
 
     def _reindex_dirty_or_full(self):
+        include_globs, exclude_globs = self._repo_map_globs()
         if self._cache is None or not self._dirty_paths:
-            indexed = index_project(self.project_root)
+            indexed = index_project(
+                self.project_root,
+                include_globs=include_globs,
+                exclude_globs=exclude_globs,
+            )
             if self._cache is not None:
                 self._cache.replace_all(indexed)
             return indexed
 
         if len(self._dirty_paths) >= _FULL_REINDEX_DIRTY_THRESHOLD:
-            indexed = index_project(self.project_root)
+            indexed = index_project(
+                self.project_root,
+                include_globs=include_globs,
+                exclude_globs=exclude_globs,
+            )
             self._cache.replace_all(indexed)
             return indexed
 
         self._cache.reindex_paths(self._dirty_paths)
         indexed = self._cache.load_index()
         if indexed is None or not indexed.symbols:
-            indexed = index_project(self.project_root)
+            indexed = index_project(
+                self.project_root,
+                include_globs=include_globs,
+                exclude_globs=exclude_globs,
+            )
             self._cache.replace_all(indexed)
         indexed.source = "cache"
         return indexed
+
+    def _repo_map_globs(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        return (
+            tuple(self._settings.repo_map_include_globs),
+            tuple(self._settings.repo_map_exclude_globs),
+        )
 
     @property
     def map(self) -> RepoMap | None:

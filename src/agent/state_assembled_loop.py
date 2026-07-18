@@ -65,7 +65,11 @@ from src.tools.grep_match_symbols import grep_search_fingerprint
 from src.tools.grep_tool_args import prepare_grep_search_args
 from src.hooks.after_tool import apply_after_tool_output_limit
 from src.hooks.post_tool_context import apply_post_tool_context_hook
-from src.hooks.reallocate_tools import determine_allowed_tools, post_edit_verification_ready
+from src.hooks.reallocate_tools import (
+    allocate_tools,
+    determine_allowed_tools,
+    post_edit_verification_ready,
+)
 from src.hooks.retrieval_convergence import (
     RETRIEVAL_TOOLS,
     format_duplicate_retrieval_receipt,
@@ -1782,6 +1786,104 @@ class StateAssembledLoop:
             messages_history=tuple(sanitized_messages),
         )
 
+    def _invalidate_context_files(self, files: set[str]) -> None:
+        """Drop durable code anchors and search cache entries for the given paths."""
+        invalidated = {
+            str(path).replace("\\", "/").lstrip("./") for path in files if path
+        }
+        if not invalidated:
+            return
+        removed_ids = {
+            _anchor_id(item) for item in self.state.context_anchors.code
+            if str(item.get("file") or "").replace("\\", "/").lstrip("./") in invalidated
+        }
+        removed_ids.update(
+            key for key in self.state.context_anchors.summaries
+            if any(key.startswith(f"{path}:") for path in invalidated)
+        )
+        removed_ids.update(
+            key for key in self.state.context_anchors.schema_contracts
+            if any(key.startswith(f"{path}:") for path in invalidated)
+        )
+        code = tuple(
+            item for item in self.state.context_anchors.code
+            if str(item.get("file") or "").replace("\\", "/").lstrip("./") not in invalidated
+        )
+        summaries = {
+            key: value for key, value in self.state.context_anchors.summaries.items()
+            if not any(key.startswith(f"{path}:") for path in invalidated)
+        }
+        purposes = {
+            key: value for key, value in self.state.context_anchors.purposes.items()
+            if not any(key.startswith(f"{path}:") for path in invalidated)
+        }
+        created_steps = {
+            key: value for key, value in self.state.context_anchors.created_steps.items()
+            if not any(key.startswith(f"{path}:") for path in invalidated)
+        }
+        file_contracts = {
+            key: value for key, value in self.state.context_anchors.file_contracts.items()
+            if key not in invalidated
+        }
+        file_facts = {
+            key: value for key, value in self.state.context_anchors.file_facts.items()
+            if key not in invalidated
+        }
+        schemas = {
+            key: value for key, value in self.state.context_anchors.schema_contracts.items()
+            if not any(key.startswith(f"{path}:") for path in invalidated)
+        }
+        cache = dict(self.state.search_cache)
+        cache["symbol_projections"] = [
+            item for item in cache.get("symbol_projections") or []
+            if str(item.get("file") or "").replace("\\", "/").lstrip("./") not in invalidated
+        ]
+        raw_store = cache.get("raw_evidence_store")
+        if isinstance(raw_store, list):
+            cache["raw_evidence_store"] = [
+                item for item in raw_store
+                if not isinstance(item, dict)
+                or str(item.get("file") or "").replace("\\", "/").lstrip("./") not in invalidated
+            ]
+        encoded = cache.get("search_output")
+        if isinstance(encoded, str):
+            try:
+                payload = json.loads(encoded)
+                if isinstance(payload, list):
+                    payload = [
+                        item for item in payload
+                        if not isinstance(item, dict)
+                        or str(item.get("file") or "").replace("\\", "/").lstrip("./") not in invalidated
+                    ]
+                    cache["search_output"] = json.dumps(payload, ensure_ascii=False, indent=2)
+            except (TypeError, json.JSONDecodeError):
+                pass
+        self.state = replace(
+            self.state,
+            context_anchors=replace(
+                self.state.context_anchors,
+                code=code,
+                summaries=summaries,
+                purposes=purposes,
+                created_steps=created_steps,
+                file_contracts=file_contracts,
+                file_facts=file_facts,
+                schema_contracts=schemas,
+                last_updated_step=max(created_steps.values()) if created_steps else None,
+            ),
+            search_cache=cache,
+        )
+        self._dispatch_run_event(RunEvent(
+            "artifacts_invalidated",
+            artifact_refs=ArtifactRefs(
+                code=tuple(removed_ids),
+                schemas=tuple(removed_ids),
+                facts=tuple(removed_ids),
+                summaries=tuple(removed_ids),
+            ),
+            reason=f"files changed: {', '.join(sorted(invalidated))}",
+        ))
+
     def _apply_context_update(self, result: ToolResult) -> dict[str, Any] | None:
         metadata = result.metadata or {}
         run_event = _run_evidence_event(result)
@@ -1795,89 +1897,7 @@ class StateAssembledLoop:
             str(path) for path in update.get("invalidate_code_files") or [] if path
         }
         if invalidated:
-            removed_ids = {
-                _anchor_id(item) for item in self.state.context_anchors.code
-                if str(item.get("file") or "") in invalidated
-            }
-            removed_ids.update(
-                key for key in self.state.context_anchors.summaries
-                if any(key.startswith(f"{path}:") for path in invalidated)
-            )
-            removed_ids.update(
-                key for key in self.state.context_anchors.schema_contracts
-                if any(key.startswith(f"{path}:") for path in invalidated)
-            )
-            code = tuple(
-                item for item in self.state.context_anchors.code
-                if str(item.get("file") or "") not in invalidated
-            )
-            summaries = {
-                key: value for key, value in self.state.context_anchors.summaries.items()
-                if not any(key.startswith(f"{path}:") for path in invalidated)
-            }
-            purposes = {
-                key: value for key, value in self.state.context_anchors.purposes.items()
-                if not any(key.startswith(f"{path}:") for path in invalidated)
-            }
-            created_steps = {
-                key: value for key, value in self.state.context_anchors.created_steps.items()
-                if not any(key.startswith(f"{path}:") for path in invalidated)
-            }
-            file_contracts = {
-                key: value for key, value in self.state.context_anchors.file_contracts.items()
-                if key not in invalidated
-            }
-            file_facts = {
-                key: value for key, value in self.state.context_anchors.file_facts.items()
-                if key not in invalidated
-            }
-            schemas = {
-                key: value for key, value in self.state.context_anchors.schema_contracts.items()
-                if not any(key.startswith(f"{path}:") for path in invalidated)
-            }
-            cache = dict(self.state.search_cache)
-            cache["symbol_projections"] = [
-                item for item in cache.get("symbol_projections") or []
-                if str(item.get("file") or "") not in invalidated
-            ]
-            encoded = cache.get("search_output")
-            if isinstance(encoded, str):
-                try:
-                    payload = json.loads(encoded)
-                    if isinstance(payload, list):
-                        payload = [
-                            item for item in payload
-                            if not isinstance(item, dict)
-                            or str(item.get("file") or "") not in invalidated
-                        ]
-                        cache["search_output"] = json.dumps(payload, ensure_ascii=False, indent=2)
-                except (TypeError, json.JSONDecodeError):
-                    pass
-            self.state = replace(
-                self.state,
-                context_anchors=replace(
-                    self.state.context_anchors,
-                    code=code,
-                    summaries=summaries,
-                    purposes=purposes,
-                    created_steps=created_steps,
-                    file_contracts=file_contracts,
-                    file_facts=file_facts,
-                    schema_contracts=schemas,
-                    last_updated_step=max(created_steps.values()) if created_steps else None,
-                ),
-                search_cache=cache,
-            )
-            self._dispatch_run_event(RunEvent(
-                "artifacts_invalidated",
-                artifact_refs=ArtifactRefs(
-                    code=tuple(removed_ids),
-                    schemas=tuple(removed_ids),
-                    facts=tuple(removed_ids),
-                    summaries=tuple(removed_ids),
-                ),
-                reason=f"files changed: {', '.join(sorted(invalidated))}",
-            ))
+            self._invalidate_context_files(invalidated)
         completion = metadata.get("task_completion")
         return completion if isinstance(completion, dict) else None
 
@@ -2150,7 +2170,13 @@ class StateAssembledLoop:
             modified_files=list(self.state.run_state.changes.files),
             manifest=self.state.run_state.manifest,
             project_root=self.harness.project_root,
-            edit_recovery=bool(self.state.run_state.edit_patch_failed),
+            edit_recovery=bool(
+                self.state.run_state.edit_patch_failed
+                or self.state.run_state.manifest.has_stale
+            ),
+            rounds_since_last_edit=int(
+                getattr(self.state.run_state, "rounds_since_last_edit", 0)
+            ),
         )
 
     def _record_preflight_block(self, tc: ToolCall, err: str) -> ToolResult:
@@ -2500,13 +2526,14 @@ class StateAssembledLoop:
                 run_state=replace(self.state.run_state, manifest=projected_manifest),
             )
 
-            self._current_step_tools = determine_allowed_tools(
+            tool_allocation = allocate_tools(
                 self.state,
                 None,
                 default_tools=ASSEMBLED_TOOL_NAMES,
                 has_compile_error=bool(self._validation_error()),
                 validation_error=self._validation_error(),
             )
+            self._current_step_tools = tool_allocation.allowed
             self.state = replace(
                 self.state,
                 last_core_tools=self._current_step_tools,
@@ -2586,6 +2613,9 @@ class StateAssembledLoop:
                         self.state.run_state.view_last_round_all_duplicate
                     ),
                     verification_mode=verification_active,
+                    preferred_tool=tool_allocation.preferred,
+                    tool_probabilities=tool_allocation.probabilities,
+                    project_root=self.harness.project_root,
                 )
                 turn_context_block = _build_turn_context_block(
                     loaded_anchors=context_block,
@@ -2966,10 +2996,15 @@ class StateAssembledLoop:
             if len(batch) > 1:
                 # Parallel execution of safe retrieval tools
                 for tc in batch:
-                    yield tool_call_event(tc.name, tc.arguments)
+                    prepared_args = _prepare_tool_arguments(
+                        tc.name,
+                        dict(tc.arguments),
+                        hint_text=self._task_text,
+                    )
+                    yield tool_call_event(tc.name, prepared_args)
                     yield AgentEvent(
                         type=EventType.STATUS,
-                        content=get_tool_status_text(tc.name, tc.arguments),
+                        content=get_tool_status_text(tc.name, prepared_args),
                         data={"spinner_only": True, "phase": "executor"},
                     )
 
@@ -3026,7 +3061,13 @@ class StateAssembledLoop:
                         modified_files=list(self.state.run_state.changes.files),
                         manifest=self.state.run_state.manifest,
                         project_root=self.harness.project_root,
-                        edit_recovery=bool(self.state.run_state.edit_patch_failed),
+                        edit_recovery=bool(
+                            self.state.run_state.edit_patch_failed
+                            or self.state.run_state.manifest.has_stale
+                        ),
+                        rounds_since_last_edit=int(
+                            getattr(self.state.run_state, "rounds_since_last_edit", 0)
+                        ),
                     )
                     warning_feedback = None
                     is_hard_block = False
@@ -3206,7 +3247,17 @@ class StateAssembledLoop:
             else:
                 # Sequential execution
                 tc = batch[0]
-                yield tool_call_event(tc.name, tc.arguments)
+                prepared_args = _prepare_tool_arguments(
+                    tc.name,
+                    dict(tc.arguments),
+                    hint_text=self._task_text,
+                )
+                yield tool_call_event(tc.name, prepared_args)
+                yield AgentEvent(
+                    type=EventType.STATUS,
+                    content=get_tool_status_text(tc.name, prepared_args),
+                    data={"spinner_only": True, "phase": "executor"},
+                )
 
                 if tc.id in preflight_results:
                     result = preflight_results[tc.id]
@@ -3409,6 +3460,15 @@ class StateAssembledLoop:
                     retrieval_round_results.append((tc.name, result))
                 display_output = result.output if result.success else f"Error: {result.error}"
                 task_completion = self._apply_context_update(result)
+                if tc.name == "decision_edit" and result.success:
+                    from src.agent.manifest import cross_file_partner_files
+
+                    partners = cross_file_partner_files(
+                        self.state.run_state.manifest,
+                        str(tc.arguments.get("target_file") or ""),
+                    )
+                    if partners:
+                        self._invalidate_context_files(set(partners))
                 self._trace_tool_result(tc.name, display_output, success=result.success)
 
                 norm_args = _prepare_tool_arguments(

@@ -4,37 +4,58 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from src.indexer.language_profiles import (
+    SQL,
+    classify_line_with_profiles,
+    default_profiles,
+    extract_symbol_with_profiles,
+    profile_for_path,
+    profiles_from_include_glob,
+)
+from src.indexer.project_stack import detect_project_stack
+
 _SQL_DEFINITION_KINDS = "TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|EVENT"
+_DECORATOR_LINE_RE = re.compile(
+    r"@(?:app|router)\.(?:exception_handler|middleware|(?:get|post|put|delete|patch)\()",
+)
+_MOUNT_LINE_RE = re.compile(
+    r"\binclude_router\s*\(|\bFastAPI\s*\(|\bcreate_app\s*\(|\badd_exception_handler\s*\(",
+)
+_DEFINITION_LINE_RE = re.compile(r"\b(?:async\s+def|def|class)\s+")
+_SCHEMA_LINE_RE = re.compile(r"\bCREATE\s+(?:TABLE|VIEW)\b", re.IGNORECASE)
 
 
-def extract_symbol_from_match_line(content: str) -> str:
+def _active_profiles(
+    *,
+    file_path: str = "",
+    include: str | None = None,
+    project_root: Path | None = None,
+) -> tuple[Any, ...]:
+    narrowed = profiles_from_include_glob(include)
+    if narrowed:
+        return narrowed
+    profile = profile_for_path(file_path)
+    if profile is not None:
+        return (profile,)
+    if project_root is not None:
+        return detect_project_stack(project_root).profiles()
+    return default_profiles()
+
+
+def extract_symbol_from_match_line(
+    content: str,
+    *,
+    file_path: str = "",
+    project_root: Path | None = None,
+) -> str:
     """Derive a view_symbol_code target from a single grep match line."""
-    py_match = re.search(
-        r"\b(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)",
-        content,
-    )
-    if py_match:
-        return py_match.group(1)
-
-    sql_match = re.search(
-        r"(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?"
-        r"(?:DEFINER\s*=\s*\S+\s+)?(?:TEMP\s+|TEMPORARY\s+)?"
-        rf"(?:{_SQL_DEFINITION_KINDS})\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-        r"(?:`([^`]+)`|\"([^\"]+)\"|'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))",
-        content,
-    )
-    if sql_match:
-        for group in sql_match.groups():
-            if group:
-                return group
-
-    router_match = re.search(
-        r"@(?:app|router)\.\w+\([^)]*\).*?\b(?:async\s+def|def)\s+([A-Za-z_][A-Za-z0-9_]*)",
-        content,
-    )
-    if router_match:
-        return router_match.group(1)
-
+    profiles = _active_profiles(file_path=file_path, project_root=project_root)
+    sql_symbol = extract_symbol_with_profiles(content, (SQL,))
+    if sql_symbol:
+        return sql_symbol
+    symbol = extract_symbol_with_profiles(content, profiles)
+    if symbol:
+        return symbol
     return ""
 
 
@@ -228,34 +249,30 @@ def normalize_match_path(file_path: str, project_root: Path | None = None) -> st
     return text.lstrip("./")
 
 
-_MOUNT_LINE_RE = re.compile(r"\b(?:include_router|mount)\s*\(")
-_DECORATOR_LINE_RE = re.compile(
-    r"@(?:app|router)\.|exception_handler|add_exception_handler",
-)
-_DEFINITION_LINE_RE = re.compile(r"\b(?:async\s+def|def|class)\s+")
-_SCHEMA_LINE_RE = re.compile(r"\bCREATE\s+(?:TABLE|VIEW)\b", re.IGNORECASE)
-
-
-def classify_match_line(match_line: str, *, pattern: str = "") -> str:
+def classify_match_line(
+    match_line: str,
+    *,
+    pattern: str = "",
+    file_path: str = "",
+    project_root: Path | None = None,
+) -> str:
     """Classify a grep hit for ranking (definition > mount > call-site noise)."""
     line = str(match_line or "").strip()
     if not line:
         return "usage"
+    profiles = _active_profiles(file_path=file_path, project_root=project_root)
     if _SCHEMA_LINE_RE.search(line):
         return "schema"
-    if _DEFINITION_LINE_RE.search(line):
-        return "definition"
     if _DECORATOR_LINE_RE.search(line):
         return "decorator"
+    classified = classify_line_with_profiles(line, pattern=pattern, profiles=profiles)
+    if classified != "usage":
+        return classified
+    if _DEFINITION_LINE_RE.search(line):
+        return "definition"
     if _MOUNT_LINE_RE.search(line):
         return "mount"
-    if re.search(r"\b(?:import|from)\s+", line):
-        return "import"
-    leaf = str(pattern or "").split(".")[-1].strip()
-    if leaf and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", leaf):
-        if re.search(rf"\b{re.escape(leaf)}\s*\(", line) and not _DEFINITION_LINE_RE.search(line):
-            return "call_site"
-    return "usage"
+    return classified
 
 
 _MATCH_KIND_PRIORITY: dict[str, int] = {
@@ -273,6 +290,7 @@ def rank_matches(
     matches: list[dict[str, Any]],
     *,
     searched_patterns: Sequence[str] = (),
+    project_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Sort matches so definitions and wiring hits surface before call-site noise."""
     primary_pattern = str(searched_patterns[0] or "") if searched_patterns else ""
@@ -281,7 +299,13 @@ def rank_matches(
 
     for item in matches:
         pattern = str(item.get("matched_pattern") or primary_pattern)
-        kind = classify_match_line(str(item.get("match_line") or ""), pattern=pattern)
+        file_path = normalize_match_path(str(item.get("file") or ""))
+        kind = classify_match_line(
+            str(item.get("match_line") or ""),
+            pattern=pattern,
+            file_path=file_path,
+            project_root=project_root,
+        )
         item["match_kind"] = kind
         symbol = str(item.get("symbol") or "").strip()
         if not symbol and kind == "call_site":
@@ -292,7 +316,11 @@ def rank_matches(
         if kind == "definition":
             symbol = str(item.get("symbol") or "").strip()
             if not symbol:
-                symbol = extract_symbol_from_match_line(str(item.get("match_line") or ""))
+                symbol = extract_symbol_from_match_line(
+                    str(item.get("match_line") or ""),
+                    file_path=file_path,
+                    project_root=project_root,
+                )
                 if symbol:
                     item["symbol"] = symbol
             if symbol:
@@ -610,7 +638,11 @@ def parse_rg_hit_line(
     except ValueError:
         return None
     content = parts[2]
-    symbol_name = extract_symbol_from_match_line(content)
+    symbol_name = extract_symbol_from_match_line(
+        content,
+        file_path=file_path,
+        project_root=project_root,
+    )
     return {
         "file": file_path,
         "symbol": symbol_name,
@@ -630,7 +662,7 @@ def enrich_grep_matches(
     """Run ranking, span expansion, wiring resolution, and suggested view assembly."""
     if not matches:
         return [], []
-    matches = rank_matches(matches, searched_patterns=searched_patterns)
+    matches = rank_matches(matches, searched_patterns=searched_patterns, project_root=project_root)
     matches = expand_schema_definition_spans(matches, project_root=project_root)
     matches = fill_symbols_from_adjacent_lines(matches)
     matches = resolve_decorator_symbols_from_files(matches, project_root=project_root)

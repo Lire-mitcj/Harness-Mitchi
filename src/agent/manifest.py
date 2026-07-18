@@ -19,10 +19,23 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from pathlib import Path
 from typing import Literal
 
 from src.agent.evidence_slots import rule_matches, slot_def, slot_satisfy_rule
 from src.agent.grep_discovery import discovery_hint_lines
+from src.agent.wiring import (
+    caller_has_setup_evidence,
+    default_wiring_probe_symbol,
+    grep_patterns_for_wiring,
+    integration_layer,
+    mount_setup_confirmed,
+    peer_layers_skip_wiring,
+    task_needs_integration_wiring,
+    wiring_gap_message,
+    wiring_probe_symbols,
+)
+from src.indexer.language_profiles import ALL_PROFILES, SQL, extract_symbol_with_profiles
 
 
 class Sufficiency(StrEnum):
@@ -158,29 +171,48 @@ def stale_needing_refresh(manifest: StepManifest) -> tuple[EvidenceItem, ...]:
     return tuple(needing)
 
 
-_CALLER_SETUP_MAX_LINE = 45
-_CALLER_MOUNT_SYMBOLS = frozenset({
-    "create_app",
-    "wire_routes",
-    "include_router",
-    "application",
-})
-_SETUP_HEADER_MIN_WIDTH = 12
+def wiring_gap_lines(
+    manifest: StepManifest,
+    *,
+    task_text: str = "",
+) -> tuple[str, ...]:
+    """Caller/support files that lack entry/integration spans block cross-file bootstrap."""
+    if not task_needs_integration_wiring(task_text):
+        return ()
 
+    grounded = _grounded_observed_items(manifest)
+    if not grounded:
+        return ()
 
-def _caller_file_has_setup_evidence(items: Sequence[EvidenceItem]) -> bool:
-    """True when caller file has a mount/setup region loaded, not a single-line app."""
-    for item in items:
-        short = (item.symbol or "").split(".")[-1]
-        if short in _CALLER_MOUNT_SYMBOLS:
-            return True
-        if item.span is None:
+    symbol_files: dict[str, list[EvidenceItem]] = {}
+    for item in grounded:
+        if item.type != "symbol" or not item.file:
             continue
-        start, end = item.span
-        width = end - start + 1
-        if start <= _CALLER_SETUP_MAX_LINE and width >= _SETUP_HEADER_MIN_WIDTH:
-            return True
-    return False
+        norm = _norm_file(item.file)
+        symbol_files.setdefault(norm, []).append(item)
+
+    if len(symbol_files) < 2:
+        return ()
+
+    edit_target = _likely_edit_target_file(
+        grounded,
+        task_text=task_text,
+        manifest=manifest,
+    )
+    edit_norm = _norm_file(edit_target) if edit_target else None
+    edit_peer_skip = peer_layers_skip_wiring(edit_target or "")
+
+    gaps: list[str] = []
+    for norm, items in symbol_files.items():
+        if edit_norm and norm == edit_norm:
+            continue
+        file_label = items[0].file or norm
+        if edit_peer_skip and peer_layers_skip_wiring(file_label):
+            continue
+        if caller_has_setup_evidence(items, file_path=file_label):
+            continue
+        gaps.append(wiring_gap_message(file_label))
+    return tuple(gaps)
 
 
 def _observed_line_count(item: EvidenceItem) -> int:
@@ -221,55 +253,6 @@ def _likely_edit_target_file(
     return None
 
 
-def wiring_gap_lines(
-    manifest: StepManifest,
-    *,
-    task_text: str = "",
-) -> tuple[str, ...]:
-    """Caller/support files that lack app/init/mount spans block cross-file bootstrap."""
-    grounded = _grounded_observed_items(manifest)
-    if not grounded:
-        return ()
-
-    symbol_files: dict[str, list[EvidenceItem]] = {}
-    for item in grounded:
-        if item.type != "symbol" or not item.file:
-            continue
-        norm = _norm_file(item.file)
-        symbol_files.setdefault(norm, []).append(item)
-
-    if len(symbol_files) < 2:
-        return ()
-
-    edit_target = _likely_edit_target_file(
-        grounded,
-        task_text=task_text,
-        manifest=manifest,
-    )
-    edit_norm = _norm_file(edit_target) if edit_target else None
-
-    gaps: list[str] = []
-    for norm, items in symbol_files.items():
-        if edit_norm and norm == edit_norm:
-            continue
-        if _caller_file_has_setup_evidence(items):
-            continue
-        file_label = items[0].file or norm
-        gaps.append(
-            f"{file_label}: app/init/mount region not loaded "
-            f"(view include_router, app setup, or create_app first)"
-        )
-    return tuple(gaps)
-
-
-_WIRING_SETUP_SYMBOLS: tuple[str, ...] = (
-    "create_app",
-    "app",
-    "wire_routes",
-    "application",
-)
-
-
 def wiring_gap_pending_loads(
     manifest: StepManifest,
     *,
@@ -295,28 +278,32 @@ def wiring_gap_pending_loads(
     edit_norm = _norm_file(edit_target) if edit_target else None
 
     loads: list[dict[str, object]] = []
+    edit_peer_skip = peer_layers_skip_wiring(edit_target or "")
     for norm, items in symbol_files.items():
         if edit_norm and norm == edit_norm:
             continue
-        if _caller_file_has_setup_evidence(items):
-            continue
         file_label = str(items[0].file or norm)
+        if edit_peer_skip and peer_layers_skip_wiring(file_label):
+            continue
+        if caller_has_setup_evidence(items, file_path=file_label):
+            continue
         loaded_syms = {
             str(item.symbol)
             for item in items
             if item.symbol and item.status in {"SATISFIED", "STALE"}
         }
-        hint = next(
-            (sym for sym in _WIRING_SETUP_SYMBOLS if sym not in loaded_syms),
-            "create_app",
-        )
+        probes = wiring_probe_symbols(file_label)
+        hint = next((sym for sym in probes if sym not in loaded_syms), None)
+        if hint is None:
+            hint = default_wiring_probe_symbol(file_label)
+        patterns = grep_patterns_for_wiring(file_label)
         loads.append(
             {
                 "file": file_label,
                 "symbol": hint,
                 "span": [1, 80],
-                "grep_patterns": ("include_router", "create_app", "FastAPI("),
-                "reason": "caller mount/setup region not loaded",
+                "grep_patterns": patterns or grep_patterns_for_wiring(file_label),
+                "reason": "caller integration/bootstrap region not loaded",
             }
         )
     return tuple(loads)
@@ -341,7 +328,7 @@ def grep_pending_caller_loads(
             continue
         if view.get("resolved_from") not in {"mount_context", "decorator_context"}:
             continue
-        symbol = str(view.get("symbol") or "create_app")
+        symbol = str(view.get("symbol") or default_wiring_probe_symbol(file_label))
         span = view.get("span")
         load: dict[str, object] = {
             "file": file_label,
@@ -355,7 +342,24 @@ def grep_pending_caller_loads(
     return tuple(loads)
 
 
-def _cross_file_observed_ready(manifest: StepManifest) -> bool:
+def cross_file_partner_files(manifest: StepManifest, edited_file: str) -> frozenset[str]:
+    """Other observed symbol files in a multi-file bootstrap — refresh after one is edited."""
+    edited = _norm_file(edited_file)
+    symbol_files = {
+        _norm_file(item.file)
+        for item in manifest.observed_items
+        if item.file and item.type == "symbol" and item.status in {"SATISFIED", "STALE"}
+    }
+    if len(symbol_files) < 2 or not edited:
+        return frozenset()
+    return frozenset(path for path in symbol_files if path and path != edited)
+
+
+def _cross_file_observed_ready(
+    manifest: StepManifest,
+    *,
+    task_text: str = "",
+) -> bool:
     grounded = _grounded_observed_items(manifest)
     symbol_files = {
         _norm_file(item.file)
@@ -364,10 +368,14 @@ def _cross_file_observed_ready(manifest: StepManifest) -> bool:
     }
     if len(symbol_files) < 2:
         return False
-    return not wiring_gap_lines(manifest)
+    return not wiring_gap_lines(manifest, task_text=task_text)
 
 
-def retrieval_profile(manifest: StepManifest) -> RetrievalProfile:
+def retrieval_profile(
+    manifest: StepManifest,
+    *,
+    task_text: str = "",
+) -> RetrievalProfile:
     """Classify which retrieval modalities the manifest still requires."""
     missing = manifest.missing_items
     stale = stale_needing_refresh(manifest)
@@ -387,9 +395,11 @@ def retrieval_profile(manifest: StepManifest) -> RetrievalProfile:
             unlocated_missing = True
             needs_grep = True
 
-    if bootstrap and not missing and not needs_view and not _observed_ready_for_task(manifest, "edit"):
+    if bootstrap and not missing and not needs_view and not _observed_ready_for_task(
+        manifest, "edit", task_text=task_text
+    ):
         needs_grep = True
-    if wiring_gap_lines(manifest):
+    if wiring_gap_lines(manifest, task_text=task_text):
         needs_view = True
     if bootstrap and unlocated_missing:
         needs_heavy = True
@@ -696,7 +706,12 @@ def project_manifest(
     )
 
 
-def _observed_ready_for_task(manifest: StepManifest, task_mode: str) -> bool:
+def _observed_ready_for_task(
+    manifest: StepManifest,
+    task_mode: str,
+    *,
+    task_text: str = "",
+) -> bool:
     """Bootstrap edit/answer gate from grounded observed anchors (no abstract slots).
 
     STALE observed items still count — they were loaded before an edit invalidated
@@ -727,7 +742,7 @@ def _observed_ready_for_task(manifest: StepManifest, task_mode: str) -> bool:
     if any(item.type == "symbol" and _line_count(item) >= 50 for item in grounded):
         return True
 
-    if _cross_file_observed_ready(manifest):
+    if _cross_file_observed_ready(manifest, task_text=task_text):
         return True
 
     return False
@@ -892,6 +907,9 @@ def reconcile_observations(
         if observed_id in existing_ids:
             continue
         existing_ids.add(observed_id)
+        keywords: tuple[str, ...] = ()
+        if target_kind == "symbol" and mount_setup_confirmed(code, file_path=file):
+            keywords = ("mount_confirmed",)
         additions.append(
             EvidenceItem(
                 id=observed_id,
@@ -903,6 +921,7 @@ def reconcile_observations(
                 symbol=symbol or None,
                 status="MISSING",
                 provenance="retrieval_request",
+                keywords=keywords,
             )
         )
 
@@ -981,9 +1000,9 @@ def _structural_locator(text: str) -> tuple[str | None, str | None]:
     )
     if ddl:
         return "schema", ddl.group(1)
-    python = re.search(r"\b(?:async\s+def|def|class)\s+([A-Za-z_]\w*)", text)
-    if python:
-        return "symbol", python.group(1)
+    symbol = extract_symbol_with_profiles(text, ALL_PROFILES)
+    if symbol:
+        return "symbol", symbol
     return None, None
 
 
@@ -1000,25 +1019,20 @@ def _discovery_hints(
     task_slots: Sequence[str],
     *,
     task_text: str = "",
+    project_root: Path | None = None,
 ) -> list[str]:
     if task_text.strip():
-        return discovery_hint_lines(task_text, task_slots)
+        return discovery_hint_lines(task_text, task_slots, project_root=project_root)
     hints: list[str] = []
-    slot_patterns: dict[str, tuple[str, str]] = {
-        "target_implementation": ("*.py", "build_router|include_router|APIRouter"),
-        "endpoint_implementation": ("*.py", "@router\\.|@app\\.(get|post|put|delete)|APIRouter"),
-        "integration_or_mount_point": ("*.py", "include_router|add_api_route|mount|build_router"),
-        "exception_handler_context": ("main.py", "@app\\.exception_handler|def handle_|logger\\.exception"),
-        "relevant_schema": ("*.sql", "CREATE TABLE|CREATE VIEW|order|ticket"),
-        "authentication_context": ("*.py", "get_current_user|Bearer|oauth|authenticate"),
-        "authorization_policy": ("*.py", "role|permission|authorize|Depends"),
-    }
-    for slot in task_slots[:5]:
-        if slot in slot_patterns:
-            include, pattern_hint = slot_patterns[slot]
-            hints.append(
-                f"- {slot}: grep_search(patterns=[{pattern_hint!r}, ...], include={include!r})"
-            )
+    for slot_id in task_slots[:5]:
+        slot_meta = slot_def(slot_id)
+        if slot_meta is None or not slot_meta.grep_patterns:
+            continue
+        include = slot_meta.grep_include or "*.*"
+        pattern_hint = "|".join(slot_meta.grep_patterns[:5])
+        hints.append(
+            f"- {slot_id}: grep_search(patterns=[{pattern_hint!r}, ...], include={include!r})"
+        )
     return hints
 
 
@@ -1089,6 +1103,9 @@ def execution_card(
     view_last_round_all_duplicate: bool = False,
     verification_mode: bool = False,
     edited_files: Sequence[str] = (),
+    preferred_tool: str | None = None,
+    tool_probabilities: Mapping[str, float] | None = None,
+    project_root: Path | None = None,
 ) -> str:
     """Render the STEP EVIDENCE card for the Core LLM."""
     edit_ready = manifest.sufficiency in {
@@ -1103,6 +1120,17 @@ def execution_card(
         f"required_coverage: {metrics.coverage:.2f}",
         f"retrieval_no_gain_rounds: {retrieval_no_gain_rounds}",
     ]
+    if tool_probabilities:
+        ranked = sorted(
+            tool_probabilities.items(), key=lambda kv: kv[1], reverse=True
+        )
+        ranking = " > ".join(f"{tool}({prob:.2f})" for tool, prob in ranked)
+        lines.append(f"tool_ranking: {ranking}")
+    if preferred_tool:
+        lines.append(
+            f"preferred_tool: {preferred_tool} — start here unless the guidance "
+            "below justifies another allowed tool"
+        )
     if not manifest.core_items:
         satisfied_observed = [
             item
@@ -1114,8 +1142,8 @@ def execution_card(
         elif not edit_ready:
             if wiring_gap_lines(manifest, task_text=task_text):
                 lines.append(
-                    "bootstrap_gate: wiring_gap — caller file missing app/init/mount "
-                    "region; load include_router or app setup before decision_edit"
+                    "bootstrap_gate: wiring_gap — support file missing entry/integration "
+                    "region; load language-specific bootstrap wiring before decision_edit"
                 )
             else:
                 lines.append(
@@ -1134,12 +1162,12 @@ def execution_card(
     pending_wiring = wiring_gap_pending_loads(manifest, task_text=task_text)
     for load in pending_wiring:
         file_label = str(load.get("file") or "?")
-        symbol = str(load.get("symbol") or "create_app")
+        symbol = str(load.get("symbol") or default_wiring_probe_symbol(file_label))
         patterns = load.get("grep_patterns")
         if isinstance(patterns, tuple):
             grep_hint = "|".join(str(p) for p in patterns)
         else:
-            grep_hint = "include_router|create_app"
+            grep_hint = "|".join(grep_patterns_for_wiring(file_label)[:4]) or "main"
         lines.append(
             f"pending_wiring: view_symbol_code({file_label!r}, symbol={symbol!r}) "
             f"or grep {grep_hint!r} on {file_label!r} — {load.get('reason', 'mount/setup')}"
@@ -1147,7 +1175,7 @@ def execution_card(
     grep_pending = grep_pending_caller_loads(manifest, grep_suggested_views)
     for load in grep_pending:
         file_label = str(load.get("file") or "?")
-        symbol = str(load.get("symbol") or "create_app")
+        symbol = str(load.get("symbol") or default_wiring_probe_symbol(file_label))
         lines.append(
             f"pending_wiring: view_symbol_code({file_label!r}, symbol={symbol!r}) "
             f"— {load.get('reason', 'grep mount/setup not loaded')}"
@@ -1249,7 +1277,7 @@ def execution_card(
         lines.append("missing:")
         for item in missing:
             lines.append(f"- {_item_locator(item)}  ({item.need})")
-    hints = _discovery_hints(task_slots, task_text=task_text)
+    hints = _discovery_hints(task_slots, task_text=task_text, project_root=project_root)
     if hints and "grep_search" in tools_available and not edit_ready:
         lines.append("discovery_hints (task-derived grep batch; not manifest obligations):")
         lines.extend(hints)

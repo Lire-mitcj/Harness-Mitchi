@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,35 @@ _DEFAULT_FALLBACK_PATTERNS = [
 
 _TASK_IDENTIFIER = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b")
 _STORED_PROC = re.compile(r"\b(sp_[A-Za-z0-9_]+)\b", re.IGNORECASE)
+_RAW_STRING_FIELD = re.compile(r'"(pattern|include|path|query|mode)"\s*:\s*"([^"]*)')
+
+
+def unwrap_raw_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Salvage fields from streamed/truncated tool-call JSON stored under ``_raw``."""
+    args = dict(arguments)
+    raw = args.pop("_raw", None)
+    if not isinstance(raw, str) or not raw.strip():
+        return args
+
+    parsed: dict[str, Any] | None = None
+    try:
+        loaded = json.loads(raw)
+        if isinstance(loaded, dict):
+            parsed = loaded
+    except json.JSONDecodeError:
+        parsed = None
+
+    if parsed is not None:
+        for key, value in parsed.items():
+            if key not in args or args.get(key) in (None, "", [], ()):
+                args[key] = value
+        return args
+
+    for match in _RAW_STRING_FIELD.finditer(raw):
+        key, value = match.group(1), match.group(2)
+        if key not in args or not str(args.get(key) or "").strip():
+            args[key] = value
+    return args
 
 
 def _has_pattern(args: dict[str, Any]) -> bool:
@@ -100,7 +130,7 @@ def normalize_grep_search_args(
     hint_text: str = "",
 ) -> dict[str, Any]:
     """Fill missing grep_search.pattern/patterns from task text when the model omits them."""
-    args = dict(arguments)
+    args = unwrap_raw_tool_arguments(arguments)
     if _has_pattern(args):
         return args
 

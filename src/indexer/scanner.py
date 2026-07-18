@@ -24,6 +24,8 @@ EXTENSION_LANGUAGE_MAP: dict[str, str] = {
     ".html": "HTML", ".css": "CSS", ".scss": "SCSS",
     ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML",
     ".json": "JSON", ".md": "Markdown", ".sql": "SQL",
+    ".proto": "Protobuf", ".xml": "XML", ".properties": "Properties",
+    ".gradle": "Gradle", ".mod": "GoModule",
     ".sh": "Shell", ".bash": "Shell",
 }
 

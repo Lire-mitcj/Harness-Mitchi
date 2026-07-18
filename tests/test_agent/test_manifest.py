@@ -583,6 +583,7 @@ def test_wiring_gap_cleared_when_wide_header_span_loaded() -> None:
                 span=(1, 45),
                 symbol="app",
                 status="SATISFIED",
+                keywords=("mount_confirmed",),
             ),
             EvidenceItem(
                 id="observed.symbol:list.py:build_router",
@@ -610,6 +611,7 @@ def test_observed_integration_bootstrap_ready_with_caller_setup() -> None:
             span=(1, 35),
             symbol="create_app",
             status="SATISFIED",
+            keywords=("mount_confirmed",),
         ),
         EvidenceItem(
             id="observed.symbol:main.py:sqlalchemy_error_handler",
@@ -663,7 +665,11 @@ def test_execution_card_reports_wiring_gap() -> None:
         ),
         sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
     )
-    card = execution_card(manifest, ["view_symbol_code", "decision_edit"], task_text="list.py")
+    card = execution_card(
+        manifest,
+        ["view_symbol_code", "decision_edit"],
+        task_text="mount list.py router in main.py include_router",
+    )
     assert "wiring_gap:" in card
     assert "main.py" in card
     assert "pending_wiring:" in card
@@ -722,7 +728,10 @@ def test_wiring_gap_pending_loads_suggests_caller_setup() -> None:
             ),
         )
     )
-    loads = wiring_gap_pending_loads(manifest, task_text="list.py")
+    loads = wiring_gap_pending_loads(
+        manifest,
+        task_text="mount list.py router in main.py include_router",
+    )
     assert len(loads) == 1
     assert loads[0]["file"] == "main.py"
     assert loads[0]["symbol"] == "create_app"
@@ -848,3 +857,141 @@ def test_execution_card_surfaces_grep_error_and_suggested_views() -> None:
     assert "suggested_views" in card
     assert "ticket_order" in card
     assert "view_symbol_code" in card
+
+
+def test_wiring_gap_when_create_app_loaded_without_mount_content() -> None:
+    """Symbol name create_app alone must not clear caller wiring gap."""
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:create_app",
+                need="create_app",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(1, 80),
+                symbol="create_app",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 358),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        )
+    )
+    assert wiring_gap_lines(manifest)
+    profile = retrieval_profile(manifest)
+    assert profile.needs_view
+
+
+def test_reconcile_observations_tags_mount_confirmed_on_setup_code() -> None:
+    manifest = reconcile_observations(
+        StepManifest(),
+        observations=[
+            _anchor(
+                "main.py",
+                (1, 40),
+                "def create_app():\n    app = FastAPI()\n    app.include_router(build_router(engine))\n",
+                symbol="create_app",
+            )
+        ],
+    )
+    item = next(item for item in manifest.observed_items if item.file == "main.py")
+    assert "mount_confirmed" in item.keywords
+
+
+def test_cross_file_partner_files_excludes_edited_target() -> None:
+    from src.agent.manifest import cross_file_partner_files
+
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:create_app",
+                need="app",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(1, 40),
+                symbol="create_app",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 100),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        )
+    )
+    assert cross_file_partner_files(manifest, "list.py") == frozenset({"main.py"})
+
+
+def test_wiring_gap_skipped_for_mention_yaml_tasks() -> None:
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:sqlalchemy_error_handler",
+                need="handler",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(49, 55),
+                symbol="sqlalchemy_error_handler",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 358),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        )
+    )
+    task = "在 noise_policy.yaml 添加 bot_nicknames，并优化 @mention 检测"
+    assert wiring_gap_lines(manifest)
+    assert not wiring_gap_lines(manifest, task_text=task)
+    profile = retrieval_profile(manifest, task_text=task)
+    assert not profile.needs_view
+
+
+def test_wiring_gap_skipped_between_infrastructure_peers() -> None:
+    """Infra/config peers should not trigger FastAPI-style caller wiring gaps."""
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:agentmesh_orchestrator/conf/noise_policy.py:load_policy",
+                need="policy",
+                type="symbol",
+                role="observed",
+                file="agentmesh_orchestrator/conf/noise_policy.py",
+                span=(1, 120),
+                symbol="load_policy",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:agentmesh_orchestrator/internal/mention_rules.py:rules",
+                need="rules",
+                type="symbol",
+                role="observed",
+                file="agentmesh_orchestrator/internal/mention_rules.py",
+                span=(1, 80),
+                symbol="rules",
+                status="SATISFIED",
+            ),
+        )
+    )
+    assert not wiring_gap_lines(manifest)

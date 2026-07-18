@@ -9,6 +9,11 @@ from typing import Any
 
 from src.agent.types import RiskLevel, ToolResult
 from src.tools.base import Tool
+from src.indexer.language_profiles import (
+    profile_for_path,
+    searchable_extensions,
+)
+from src.indexer.project_stack import detect_project_stack
 from src.tools.grep_match_symbols import wiring_symbol_suggestions
 
 log = logging.getLogger(__name__)
@@ -18,6 +23,23 @@ MAX_SYMBOL_OUTPUT_CHARS = 8_000
 _SKIPPED_SEARCH_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build"}
 _SQL_DEFINITION_KINDS = "TABLE|VIEW|PROCEDURE|FUNCTION|TRIGGER|EVENT"
 _WIRING_PROBE_SYMBOLS = frozenset({"app", "application", "router", "logger", "create_app"})
+
+
+def _captured_symbol_matches(
+    pattern: re.Pattern[str],
+    line: str,
+    symbol_name: str,
+) -> bool:
+    """True when a profile regex match names the requested symbol."""
+    leaf = symbol_name.split(".")[-1]
+    match = pattern.search(line)
+    if match is None:
+        return False
+    if match.lastindex and match.lastindex >= 1:
+        captured = match.group(1)
+        if captured is not None:
+            return captured == leaf
+    return bool(re.search(r"\b" + re.escape(leaf) + r"\b", line))
 
 
 def _find_symbol_span_in_python_file(content: str, symbol_name: str) -> tuple[int, int] | None:
@@ -73,14 +95,34 @@ def _find_symbol_span_in_python_file(content: str, symbol_name: str) -> tuple[in
     return None
 
 
-def _find_symbol_span_by_regex(content: str, symbol_name: str) -> tuple[int, int] | None:
+def _find_symbol_span_by_regex(
+    content: str,
+    symbol_name: str,
+    *,
+    file_path: str = "",
+) -> tuple[int, int] | None:
     lines = content.splitlines()
     last_part = symbol_name.split(".")[-1]
+    profile = profile_for_path(file_path)
+
+    block_patterns: list[re.Pattern[str]] = []
+    if profile is not None:
+        block_patterns.extend(profile.block_start_res)
+    else:
+        block_patterns.append(
+            re.compile(
+                r"\b(?:def|class|function|func|type|interface|enum)\s+"
+                + re.escape(last_part)
+                + r"\b"
+            )
+        )
 
     for idx, line in enumerate(lines):
-        # 1. matches "def symbol_name", "class symbol_name", "function symbol_name", etc.
-        def_match = re.search(r'\b(def|class|function)\s+' + re.escape(last_part) + r'\b', line)
-        # 2. matches "symbol_name = ..."
+        matched = False
+        for pattern in block_patterns:
+            if _captured_symbol_matches(pattern, line, symbol_name):
+                matched = True
+                break
         assign_match = re.search(r'\b' + re.escape(last_part) + r'\s*=\s*', line)
         # 3. matches SQL view/table definitions with optional backticks/quotes
         escaped_name = re.escape(last_part)
@@ -93,13 +135,23 @@ def _find_symbol_span_by_regex(content: str, symbol_name: str) -> tuple[int, int
             re.IGNORECASE
         )
 
-        if def_match or assign_match or sql_match:
+        if matched or assign_match or sql_match:
             start_line = idx + 1
             if sql_match:
                 return start_line, _find_sql_definition_end(lines, idx)
 
             indent_match = re.match(r'^(\s*)', line)
             indent = indent_match.group(1) if indent_match else ""
+            # Go/Java/Proto blocks often use braces — scan for closing brace at base indent
+            if "{" in line and profile is not None and profile.id in {"go", "java", "proto"}:
+                depth = line.count("{") - line.count("}")
+                end_line = start_line
+                for j in range(idx + 1, len(lines)):
+                    depth += lines[j].count("{") - lines[j].count("}")
+                    end_line = j + 1
+                    if depth <= 0:
+                        break
+                return start_line, end_line
 
             end_line = start_line
             for j in range(idx + 1, len(lines)):
@@ -150,13 +202,23 @@ def _find_symbol_definitions(
     *,
     exclude_file: str,
 ) -> list[tuple[str, str, tuple[int, int]]]:
-    """Find project-local Python and SQL definitions for a symbol after a file mismatch."""
+    """Find project-local definitions for a symbol after a file mismatch."""
     candidates: list[tuple[str, str, tuple[int, int]]] = []
     leaf_name = symbol_name.split(".")[-1]
-    
-    # Python declaration pattern
+    stack = detect_project_stack(project_root)
+    extensions = searchable_extensions(stack.languages) or frozenset({".py", ".sql", ".go", ".java", ".proto"})
+
     py_declaration = re.compile(
         rf"\b(?:async\s+def|def|class)\s+{re.escape(leaf_name)}\b"
+    )
+    go_declaration = re.compile(
+        rf"\b(?:func|type)\s+(?:\([^)]*\)\s+)?{re.escape(leaf_name)}\b"
+    )
+    java_declaration = re.compile(
+        rf"\b(?:class|interface|enum)\s+{re.escape(leaf_name)}\b"
+    )
+    proto_declaration = re.compile(
+        rf"\b(?:service|message|enum|rpc)\s+{re.escape(leaf_name)}\b"
     )
     
     # SQL view/table declaration pattern
@@ -176,30 +238,40 @@ def _find_symbol_definitions(
         if relative == exclude_file:
             continue
             
+        if path.suffix not in extensions:
+            continue
+
+        try:
+            candidate_content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        matched = False
+        if path.suffix == ".py" and py_declaration.search(candidate_content):
+            matched = True
+        elif path.suffix == ".go" and go_declaration.search(candidate_content):
+            matched = True
+        elif path.suffix == ".java" and java_declaration.search(candidate_content):
+            matched = True
+        elif path.suffix == ".proto" and proto_declaration.search(candidate_content):
+            matched = True
+        elif path.suffix == ".sql" and sql_declaration.search(candidate_content):
+            matched = True
+        if not matched:
+            continue
+
+        span = None
         if path.suffix == ".py":
-            try:
-                candidate_content = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            if not py_declaration.search(candidate_content):
-                continue
             span = _find_symbol_span_in_python_file(candidate_content, symbol_name)
-            if span is None:
-                span = _find_symbol_span_by_regex(candidate_content, symbol_name)
-            if span is not None:
-                candidates.append((relative, candidate_content, span))
-                
-        elif path.suffix == ".sql":
-            try:
-                candidate_content = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            if not sql_declaration.search(candidate_content):
-                continue
-            span = _find_symbol_span_by_regex(candidate_content, symbol_name)
-            if span is not None:
-                candidates.append((relative, candidate_content, span))
-                
+        if span is None:
+            span = _find_symbol_span_by_regex(
+                candidate_content,
+                symbol_name,
+                file_path=relative,
+            )
+        if span is not None:
+            candidates.append((relative, candidate_content, span))
+
     return candidates
 
 
@@ -341,7 +413,7 @@ class ViewSymbolCodeTool(Tool):
                 symbol = resolved_symbol
 
         if not span:
-            span = _find_symbol_span_by_regex(content, symbol)
+            span = _find_symbol_span_by_regex(content, symbol, file_path=target_file)
 
         if not span and search_cache:
             search_output_str = search_cache.get("search_output")

@@ -7,6 +7,12 @@ import re
 from pathlib import Path
 from typing import Any
 
+from src.indexer.project_stack import (
+    ProjectStack,
+    detect_project_stack,
+    maven_module_for_target,
+    validator_command_for_target,
+)
 from src.agent.contracts import ValidationDecision, ValidationResult
 from src.agent.inter_llm import _strip_json_fence
 from src.agent.sql_parser import UniversalSqlParser
@@ -50,6 +56,8 @@ class CursorValidator:
         max_error_chars: int = 2000,
         semantic_llm: Any | None = None,
         semantic_timeout: float = 30.0,
+        stack: ProjectStack | None = None,
+        per_file_commands: bool = True,
     ) -> None:
         self.project_root = project_root.resolve()
         self.command = command
@@ -57,6 +65,8 @@ class CursorValidator:
         self.max_error_chars = max_error_chars
         self.semantic_llm = semantic_llm
         self.semantic_timeout = semantic_timeout
+        self.stack = stack
+        self.per_file_commands = per_file_commands
         self.sql_parser = UniversalSqlParser()
 
 
@@ -128,6 +138,16 @@ class CursorValidator:
                 self.sql_parser.parse_file(patched_content, target_file or "<patch>")
             except Exception as exc:  # pragma: no cover - parser should be defensive
                 issues.append(f"sql_syntax_error:{exc}")
+        elif suffix == ".go":
+            issues.extend(_gofmt_syntax_issues(patched_content))
+        elif suffix == ".proto":
+            issues.extend(
+                _proto_syntax_issues(
+                    patched_content,
+                    target_file=target_file,
+                    project_root=self.project_root,
+                )
+            )
         else:
             sql_scope = _schema_sql_scope(
                 suffix=suffix,
@@ -356,8 +376,42 @@ class CursorValidator:
         }
 
     async def validate_execution(self, target_file: str = "") -> dict[str, object]:
-        command = list(self.command)
-        if command and command[0] == "pytest" and target_file:
+        stack = self.stack or detect_project_stack(self.project_root)
+        if self.per_file_commands and target_file:
+            per_file_command = validator_command_for_target(
+                stack=stack,
+                target_file=target_file,
+                project_root=self.project_root,
+            )
+            if (
+                stack.primary == "mixed"
+                or per_file_command != stack.validator_command
+            ):
+                base_command = per_file_command
+            else:
+                base_command = self.command
+        else:
+            base_command = self.command
+
+        if not base_command:
+            return {
+                "pass": True,
+                "status": "SKIPPED",
+                "warning": "no execution validator for this file type",
+                "error": "",
+            }
+
+        command = list(base_command)
+        if (
+            len(command) >= 2
+            and command[0] == "go"
+            and command[1] == "test"
+            and target_file.endswith(".go")
+        ):
+            scoped = _go_test_scope(target_file)
+            if scoped:
+                command = ["go", "test", scoped]
+        elif command and command[0] == "pytest" and target_file:
             test_file = _find_target_test_file(self.project_root, target_file)
             if test_file:
                 try:
@@ -365,6 +419,22 @@ class CursorValidator:
                     command.append(rel_path)
                 except Exception:
                     pass
+        elif (
+            command
+            and command[0] == "mvn"
+            and "test" in command
+            and target_file
+            and stack.maven_modules
+        ):
+            module = maven_module_for_target(target_file, stack.maven_modules)
+            if module and "-pl" not in command:
+                insert_at = 2 if len(command) > 1 and command[1] == "-q" else 1
+                command = [
+                    *command[:insert_at],
+                    "-pl",
+                    module,
+                    *command[insert_at:],
+                ]
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -420,6 +490,112 @@ class CursorValidator:
         if len(output) <= self.max_error_chars:
             return output
         return "...[truncated]\n" + output[-self.max_error_chars :]
+
+
+def _gofmt_syntax_issues(content: str) -> list[str]:
+    """Return gofmt -e syntax diagnostics for a single Go source file."""
+    if not content.strip():
+        return []
+    import shutil
+    import subprocess
+
+    gofmt = shutil.which("gofmt")
+    if not gofmt:
+        return []
+    proc = subprocess.run(
+        [gofmt, "-e"],
+        input=content,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if proc.returncode == 0:
+        return []
+    detail = (proc.stderr or proc.stdout or "gofmt failed").strip().splitlines()
+    first = detail[0] if detail else "gofmt_syntax_error"
+    return [f"go_syntax_error:{first[:200]}"]
+
+
+def _go_test_scope(target_file: str) -> str | None:
+    """Narrow `go test` to the package directory of the edited file."""
+    path = Path(target_file)
+    if path.suffix.casefold() != ".go":
+        return None
+    parent = path.parent.as_posix()
+    if not parent or parent == ".":
+        return "./..."
+    return f"./{parent}"
+
+
+def _proto_syntax_issues(
+    content: str,
+    *,
+    target_file: str,
+    project_root: Path,
+) -> list[str]:
+    """Return buf/protoc syntax diagnostics for a protobuf source file."""
+    if not content.strip():
+        return []
+    import shutil
+    import subprocess
+    import tempfile
+
+    buf = shutil.which("buf")
+    protoc = shutil.which("protoc")
+    if not buf and not protoc:
+        return []
+
+    rel = Path(target_file.replace("\\", "/"))
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_root = Path(temp_dir)
+        temp_file = temp_root / rel.name
+        temp_file.write_text(content, encoding="utf-8")
+
+        if buf:
+            if (project_root / "buf.yaml").is_file() or (project_root / "buf.work.yaml").is_file():
+                proc = subprocess.run(
+                    ["buf", "lint", str(temp_file)],
+                    cwd=str(project_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            else:
+                proc = subprocess.run(
+                    ["buf", "lint", "--path", str(temp_file)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            if proc.returncode == 0:
+                return []
+            detail = (proc.stderr or proc.stdout or "buf lint failed").strip().splitlines()
+            first = detail[0] if detail else "buf lint failed"
+            return [f"proto_syntax_error:{first[:200]}"]
+
+        proto_paths = [str(project_root), str(temp_root)]
+        parent = (project_root / rel.parent)
+        if parent.is_dir():
+            proto_paths.insert(1, str(parent))
+        cmd = ["protoc", "-o", "/dev/null"]
+        for proto_path in proto_paths:
+            cmd.extend(["--proto_path", proto_path])
+        cmd.append(str(temp_file))
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return []
+        detail = (proc.stderr or proc.stdout or "protoc failed").strip().splitlines()
+        first = detail[0] if detail else "protoc failed"
+        return [f"proto_syntax_error:{first[:200]}"]
 
 
 def _parse_python(content: str) -> ast.AST | None:

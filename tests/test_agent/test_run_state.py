@@ -106,6 +106,41 @@ def test_reducer_tracks_consecutive_retrieval_rounds_without_new_observations() 
     assert state.retrieval_no_gain_rounds == 2
 
 
+def test_edit_applied_marks_cross_file_partner_files_stale() -> None:
+    from src.agent.manifest import EvidenceItem, StepManifest
+
+    manifest = StepManifest(
+        required_items=(
+            EvidenceItem(
+                id="observed.symbol:main.py:create_app",
+                need="app",
+                type="symbol",
+                role="observed",
+                file="main.py",
+                span=(1, 40),
+                symbol="create_app",
+                status="SATISFIED",
+            ),
+            EvidenceItem(
+                id="observed.symbol:list.py:build_router",
+                need="router",
+                type="symbol",
+                role="observed",
+                file="list.py",
+                span=(16, 100),
+                symbol="build_router",
+                status="SATISFIED",
+            ),
+        )
+    )
+    state = replace(start_run("wire handler", edit_mode=True), manifest=manifest)
+    state, _ = reduce_run_state(state, RunEvent("edit_applied", file="list.py"))
+
+    statuses = {item.file: item.status for item in state.manifest.observed_items}
+    assert statuses["list.py"] == "STALE"
+    assert statuses["main.py"] == "STALE"
+
+
 def test_reducer_resets_rounds_since_last_edit_on_applied_edit() -> None:
     state = start_run("修改接口", edit_mode=True)
     state, _ = reduce_run_state(state, RunEvent("edit_applied", file="list.py"))

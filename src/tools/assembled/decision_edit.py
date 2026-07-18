@@ -14,6 +14,7 @@ from src.agent.executor import CursorExecutor
 from src.agent.patch_applier import CursorPatchApplier
 from src.agent.types import RiskLevel, ToolResult
 from src.agent.validator import CursorValidator
+from src.indexer.project_stack import detect_project_stack
 from src.llm.client import LLMClient
 from src.tools.base import Tool
 
@@ -283,6 +284,8 @@ class DecisionEditTool(Tool):
             max_error_chars=settings.cursor_observation_max_chars,
             semantic_llm=validator_llm,
             semantic_timeout=settings.cursor_validator_semantic_timeout,
+            stack=detect_project_stack(self.project_root),
+            per_file_commands=settings.cursor_validator_auto,
         )
         self.active_files: list[str] = []
 

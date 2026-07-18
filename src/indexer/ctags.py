@@ -7,12 +7,23 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from src.indexer.path_globs import ctags_exclude_args, repo_map_path_allowed
 from src.indexer.parser import CodeParser, Symbol
+from src.indexer.project_stack import detect_project_stack, indexable_extensions_for_stack
 from src.indexer.scanner import DEFAULT_IGNORE_DIRS, EXTENSION_LANGUAGE_MAP, ProjectScanner
 
 log = logging.getLogger(__name__)
 
 _INDEXABLE_SUFFIXES = frozenset(EXTENSION_LANGUAGE_MAP.keys())
+_CTAGS_EXTRA_EXCLUDES = (
+    "*.json",
+    "*.md",
+    "*.lock",
+    "*.svg",
+    "*.map",
+    "docs",
+    "testdata",
+)
 
 
 @dataclass
@@ -32,23 +43,90 @@ class CtagsIndexResult:
     source: str = "parser"
 
 
-def index_project(project_root: Path) -> CtagsIndexResult:
+def index_project(
+    project_root: Path,
+    *,
+    include_globs: tuple[str, ...] = (),
+    exclude_globs: tuple[str, ...] = (),
+) -> CtagsIndexResult:
     """Index symbols via universal-ctags JSON, else regex parser fallback."""
     root = project_root.resolve()
+    stack = detect_project_stack(root)
     ctags_bin = shutil.which("ctags") or shutil.which("universal-ctags")
     if ctags_bin:
         try:
-            result = _run_ctags_json(ctags_bin, root)
+            result = _run_ctags_json(
+                ctags_bin,
+                root,
+                exclude_globs=exclude_globs,
+            )
             if result.symbols:
                 result.source = "ctags"
+                result = _filter_index_for_stack(
+                    result,
+                    stack,
+                    include_globs=include_globs,
+                    exclude_globs=exclude_globs,
+                )
                 return result
         except Exception as exc:
             log.debug("ctags indexing failed, falling back to parser: %s", exc)
-    return _index_with_parser(root)
+    result = _index_with_parser(
+        root,
+        include_globs=include_globs,
+        exclude_globs=exclude_globs,
+    )
+    return _filter_index_for_stack(
+        result,
+        stack,
+        include_globs=include_globs,
+        exclude_globs=exclude_globs,
+    )
 
 
-def _run_ctags_json(ctags_bin: str, project_root: Path) -> CtagsIndexResult:
+def _filter_index_for_stack(
+    result: CtagsIndexResult,
+    stack,
+    *,
+    include_globs: tuple[str, ...] = (),
+    exclude_globs: tuple[str, ...] = (),
+) -> CtagsIndexResult:
+    allowed = indexable_extensions_for_stack(stack)
+    if not allowed and not include_globs and not exclude_globs:
+        return result
+    kept_files = {
+        sym.file_path
+        for sym in result.symbols
+        if (not allowed or Path(sym.file_path).suffix.lower() in allowed)
+        and repo_map_path_allowed(
+            sym.file_path,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
+        )
+    }
+    symbols = [sym for sym in result.symbols if sym.file_path in kept_files]
+    references: list[tuple[str, str]] = []
+    for src, dst in result.references:
+        src_file = src.split(":", 1)[0]
+        if src_file in kept_files or dst in kept_files or "." not in Path(dst).name:
+            references.append((src, dst))
+    return CtagsIndexResult(
+        symbols=symbols,
+        references=references,
+        source=result.source,
+    )
+
+
+def _run_ctags_json(
+    ctags_bin: str,
+    project_root: Path,
+    *,
+    exclude_globs: tuple[str, ...] = (),
+) -> CtagsIndexResult:
     excludes = [f"--exclude={name}" for name in sorted(DEFAULT_IGNORE_DIRS)]
+    for pattern in _CTAGS_EXTRA_EXCLUDES:
+        excludes.append(f"--exclude={pattern}")
+    excludes.extend(ctags_exclude_args(exclude_globs))
     cmd = [
         ctags_bin,
         "--recurse",
@@ -115,7 +193,14 @@ def _run_ctags_json(ctags_bin: str, project_root: Path) -> CtagsIndexResult:
     return CtagsIndexResult(symbols=symbols, references=references)
 
 
-def _index_with_parser(project_root: Path) -> CtagsIndexResult:
+def _index_with_parser(
+    project_root: Path,
+    *,
+    include_globs: tuple[str, ...] = (),
+    exclude_globs: tuple[str, ...] = (),
+) -> CtagsIndexResult:
+    stack = detect_project_stack(project_root)
+    allowed = indexable_extensions_for_stack(stack)
     scanner = ProjectScanner(project_root)
     structure = scanner.scan(max_files=5000)
     parser = CodeParser()
@@ -125,9 +210,17 @@ def _index_with_parser(project_root: Path) -> CtagsIndexResult:
     for path in structure.files:
         if path.suffix.lower() not in _INDEXABLE_SUFFIXES:
             continue
+        if allowed and path.suffix.lower() not in allowed:
+            continue
         try:
             rel = path.relative_to(project_root).as_posix()
         except ValueError:
+            continue
+        if not repo_map_path_allowed(
+            rel,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
+        ):
             continue
         result = parser.parse_file(path)
         for sym in result.all_symbols:
