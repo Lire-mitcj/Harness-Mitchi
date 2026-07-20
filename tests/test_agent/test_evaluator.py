@@ -323,8 +323,170 @@ def test_patch_applier_creates_new_file_and_applies_empty_search(tmp_path: Path)
     assert (tmp_path / empty_file).read_text(encoding="utf-8") == "print('populated')\n"
 
 
+def test_patch_applier_locates_search_when_unicode_escape_decoded_to_glyph(
+    tmp_path: Path,
+) -> None:
+    """The Edit model single-escapes \\uXXXX over JSON, so on-disk source with a
+    literal \\u4e00 arrives in SEARCH as the decoded glyph. The block must still
+    locate via the escape-insensitive fallback instead of failing E2_LOCATE."""
+    applier = CursorPatchApplier(tmp_path)
+    target = "policy.py"
+    (tmp_path / target).write_text(
+        'PATTERN = r"^(?:[a-z]{1,3}|[\\u4e00-\\u9fa5]{1,2})$"\n'
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "<<<<<<< SEARCH\n"
+        'PATTERN = r"^(?:[a-z]{1,3}|[一-龥]{1,2})$"\n'
+        "VALUE = 1\n"
+        "=======\n"
+        'PATTERN = r"^(?:[a-z]{1,3}|[一-龥]{1,2})$"\n'
+        "VALUE = 2\n"
+        ">>>>>>> REPLACE"
+    )
+
+    success, error = applier.apply_patch(target, patch)
+
+    assert success is True, error
+    assert "VALUE = 2" in (tmp_path / target).read_text(encoding="utf-8")
+
+
+def test_escape_fold_equates_literal_escape_and_glyph() -> None:
+    disk = 'r"[\\u4e00-\\u9fa5]"'
+    search = 'r"[一-龥]"'
+    assert CursorPatchApplier._escape_fold(disk) == CursorPatchApplier._escape_fold(
+        search
+    )
+    # Case-insensitive on the hex, whitespace-insensitive overall.
+    assert CursorPatchApplier._escape_fold(
+        'r"[\\u4E00 - \\u9FA5]"'
+    ) == CursorPatchApplier._escape_fold('r"[一-龥]"')
+
+
 def test_patch_applier_applies_multiple_non_overlapping_blocks(tmp_path: Path) -> None:
     applier = CursorPatchApplier(tmp_path)
+    target = "routes.py"
+    (tmp_path / target).write_text(
+        "@router.get('/a')\ndef a():\n    return 1\n\n"
+        "@router.get('/b')\ndef b():\n    return 2\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "<<<<<<< SEARCH\n"
+        "@router.get('/a')\n"
+        "def a():\n"
+        "=======\n"
+        "@wrap\n"
+        "@router.get('/a')\n"
+        "def a():\n"
+        ">>>>>>> REPLACE\n"
+        "<<<<<<< SEARCH\n"
+        "@router.get('/b')\n"
+        "def b():\n"
+        "=======\n"
+        "@wrap\n"
+        "@router.get('/b')\n"
+        "def b():\n"
+        ">>>>>>> REPLACE"
+    )
+
+    success, error = applier.apply_patch(target, patch)
+
+    assert success is True, error
+    updated = (tmp_path / target).read_text(encoding="utf-8")
+    assert updated.count("@wrap") == 2
+
+
+def test_patch_applier_unsticks_glued_block_boundaries(tmp_path: Path) -> None:
+    applier = CursorPatchApplier(tmp_path)
+    target = "policy.py"
+    (tmp_path / target).write_text(
+        "    short_task_keywords: frozenset[str]\n"
+        "    ingress_layer2_unique_types_max: int\n"
+        "\n"
+        "        short_task_keywords=frozenset(['a']),\n"
+        "        ingress_layer2_unique_types_max=2,\n",
+        encoding="utf-8",
+    )
+    # Model forgot the newline between REPLACE and the next SEARCH.
+    patch = (
+        "<<<<<<< SEARCH\n"
+        "    short_task_keywords: frozenset[str]\n"
+        "    ingress_layer2_unique_types_max: int\n"
+        "=======\n"
+        "    short_task_keywords: frozenset[str]\n"
+        "    bot_nicknames: frozenset[str]\n"
+        "    ingress_layer2_unique_types_max: int\n"
+        ">>>>>>> REPLACE<<<<<<< SEARCH\n"
+        "        short_task_keywords=frozenset(['a']),\n"
+        "        ingress_layer2_unique_types_max=2,\n"
+        "=======\n"
+        "        short_task_keywords=frozenset(['a']),\n"
+        "        bot_nicknames=frozenset(['b']),\n"
+        "        ingress_layer2_unique_types_max=2,\n"
+        ">>>>>>> REPLACE"
+    )
+
+    success, error = applier.apply_patch(target, patch)
+
+    assert success is True, error
+    text = (tmp_path / target).read_text(encoding="utf-8")
+    assert "bot_nicknames: frozenset[str]" in text
+    assert "bot_nicknames=frozenset(['b'])" in text
+    assert ">>>>>>>" not in text
+    assert "<<<<<<<" not in text
+
+
+def test_patch_applier_rejects_markers_inside_replace_body(tmp_path: Path) -> None:
+    applier = CursorPatchApplier(tmp_path)
+    target = "x.py"
+    (tmp_path / target).write_text("def a():\n    return 1\n", encoding="utf-8")
+    # Nested marker inside REPLACE survives boundary normalize.
+    nested = (
+        "<<<<<<< SEARCH\n"
+        "def a():\n"
+        "    return 1\n"
+        "=======\n"
+        "def a():\n"
+        "<<<<<<< SEARCH\n"
+        "    return 2\n"
+        ">>>>>>> REPLACE\n"
+        ">>>>>>> REPLACE"
+    )
+    success, error = applier.apply_patch(target, nested)
+    assert success is False
+    assert "invalid_patch:" in error
+    assert "marker" in error.lower() or "SEARCH/REPLACE" in error
+
+
+def test_patch_applier_rejects_more_than_max_blocks(tmp_path: Path) -> None:
+    applier = CursorPatchApplier(tmp_path, max_blocks=3)
+    target = "routes.py"
+    (tmp_path / target).write_text(
+        "\n".join(f"def f{i}():\n    return {i}\n" for i in range(4)),
+        encoding="utf-8",
+    )
+    parts = []
+    for i in range(4):
+        parts.append(
+            "<<<<<<< SEARCH\n"
+            f"def f{i}():\n"
+            f"    return {i}\n"
+            "=======\n"
+            f"def f{i}():\n"
+            f"    return {i + 10}\n"
+            ">>>>>>> REPLACE"
+        )
+    success, error = applier.apply_patch(target, "\n".join(parts))
+    assert success is False
+    assert "too many SEARCH/REPLACE blocks (4 > 3)" in error
+    assert "later Core decision_edit" in error
+    assert (tmp_path / target).read_text(encoding="utf-8").count("return 10") == 0
+
+
+def test_patch_applier_sequential_applies_top_to_bottom(tmp_path: Path) -> None:
+    applier = CursorPatchApplier(tmp_path, sequential=True)
     target = "routes.py"
     (tmp_path / target).write_text(
         "@router.get('/a')\ndef a():\n    return 1\n\n"
@@ -390,3 +552,81 @@ def test_patch_applier_mismatch_includes_search_and_closest_fragment(
     assert "Closest file fragment" in error
     assert "@router.get('/orders')" in error
     assert "SEARCH must be the current on-disk code" in error
+
+
+def test_patch_applier_mismatch_surfaces_the_single_diverging_line(
+    tmp_path: Path,
+) -> None:
+    """A near-miss SEARCH (only one differing line) must expose that exact line
+    verbatim, otherwise the inner retry regenerates the same failing patch."""
+    applier = CursorPatchApplier(tmp_path)
+    target = "noise.py"
+    on_disk = [
+        "def strip_chat_noise(raw: str) -> str:",
+        '    """doc."""',
+        "    text = raw.strip()",
+        "    text = re.sub(r'\\[CQ:at,qq=\\d+\\]', '', text)",
+        "    return text.strip()",
+    ]
+    (tmp_path / target).write_text("\n".join(on_disk) + "\n", encoding="utf-8")
+
+    # Model's SEARCH matches every line except one (the regex line hallucinated).
+    search = list(on_disk)
+    search[3] = "    text = re.sub(r'@mention', '', text)"
+    patch = (
+        "<<<<<<< SEARCH\n"
+        + "\n".join(search)
+        + "\n=======\n"
+        + "\n".join(on_disk)
+        + "\n>>>>>>> REPLACE"
+    )
+
+    success, error = applier.apply_patch(target, patch)
+
+    assert success is False
+    # The exact on-disk line that the model got wrong must be visible verbatim.
+    assert "text = re.sub(r'\\[CQ:at,qq=\\d+\\]', '', text)" in error
+    # And it must be flagged as the diverging line, not silently truncated away.
+    assert "✗" in error
+    assert "your SEARCH had:" in error
+    # Matching lines around it should still be present (full window, not 3 lines).
+    assert "return text.strip()" in error
+
+
+def test_patch_applier_mismatch_flags_phantom_search_and_correct_candidate(
+    tmp_path: Path,
+) -> None:
+    """Target-state SEARCH (new line not on disk) must name the phantom and give
+    a paste-ready CORRECT SEARCH candidate from the remaining real lines."""
+    applier = CursorPatchApplier(tmp_path)
+    target = "noise_policy.py"
+    (tmp_path / target).write_text(
+        "        ),\n"
+        "        deictic_followup_patterns=_compile_deictic(deictic),\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    # Model put the not-yet-existing kwarg into SEARCH (classic insert failure).
+    patch = (
+        "<<<<<<< SEARCH\n"
+        "        deictic_followup_patterns=_compile_deictic(deictic),\n"
+        "        bot_nicknames=bot_nicknames_set,\n"
+        "    )\n"
+        "=======\n"
+        "        deictic_followup_patterns=_compile_deictic(deictic),\n"
+        "        bot_nicknames=bot_nicknames_set,\n"
+        "    )\n"
+        ">>>>>>> REPLACE"
+    )
+
+    success, error = applier.apply_patch(target, patch)
+
+    assert success is False
+    assert "mismatch: block 1 SEARCH code not found" in error
+    assert "PHANTOM SEARCH lines" in error
+    assert "bot_nicknames=bot_nicknames_set," in error
+    assert "move them to REPLACE only" in error
+    assert "CORRECT SEARCH candidate" in error
+    # Candidate should be the contiguous on-disk span of the non-phantom lines.
+    assert "deictic_followup_patterns=_compile_deictic(deictic)," in error
+    assert "    )" in error

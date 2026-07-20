@@ -206,7 +206,13 @@ def _find_symbol_definitions(
     candidates: list[tuple[str, str, tuple[int, int]]] = []
     leaf_name = symbol_name.split(".")[-1]
     stack = detect_project_stack(project_root)
-    extensions = searchable_extensions(stack.languages) or frozenset({".py", ".sql", ".go", ".java", ".proto"})
+    # Union (not fallback) with the common definition-bearing suffixes: a project
+    # detected as python-only still holds symbols in .sql schema files, .proto
+    # contracts, etc. Definition lookup is a miss-only fallback, so searching the
+    # extra suffixes is cheap and restores cross-language resolution.
+    extensions = searchable_extensions(stack.languages) | frozenset(
+        {".py", ".sql", ".go", ".java", ".proto"}
+    )
 
     py_declaration = re.compile(
         rf"\b(?:async\s+def|def|class)\s+{re.escape(leaf_name)}\b"
@@ -386,9 +392,12 @@ class ViewSymbolCodeTool(Tool):
             )
 
         # 3. Locate the symbol span
+        from src.hooks.tool_gate import normalize_view_symbol
+
         span = None
         basename = Path(target_file).name
         stem = Path(target_file).stem
+        symbol = normalize_view_symbol(symbol)
         if symbol.lower() in ("*", "all", "file"):
             span = (1, len(content.splitlines()))
         elif symbol == basename or symbol == stem:

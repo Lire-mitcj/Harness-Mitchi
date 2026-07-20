@@ -10,6 +10,7 @@ from src.hooks.preflight.context_window import inspect_context_window_disk
 from src.hooks.preflight.decision_edit_intent import inspect_decision_edit_intent
 from src.hooks.preflight.fact_locking import inspect_fact_locking_async
 from src.hooks.preflight.static_constraints import inspect_static_constraints
+from src.agent.edit_brief import inspect_edit_brief_spec
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +77,15 @@ async def inspect_tool_request_async(
         tool_name,
         arguments,
         manifest=manifest,
+    )
+    if err:
+        return err
+
+    # 1c. EditBrief contract (fake focus / fat intent / span) → E4_SPEC to Core
+    err = inspect_edit_brief_spec(
+        tool_name,
+        arguments,
+        project_root=project_root,
     )
     if err:
         return err

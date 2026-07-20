@@ -18,7 +18,6 @@ from src.agent.inter_llm import _strip_json_fence
 from src.agent.sql_parser import UniversalSqlParser
 
 _VIEW_RE = re.compile(r"(?:\bview\b|view_|_view|视图)", re.IGNORECASE)
-_SQL_RE = re.compile(r"\b(select|from|join|create\s+view|update|insert)\b", re.IGNORECASE)
 _SQL_STATEMENT_RE = re.compile(
     r"\b(?:"
     r"select\b.+\bfrom\b|"
@@ -28,6 +27,10 @@ _SQL_STATEMENT_RE = re.compile(
     r"create\s+(?:or\s+replace\s+)?(?:view|trigger)\b"
     r")",
     re.IGNORECASE | re.DOTALL,
+)
+# Column/alias refs must be ident.ident or ident.* — not sentence-final "text."
+_SQL_ALIAS_USE_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?:\*|[A-Za-z_])"
 )
 _PYTHON_IMPORT_LINE_RE = re.compile(
     r"^\s*from\s+[\w.]+\s+import\b",
@@ -641,18 +644,22 @@ def _missing_patch_scope_symbols(
 
 
 def _contains_actionable_sql(content: str) -> bool:
-    """True when content contains a real SQL statement, not Python import lines."""
+    """True when content contains a real SQL statement, not Python import/prose.
+
+    Bare keywords like ``from`` / ``select`` appear in English docstrings
+    (e.g. ``strip bot mention from text.``) and must not open schema checks.
+    Only statement-shaped SQL (SELECT…FROM, INSERT INTO, CREATE VIEW, …) counts.
+    """
     text = content.strip()
     if not text:
         return False
-    if _SQL_STATEMENT_RE.search(text):
-        return True
-    lines = [line for line in text.splitlines() if line.strip()]
-    if not lines:
+    if all(
+        _PYTHON_IMPORT_LINE_RE.match(line)
+        for line in text.splitlines()
+        if line.strip()
+    ):
         return False
-    if all(_PYTHON_IMPORT_LINE_RE.match(line) for line in lines):
-        return False
-    return bool(_SQL_RE.search(text))
+    return bool(_SQL_STATEMENT_RE.search(text))
 
 
 def _schema_sql_scope(
@@ -1014,7 +1021,7 @@ def _sql_alias_safety(content: str) -> dict[str, object]:
     }
     used_aliases = {
         alias.casefold()
-        for alias in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.", content)
+        for alias in _SQL_ALIAS_USE_RE.findall(content)
     }
     used_aliases -= table_names
     used_aliases -= _SQL_RESERVED_ALIASES

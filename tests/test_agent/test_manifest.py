@@ -180,6 +180,35 @@ def test_reconcile_ignores_non_structural_grep_locator() -> None:
     assert compute_sufficiency(reconciled, "edit") == Sufficiency.INSUFFICIENT
 
 
+def test_execution_card_loaded_inventory_shows_all_when_over_prior_cap() -> None:
+    """Loaded inventory must not truncate at the old 8-item cap: hidden slices
+    got re-fetched. Ten loaded symbols should all appear (or be counted)."""
+    items = tuple(
+        EvidenceItem(
+            id=f"observed.symbol:mod{i}.py:Sym{i}",
+            need=f"已加载观察：mod{i}.py::Sym{i}",
+            type="symbol",
+            role="observed",
+            file=f"mod{i}.py",
+            span=(10 * i, 10 * i + 5),
+            symbol=f"Sym{i}",
+            status="SATISFIED",
+        )
+        for i in range(10)
+    )
+    manifest = StepManifest(
+        required_items=items,
+        sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+    )
+
+    card = execution_card(manifest, ["decision_edit"])
+
+    assert "loaded (" in card
+    assert "do NOT" in card
+    for i in range(10):
+        assert f"symbol=Sym{i}" in card
+
+
 def test_execution_card_lists_missing_and_tools() -> None:
     manifest = manifest_from_slots(["relevant_schema"])
     manifest = manifest.__class__(
@@ -227,7 +256,7 @@ def test_execution_card_lists_loaded_targets_once() -> None:
 
     card = execution_card(manifest, ["view_symbol_code", "decision_edit"])
 
-    assert "loaded (reuse; do not re-fetch):" in card
+    assert "loaded (already in LOADED CODE ANCHORS" in card
     assert "edit_ready: yes" in card
     assert card.count("list.py:16-350") == 1
     assert "symbol=build_router" in card
@@ -433,7 +462,6 @@ def test_execution_card_shows_stale_anchors_during_edit_burst() -> None:
     )
 
     assert "edit_burst:" in card
-    assert "batch verification" in card
     assert "stale anchors" in card
     assert "db/init/init.sql:99-110" in card
 
@@ -674,6 +702,8 @@ def test_execution_card_reports_wiring_gap() -> None:
     assert "main.py" in card
     assert "pending_wiring:" in card
     assert "edit_target: list.py" in card
+    assert "advisory" in card
+    assert "retrieval remains open only for missing/stale" in card
 
 
 def test_execution_card_filters_cross_file_duplicate_suggested_views() -> None:
@@ -906,7 +936,7 @@ def test_reconcile_observations_tags_mount_confirmed_on_setup_code() -> None:
     assert "mount_confirmed" in item.keywords
 
 
-def test_cross_file_partner_files_excludes_edited_target() -> None:
+def test_cross_file_partner_files_no_longer_blanket_invalidates() -> None:
     from src.agent.manifest import cross_file_partner_files
 
     manifest = StepManifest(
@@ -933,7 +963,9 @@ def test_cross_file_partner_files_excludes_edited_target() -> None:
             ),
         )
     )
-    assert cross_file_partner_files(manifest, "list.py") == frozenset({"main.py"})
+    # Blanket partner STALE removed — only the edited file is invalidated.
+    assert cross_file_partner_files(manifest, "list.py") == frozenset()
+    assert cross_file_partner_files(manifest, "conf/noise_policy.yaml") == frozenset()
 
 
 def test_wiring_gap_skipped_for_mention_yaml_tasks() -> None:

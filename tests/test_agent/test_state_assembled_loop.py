@@ -129,12 +129,17 @@ def test_context_assembly(temp_project: Path) -> None:
     messages = assembly.assemble(
         user_query="implement feature X",
         active_files=["target.py"],
-        checklist=["[ ] step 1", "[x] step 2"],
         git_diff="dummy diff",
         validation_error="dummy error",
         messages_history=[Message(role="assistant", content="Thinking...")],
         last_tool_result="decision_edit(target_file=\"target.py\") -> failed",
         last_error={"error_type": "SchemaValidationError", "file": "target.py", "line": 42},
+        edit_plan_card=(
+            "plan: [2/3] halted\n"
+            "failed_step: file=target.py | intent=modify | ErrorClass=E2_LOCATE\n"
+            "remaining (not run — re-emit in next edit_plan):\n"
+            "  - other.py — next step"
+        ),
     )
     
     system_msg = next(m for m in messages if m["role"] == "system")
@@ -142,7 +147,10 @@ def test_context_assembly(temp_project: Path) -> None:
     
     assert "central commander and orchestrator" in system_msg["content"]
     assert "Follow project rules." in user_msg["content"]
-    assert "step 1" in user_msg["content"]
+    assert "Preserved execution checklist" not in user_msg["content"]
+    assert "edit_plan:" in user_msg["content"]
+    assert "plan: [2/3] halted" in user_msg["content"]
+    assert "ErrorClass=E2_LOCATE" in user_msg["content"]
     assert "target.py" in user_msg["content"]
     assert "def run():" not in user_msg["content"]
     assert "dummy diff" in user_msg["content"]
@@ -259,6 +267,37 @@ def test_retrieval_tool_history_stores_receipt_not_verbatim_code() -> None:
     receipt = _tool_history_receipt(call, result)
 
     assert "[RETRIEVAL OK — NEW EVIDENCE STORED]" in receipt
+    assert "SECRET_SOURCE" not in receipt
+    assert "main.py:1-2" in receipt
+
+
+def test_view_symbol_receipt_ignores_llm_observation_body() -> None:
+    """llm_observation must not re-paste verbatim into history (ANCHORS already hold it)."""
+    call = ToolCall(
+        id="v",
+        name="view_symbol_code",
+        arguments={"target_file": "noise_policy.py", "symbol": "NoisePolicy"},
+    )
+    body = "79| class NoisePolicy:\n80|     pass\n"
+    result = ToolResult(
+        success=True,
+        output=body,
+        metadata={
+            "llm_observation": body,
+            "raw_evidence_store": [
+                {
+                    "file": "noise_policy.py",
+                    "span": [79, 146],
+                    "symbol": "NoisePolicy",
+                    "code": "class NoisePolicy:\n    pass\n",
+                }
+            ],
+        },
+    )
+    receipt = _tool_history_receipt(call, result)
+    assert "[RETRIEVAL OK — NEW EVIDENCE STORED]" in receipt
+    assert "class NoisePolicy" not in receipt
+    assert "NoisePolicy" in receipt
 
 
 def test_fact_lock_replay_becomes_no_new_evidence() -> None:
@@ -685,7 +724,24 @@ def test_anchor_ingestion_splits_symbols_file_facts_and_schema(temp_project: Pat
     user_context = loop.context_assembly.get_user_context(
         ["main.py"], _search_cache_view(loop.state)
     )
-    assert user_context.count("[FILE CONTRACT - main.py@") == 1
+    assert user_context.count("`main.py`@") == 1
+    assert "Imports:" not in user_context
+    # Unrelated historically-touched contracts must not appear when not active/loaded.
+    bloated = loop.context_assembly.get_user_context(
+        ["main.py"],
+        {
+            **_search_cache_view(loop.state),
+            "file_contracts": {
+                **loop.state.context_anchors.file_contracts,
+                "app/interfaces/http/main.py": {
+                    "hash": "dead",
+                    "imports": [f"import x{i}" for i in range(40)],
+                },
+            },
+        },
+    )
+    assert "http/main.py" not in bloated
+    assert bloated.count("`main.py`@") == 1
 
 
 @pytest.mark.asyncio
@@ -849,10 +905,10 @@ def test_decision_edit_tool_multi_file_context(temp_project: Path) -> None:
     assert "target.py" in files_in_pack
     assert "other.py" not in files_in_pack
     
-    # Verify role/mode attributes for target file
+    # Verify role/mode attributes for target file (capped snippet, never unbounded full)
     target_window = [w for w in context_pack.windows if w.file == "target.py"][0]
     assert target_window.role == "target"
-    assert target_window.mode == "full"
+    assert target_window.mode == "snippet"
 
     # CASE 2: other.py is in raw_evidence_store -> it is included as reference/snippet
     search_cache = {
@@ -1494,7 +1550,7 @@ async def test_state_assembled_loop_edit_failures_update_state(temp_project: Pat
     
     response = LLMResponse(
         content=None,
-        tool_calls=[ToolCall(id="edit-1", name="decision_edit", arguments={"target_file": "target.py", "intent": "modify"})],
+        tool_calls=[ToolCall(id="edit-1", name="decision_edit", arguments={"target_file": "target.py", "intent": "modify", "focus_symbols": ["run"], "context_window": [{"file": "target.py", "span": [1, 10]}]})],
         usage=None,
         model="coord-model",
     )
@@ -1583,7 +1639,7 @@ async def test_last_tool_result_and_last_error(temp_project: Path) -> None:
     
     response = LLMResponse(
         content=None,
-        tool_calls=[ToolCall(id="edit-1", name="decision_edit", arguments={"target_file": "target.py", "intent": "modify"})],
+        tool_calls=[ToolCall(id="edit-1", name="decision_edit", arguments={"target_file": "target.py", "intent": "modify", "focus_symbols": ["run"], "context_window": [{"file": "target.py", "span": [1, 10]}]})],
         usage=None,
         model="coord-model",
     )
@@ -2032,10 +2088,13 @@ async def test_deterministic_collapse_retrieval_before_core_llm(temp_project: Pa
 
     await loop._collapse_retrieval_before_core_llm()
 
-    # Verify that the anchor was folded/collapsed deterministically
-    assert "main.py" in loop.state.context_anchors.summaries
-    assert "确认鉴权" in loop.state.context_anchors.summaries["main.py"]
+    # L2 budget fold demotes to L4 locators (not fat CONTEXT COLLAPSE summaries).
     assert len(loop.state.context_anchors.code) == 0
+    assert any(
+        loc.get("id") == "main.py:1-2" or loc.get("file") == "main.py"
+        for loc in loop.state.context_anchors.locators
+    )
+    assert "main.py" not in loop.state.context_anchors.summaries
 
 
 def test_retrieval_policy_blocks_repeated_signature() -> None:
@@ -2212,6 +2271,178 @@ def test_build_deduped_loaded_anchors_block_edit_ready_keeps_cross_file_projecti
     assert "sqlalchemy_error_handler" in edit_ready_block
     assert "build_router" in edit_ready_block
     assert "passenger_snapshot" in edit_ready_block
+
+
+@pytest.mark.asyncio
+async def test_edit_queue_drains_after_successful_decision_edit(
+    temp_project: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from src.agent.edit_plan import build_edit_queue
+
+    (temp_project / "a.py").write_text("x=1\n", encoding="utf-8")
+    (temp_project / "b.py").write_text("y=1\n", encoding="utf-8")
+    success = ToolResult(
+        success=True,
+        output="ok",
+        metadata={
+            "execution": SimpleNamespace(
+                success=True,
+                original_content="x=1\n",
+                attempted_content="x=2\n",
+            ),
+            "validation": SimpleNamespace(success=True, error=""),
+        },
+    )
+    tools = MagicMock()
+    tools.call = AsyncMock(return_value=success)
+    harness = MagicMock(project_root=temp_project)
+    harness.phase_metrics = PhaseMetrics()
+    loop = StateAssembledLoop(
+        llm=MagicMock(),
+        tools=tools,
+        harness=harness,
+        context=MagicMock(),
+        permissions=MagicMock(),
+        settings=MagicMock(max_turns=5),
+    )
+    _prime_acting_run(loop)
+    loop.state = replace(
+        loop.state,
+        checklist=("[ ] major",),
+        edit_queue=build_edit_queue(
+            [
+                {
+                    "target_file": "b.py",
+                    "intent": "step two",
+                    "focus_symbols": ["B"],
+                    "context_window": [{"file": "b.py", "span": [1, 10]}],
+                },
+            ],
+            checklist=("[ ] major",),
+        ),
+    )
+
+    async def _no_preflight(*_a: object, **_k: object) -> None:
+        return None
+
+    loop._inspect_tool_preflight_async = _no_preflight  # type: ignore[method-assign]
+    response = LLMResponse(
+        content=None,
+        tool_calls=[
+            ToolCall(
+                id="e1",
+                name="decision_edit",
+                arguments={"target_file": "a.py", "intent": "step one"},
+            )
+        ],
+        usage=None,
+        model="m",
+    )
+    _events = [event async for event in loop._process_tool_calls(response)]
+
+    assert tools.call.await_count == 2
+    assert loop.state.edit_queue.drained is True
+    second_args = tools.call.await_args_list[1].args[1]
+    assert second_args["target_file"] == "b.py"
+    assert second_args["intent"] == "step two"
+
+
+@pytest.mark.asyncio
+async def test_edit_queue_halts_on_core_retry_owner(temp_project: Path) -> None:
+    from types import SimpleNamespace
+
+    from src.agent.edit_plan import build_edit_queue
+
+    fail = ToolResult(
+        success=False,
+        output="patch failed",
+        error="mismatch: block 1 SEARCH code not found",
+        metadata={
+            "error_class": "E2_LOCATE",
+            "retry_owner": "core",
+            "execution": SimpleNamespace(success=False),
+            "validation": SimpleNamespace(success=False, error=""),
+        },
+    )
+    tools = MagicMock()
+    tools.call = AsyncMock(return_value=fail)
+    harness = MagicMock(project_root=temp_project)
+    harness.phase_metrics = PhaseMetrics()
+    loop = StateAssembledLoop(
+        llm=MagicMock(),
+        tools=tools,
+        harness=harness,
+        context=MagicMock(),
+        permissions=MagicMock(),
+        settings=MagicMock(max_turns=5),
+    )
+    _prime_acting_run(loop)
+    loop.state = replace(
+        loop.state,
+        checklist=("[ ] major",),
+        edit_queue=build_edit_queue(
+            [
+                {"target_file": "b.py", "intent": "step two"},
+                {"target_file": "c.py", "intent": "step three"},
+            ],
+            checklist=("[ ] major",),
+        ),
+    )
+
+    async def _no_preflight(*_a: object, **_k: object) -> None:
+        return None
+
+    loop._inspect_tool_preflight_async = _no_preflight  # type: ignore[method-assign]
+    response = LLMResponse(
+        content=None,
+        tool_calls=[
+            ToolCall(
+                id="e1",
+                name="decision_edit",
+                arguments={"target_file": "a.py", "intent": "step one"},
+            )
+        ],
+        usage=None,
+        model="m",
+    )
+    _events = [event async for event in loop._process_tool_calls(response)]
+
+    assert tools.call.await_count == 1
+    assert loop.state.edit_queue.drained is True
+    assert loop.state.edit_queue.minor_steps == ()
+
+
+def test_build_deduped_loaded_anchors_block_demotes_edited_files() -> None:
+    cache = {
+        "symbol_projections": [
+            {
+                "file": "noise_policy.py",
+                "symbol": "NoisePolicy",
+                "span": [79, 146],
+                "projection_code": "79| class NoisePolicy:",
+            },
+            {
+                "file": "mention.py",
+                "symbol": "is_mentioned",
+                "span": [10, 20],
+                "projection_code": "10| def is_mentioned(...):",
+            },
+        ],
+        "raw_evidence_store": [],
+    }
+
+    block = _build_deduped_loaded_anchors_block(
+        cache,
+        edit_ready=True,
+        demote_files=frozenset({"noise_policy.py"}),
+    )
+
+    assert "COMPLETED EDIT ANCHORS" in block
+    assert "background; do not re-view" in block
+    assert "class NoisePolicy:" not in block
+    assert "def is_mentioned" in block
 
 
 def test_grep_sql_locator_does_not_ground_relevant_schema_slot() -> None:

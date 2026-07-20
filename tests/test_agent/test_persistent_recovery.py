@@ -332,3 +332,47 @@ def test_validator_schema_still_flags_dead_alias_inside_sql_literal(tmp_path: Pa
     )
 
     assert "DEAD_SQL_ALIAS" in result["issues"]
+
+
+def test_validator_schema_ignores_english_docstring_from_text(tmp_path: Path) -> None:
+    """Prose like 'strip … from text.' must not trigger DEAD_SQL_ALIAS."""
+    original = (
+        "class NoisePolicy:\n"
+        "    def is_mentioning_bot(self, text: str) -> bool:\n"
+        "        return any(n in text for n in self.bot_nicknames)\n"
+    )
+    patched = (
+        "class NoisePolicy:\n"
+        "    def is_mentioning_bot(self, text: str) -> bool:\n"
+        "        return any(n in text for n in self.bot_nicknames)\n"
+        "\n"
+        "\n"
+        "def strip_mention(text: str, policy: NoisePolicy) -> str:\n"
+        '    """Standalone convenience function to strip bot mention from text."""\n'
+        "    return text\n"
+    )
+    patch = (
+        "<<<<<<< SEARCH\n"
+        "    def is_mentioning_bot(self, text: str) -> bool:\n"
+        "        return any(n in text for n in self.bot_nicknames)\n"
+        "=======\n"
+        "    def is_mentioning_bot(self, text: str) -> bool:\n"
+        "        return any(n in text for n in self.bot_nicknames)\n"
+        "\n"
+        "\n"
+        "def strip_mention(text: str, policy: NoisePolicy) -> str:\n"
+        '    """Standalone convenience function to strip bot mention from text."""\n'
+        "    return text\n"
+        ">>>>>>> REPLACE"
+    )
+    validator = CursorValidator(tmp_path)
+
+    result = validator.validate_schema(
+        target_file="noise_policy.py",
+        patch=patch,
+        original_content=original,
+        patched_content=patched,
+    )
+
+    assert result["pass"] is True
+    assert "DEAD_SQL_ALIAS" not in result["issues"]

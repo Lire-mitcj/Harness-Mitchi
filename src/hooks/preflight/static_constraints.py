@@ -98,7 +98,9 @@ def inspect_static_constraints(
                     "view_symbol_code symbol must be a code identifier (function/class/DDL name), "
                     "not the filename. Use grep_search first to locate a concrete target."
                 )
-            arguments["symbol"] = symbol_text
+            from src.hooks.tool_gate import normalize_view_symbol
+
+            arguments["symbol"] = normalize_view_symbol(symbol_text)
 
     # 4. Decision edit validation & pruning
     elif tool_name == "decision_edit":

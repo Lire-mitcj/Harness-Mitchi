@@ -48,6 +48,7 @@ class LLMClient:
         *,
         request_timeout: float = 180,
         stream_idle_timeout: float = 60,
+        stream_reasoning_timeout: float = 180,
         prompt_cache_enabled: bool = True,
         prompt_cache_min_tokens: int = 1024,
         prompt_cache_ttl: CacheTTL = "5m",
@@ -57,6 +58,11 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.request_timeout = request_timeout
         self.stream_idle_timeout = stream_idle_timeout
+        # Absolute ceiling for reasoning-before-first-content. Reasoning deltas
+        # keep the stream alive (so a slow-but-healthy reasoning model is not
+        # misread as a dead connection), but they must not remove the cap
+        # entirely — otherwise a model that "thinks" for minutes hangs the edit.
+        self.stream_reasoning_timeout = stream_reasoning_timeout
         self.prompt_cache_enabled = prompt_cache_enabled
         self.prompt_cache_min_tokens = prompt_cache_min_tokens
         self.prompt_cache_ttl = prompt_cache_ttl
@@ -129,32 +135,54 @@ class LLMClient:
             response_format=response_format,
         )
 
+        import time
+
         content_parts: list[str] = []
         tool_calls_raw: dict[int, dict[str, Any]] = {}
         usage: TokenUsage | None = None
         last_chunk: Any = None
 
-        timeout_stage = "connection/first token"
+        timeout_stage = "connection/first content"
         try:
             # Do not pass a provider-level absolute timeout for streams. Local
-            # guards bound connection/first-event latency and each idle gap.
+            # guards bound connection + first *content* latency and each idle gap.
+            # Empty/role-only SSE events must not reset the first-content budget.
             kwargs.pop("timeout", None)
+            stream_started_at = time.monotonic()
+            first_content_deadline = stream_started_at + connect_timeout
+            reasoning_deadline = stream_started_at + max(
+                connect_timeout, self.stream_reasoning_timeout
+            )
             response = await asyncio.wait_for(
                 litellm.acompletion(**kwargs, stream=True),
                 timeout=connect_timeout,
             )
             iterator = response.__aiter__()
-            first_event = True
+            awaiting_first_content = True
+            seen_reasoning = False
             while True:
-                timeout_stage = "connection/first token" if first_event else "chunk idle"
+                if awaiting_first_content:
+                    if seen_reasoning:
+                        # Alive (model is reasoning) but still absolutely capped.
+                        timeout_stage = "reasoning (no visible content)"
+                        remaining = reasoning_deadline - time.monotonic()
+                        chunk_timeout = min(remaining, idle_timeout)
+                    else:
+                        timeout_stage = "connection/first content"
+                        remaining = first_content_deadline - time.monotonic()
+                        chunk_timeout = remaining
+                    if remaining <= 0:
+                        raise TimeoutError()
+                else:
+                    timeout_stage = "chunk idle"
+                    chunk_timeout = idle_timeout
                 try:
                     chunk = await asyncio.wait_for(
                         anext(iterator),
-                        timeout=connect_timeout if first_event else idle_timeout,
+                        timeout=chunk_timeout,
                     )
                 except StopAsyncIteration:
                     break
-                first_event = False
                 last_chunk = chunk
                 chunk_usage = self._extract_usage(chunk)
                 if chunk_usage is not None:
@@ -163,11 +191,28 @@ class LLMClient:
                 if delta is None:
                     continue
 
+                # Reasoning models may stream private thinking for a long time
+                # before emitting user-visible content. Treat those deltas as
+                # real model activity so the absolute first-content deadline
+                # does not kill a healthy stream. Do not expose or append the
+                # reasoning text to the final assistant response.
+                reasoning_content = getattr(delta, "reasoning_content", None)
+                if not reasoning_content:
+                    model_extra = getattr(delta, "model_extra", None)
+                    if isinstance(model_extra, dict):
+                        reasoning_content = model_extra.get("reasoning_content")
+                if reasoning_content:
+                    # Keep alive + switch to the (bounded) reasoning deadline, but
+                    # do NOT clear awaiting_first_content: reasoning is not content.
+                    seen_reasoning = True
+
                 if delta.content:
+                    awaiting_first_content = False
                     content_parts.append(delta.content)
                     yield (delta.content, None)
 
                 if delta.tool_calls:
+                    awaiting_first_content = False
                     for tc_delta in delta.tool_calls:
                         idx = tc_delta.index
                         if idx not in tool_calls_raw:
@@ -185,7 +230,12 @@ class LLMClient:
                             if tc_delta.function.arguments:
                                 entry["arguments"] += tc_delta.function.arguments
         except TimeoutError:
-            limit = connect_timeout if timeout_stage == "connection/first token" else idle_timeout
+            if timeout_stage == "connection/first content":
+                limit = connect_timeout
+            elif timeout_stage == "reasoning (no visible content)":
+                limit = max(connect_timeout, self.stream_reasoning_timeout)
+            else:
+                limit = idle_timeout
             log.error("LLM stream %s timed out after %.0fs", timeout_stage, limit)
             yield (
                 "",

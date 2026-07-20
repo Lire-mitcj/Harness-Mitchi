@@ -153,12 +153,30 @@ class MitKIISettings(BaseSettings):
         ),
     )
     cursor_decision_patch_retries: int = Field(
-        default=2,
+        default=1,
         ge=0,
-        le=3,
+        le=2,
         description=(
             "Inner decision_edit retries when patch apply fails with mechanical errors "
-            "(mismatch, invalid_patch overlap, empty patch). Does not retry validator failures."
+            "(mismatch, invalid_patch). Keep low; on exhaustion Core should split into "
+            "more decision_edit steps. Does not retry validator failures."
+        ),
+    )
+    cursor_decision_max_patch_blocks: int = Field(
+        default=3,
+        ge=1,
+        le=3,
+        description=(
+            "Hard cap on SEARCH/REPLACE blocks per decision_edit patch. "
+            "Patches above this are rejected before apply; Core must split steps."
+        ),
+    )
+    edit_sequential_patch: bool = Field(
+        default=False,
+        description=(
+            "When true, apply SEARCH/REPLACE blocks top-to-bottom against the evolving "
+            "buffer. When false (default), match all SEARCH against the original file "
+            "then apply bottom-up."
         ),
     )
     cursor_max_context_files: int = Field(default=3, ge=1, le=12)
@@ -334,6 +352,17 @@ class MitKIISettings(BaseSettings):
         ge=5,
         le=600,
         description="Maximum idle seconds between streaming chunks; not a total deadline.",
+    )
+    llm_stream_reasoning_timeout: int = Field(
+        default=180,
+        ge=30,
+        le=900,
+        description=(
+            "Absolute ceiling (seconds) for reasoning-before-first-content. "
+            "Reasoning deltas keep the stream alive past the first-content "
+            "timeout, but never remove the cap: a model that only 'thinks' is "
+            "aborted here instead of hanging the edit."
+        ),
     )
     ready_final_max_tokens: int = Field(
         default=1024,

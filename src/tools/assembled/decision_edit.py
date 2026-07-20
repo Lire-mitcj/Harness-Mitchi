@@ -4,12 +4,31 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
 
 from src.agent.contracts import ContextPack, ContextWindow
-from src.agent.decision import CursorDecisionLLM
+from src.agent.decision import CursorDecisionLLM, DecisionError
+from src.agent.edit_errors import (
+    EditErrorClass,
+    RetryOwner,
+    classify_edit_error,
+    core_hint_for,
+    edit_inner_retry_allowed,
+    retry_owner_for,
+)
+from src.agent.edit_brief import format_applied_diff_summary
+from src.agent.edit_materialize import (
+    MaterializeError,
+    materialize_edit_patch,
+    sanitize_focus_symbols,
+)
+from src.agent.edit_plan import (
+    MAX_PATCH_BLOCKS_PER_MINOR_STEP,
+    PREFERRED_PATCH_BLOCKS_PER_MINOR_STEP,
+)
 from src.agent.executor import CursorExecutor
 from src.agent.patch_applier import CursorPatchApplier
 from src.agent.types import RiskLevel, ToolResult
@@ -25,10 +44,59 @@ _CHARS_PER_TIMEOUT_SECOND = 800.0
 _TIMEOUT_PER_CONTEXT_SPAN = 12.0
 _MAX_DECISION_TIMEOUT = 300.0
 _MAX_FAILED_PATCH_FEEDBACK_CHARS = 6000
+_SITE_SPAN_RE = re.compile(
+    r"(?im)\bspan\s*=\s*(\d+)\s*[-:]\s*(\d+)"
+)
 
 
 def _norm_file_path(path: str) -> str:
     return path.replace("\\", "/").lstrip("./")
+
+
+def count_stream_diff_lines(text: str) -> tuple[int, int]:
+    """Estimate ``[+added -removed]`` while EditLLM streams a patch.
+
+    Supports:
+    - Legacy SEARCH/REPLACE (count SEARCH lines as removed, REPLACE as added)
+    - SITE + REPLACE-only (count REPLACE body as added; estimate removed from
+      ``SITE: span=A-B`` when present — harness fills SEARCH after stream ends)
+    """
+    normalized = (text or "").replace("\\n", "\n")
+    added = 0
+    removed = 0
+    state = "normal"
+    saw_search = False
+    for line in normalized.splitlines():
+        clean_line = line.strip().strip("\"'")
+        if "<<<<<<< SEARCH" in clean_line:
+            state = "search"
+            saw_search = True
+        elif "<<<<<<< REPLACE" in clean_line:
+            state = "replace"
+        elif state == "search" and "=======" in clean_line:
+            state = "replace"
+        elif ">>>>>>> REPLACE" in clean_line:
+            state = "normal"
+        elif state == "search":
+            removed += 1
+        elif state == "replace":
+            added += 1
+
+    # SITE+REPLACE: SEARCH is synthesized later; approximate removals from span=.
+    if not saw_search and removed == 0:
+        for match in _SITE_SPAN_RE.finditer(normalized):
+            start, end = int(match.group(1)), int(match.group(2))
+            if end >= start:
+                removed += end - start + 1
+    return added, removed
+
+
+def format_edit_progress(target_file: str, added: int, removed: int) -> str:
+    """Rich markup for the decision_edit streaming status line."""
+    return (
+        f"正在编辑文件: [bold blue]{target_file}[/]… "
+        f"[bold blue][+{added} -{removed}][/]"
+    )
 
 
 def merge_context_spans(
@@ -71,43 +139,102 @@ def decision_timeout_for_context(
     context_chars: int,
     span_count: int,
 ) -> float:
-    """First-token (connect) deadline for decision_edit streaming.
+    """Absolute first-*content* deadline for decision_edit streaming.
 
-    Active streams are bounded by per-chunk idle timeout on the LLM client,
-    not this value as a total wall-clock cap.
+    Scales lightly with context size. After the first content chunk, only the
+    LLM client's per-chunk idle timeout applies — not this value as a total
+    wall-clock cap for generation.
     """
-    scaled = (
-        base_timeout
-        + (max(context_chars, 0) / _CHARS_PER_TIMEOUT_SECOND)
-        + (max(span_count, 0) * _TIMEOUT_PER_CONTEXT_SPAN)
-    )
+    # Cap additive budget so small contexts are not misread as "must wait 160s+".
+    char_budget = min(45.0, max(context_chars, 0) / _CHARS_PER_TIMEOUT_SECOND)
+    span_budget = min(36.0, max(span_count, 0) * _TIMEOUT_PER_CONTEXT_SPAN)
+    scaled = base_timeout + char_budget + span_budget
     return min(_MAX_DECISION_TIMEOUT, max(base_timeout, scaled))
 
 
 def is_mechanical_patch_error(error: str) -> bool:
     """True when patch applier rejected the patch without changing the file."""
-    if not error:
-        return False
-    return error.startswith(("mismatch:", "invalid_patch:"))
+    klass = classify_edit_error(error, apply_succeeded=False)
+    return klass in {EditErrorClass.E1_FORMAT, EditErrorClass.E2_LOCATE}
+
+
+def is_format_validation_retry(error: str, attempted_content: str = "") -> bool:
+    """True when validator failure is likely a patch-format corruption (Edit retry)."""
+    klass = classify_edit_error(
+        error,
+        attempted_content=attempted_content,
+        apply_succeeded=True,
+    )
+    return klass is EditErrorClass.E1_FORMAT
 
 
 def _patch_retry_hint(error: str) -> str:
-    if "overlaps another block" in error:
+    klass = classify_edit_error(error, apply_succeeded=False)
+    if klass is EditErrorClass.E1_FORMAT:
+        if "decision_schema" in error or "invalid JSON" in error:
+            return (
+                "E1_FORMAT: return ACTION: edit with SITE + REPLACE (header-block). "
+                "Do not wrap the patch in JSON. "
+                f"Prefer {PREFERRED_PATCH_BLOCKS_PER_MINOR_STEP} SITE "
+                f"(max {MAX_PATCH_BLOCKS_PER_MINOR_STEP})."
+            )
+        if "SITE:" in error or "expected SITE" in error or "empty patch" in error:
+            return (
+                "E1_FORMAT: emit `SITE: symbol=<name>` then "
+                "`<<<<<<< REPLACE` … `>>>>>>> REPLACE`. Do NOT emit SEARCH — "
+                "harness fills SEARCH from disk. "
+                f"Prefer {PREFERRED_PATCH_BLOCKS_PER_MINOR_STEP} SITE "
+                f"(max {MAX_PATCH_BLOCKS_PER_MINOR_STEP})."
+            )
+        if "nested SEARCH/REPLACE markers" in error or "stray ======= marker" in error:
+            return (
+                "E1_FORMAT: separate each SITE with a newline after >>>>>>> REPLACE "
+                "before the next SITE. Never embed markers in code bodies. "
+                f"Prefer {PREFERRED_PATCH_BLOCKS_PER_MINOR_STEP} SITE "
+                f"(max {MAX_PATCH_BLOCKS_PER_MINOR_STEP}) per 小步."
+            )
+        if "too many SEARCH/REPLACE blocks" in error or "too many SITE" in error:
+            return (
+                f"E1_FORMAT: at most {MAX_PATCH_BLOCKS_PER_MINOR_STEP} SITE blocks per 小步 "
+                f"(prefer {PREFERRED_PATCH_BLOCKS_PER_MINOR_STEP}). "
+                "Enqueue remaining sites as later 小步."
+            )
+        if "patch produces no change" in error or "REPLACE equals on-disk" in error:
+            return (
+                "E1_FORMAT: your REPLACE echoed the on-disk SITE (no edit). "
+                "REPLACE must be the AFTER-edit text with CURRENT_STATE intent "
+                "applied — full symbol/span body, not a copy of CURRENT_CONTEXT. "
+                "Do not repeat the previous identical REPLACE."
+            )
+        if "expected SEARCH/REPLACE blocks only" in error:
+            return (
+                "E1_FORMAT: return SITE + REPLACE blocks (or legacy SEARCH/REPLACE); "
+                "no prose/fences."
+            )
         return (
-            "Each SEARCH/REPLACE block must target disjoint line ranges. "
-            "Shrink SEARCH to 3–8 lines per site; never reuse the same lines in two blocks."
+            "E1_FORMAT: regenerate SITE + REPLACE for this 小步 only "
+            f"(prefer {PREFERRED_PATCH_BLOCKS_PER_MINOR_STEP}, "
+            f"max {MAX_PATCH_BLOCKS_PER_MINOR_STEP} SITE blocks). Do not emit SEARCH."
         )
-    if error.startswith("mismatch:"):
+    if klass is EditErrorClass.E2_LOCATE:
+        if "overlaps another block" in error:
+            return (
+                "E2_LOCATE: SITE spans must be disjoint; one symbol/span per SITE. "
+                "If sites >3, leave extras for later 小步."
+            )
         return (
-            "SEARCH must be verbatim code from CURRENT_CONTEXT (before edit). "
-            "Put new code only in REPLACE; split independent sites into non-overlapping blocks."
+            "E2_LOCATE: fix SITE to an on-disk symbol from Did you mean… / "
+            "valid_focus_symbols (ignore invented Core focus names). "
+            "New helpers: insert via MODE+ANCHOR under an existing symbol — "
+            "do not SITE a name that is not on disk yet. "
+            "Do NOT emit SEARCH — harness copies on-disk text. "
+            f"Prefer {PREFERRED_PATCH_BLOCKS_PER_MINOR_STEP} SITE "
+            f"(max {MAX_PATCH_BLOCKS_PER_MINOR_STEP}); if still failing Core will replan."
         )
-    if "patch produces no change" in error:
-        return "REPLACE must differ from SEARCH; ensure the patch actually edits the file."
-    if "expected SEARCH/REPLACE blocks only" in error:
-        return "Return only SEARCH/REPLACE marker blocks in patch; no prose or Markdown fences."
     return (
-        "Regenerate action=edit with corrected SEARCH/REPLACE blocks using CURRENT_CONTEXT only."
+        "Regenerate ACTION: edit with corrected SITE + REPLACE for this 小步 only. "
+        f"Prefer {PREFERRED_PATCH_BLOCKS_PER_MINOR_STEP} SITE "
+        f"(max {MAX_PATCH_BLOCKS_PER_MINOR_STEP}). Do not emit SEARCH."
     )
 
 
@@ -120,19 +247,33 @@ def build_patch_retry_state_text(
     failed_patch: str,
 ) -> str:
     """Augment CURRENT_STATE for an inner decision_edit retry."""
-    patch_excerpt = failed_patch.strip()
-    if len(patch_excerpt) > _MAX_FAILED_PATCH_FEEDBACK_CHARS:
-        patch_excerpt = (
-            patch_excerpt[:_MAX_FAILED_PATCH_FEEDBACK_CHARS]
-            + "\n... (truncated failed patch)"
+    error_text = (error or "").strip()
+    # Replaying an echoed REPLACE teaches the model to emit the same no-op again.
+    noop_echo = (
+        "REPLACE equals on-disk" in error_text
+        or "patch produces no change" in error_text
+    )
+    if noop_echo:
+        patch_section = (
+            "Do NOT copy the previous REPLACE body — it was identical to disk.\n"
+            "Re-read CURRENT_STATE intent and emit the changed AFTER-edit text.\n"
         )
+    else:
+        patch_excerpt = failed_patch.strip()
+        if len(patch_excerpt) > _MAX_FAILED_PATCH_FEEDBACK_CHARS:
+            patch_excerpt = (
+                patch_excerpt[:_MAX_FAILED_PATCH_FEEDBACK_CHARS]
+                + "\n... (truncated failed patch)"
+            )
+        patch_section = f"Failed patch excerpt:\n```\n{patch_excerpt}\n```\n"
     return (
         f"{base_state_text.strip()}\n\n"
         f"PATCH_RETRY_FEEDBACK (attempt {attempt + 1}/{max_attempts})\n"
-        f"The previous patch failed to apply:\n```\n{error.strip()}\n```\n"
-        f"Failed patch excerpt:\n```\n{patch_excerpt}\n```\n"
-        f"Fix: {_patch_retry_hint(error)}\n"
-        "Return a new action=edit JSON with corrected patch only."
+        f"The previous patch failed to apply:\n```\n{error_text}\n```\n"
+        f"{patch_section}"
+        f"Fix: {_patch_retry_hint(error_text)}\n"
+        "Return ACTION: edit with corrected SITE (+ MODE/ANCHOR delta preferred) "
+        "(header-block format; do NOT emit SEARCH; do NOT wrap in JSON)."
     )
 
 
@@ -140,6 +281,9 @@ def _build_state_text(
     target_file: str,
     intent: str,
     focus_symbols: list[str],
+    *,
+    dropped_focus: list[str] | None = None,
+    remapped_focus: dict[str, str] | None = None,
 ) -> str:
     """Pass Core plan step through to Decision LLM without internal re-batching."""
     lines = [
@@ -149,19 +293,31 @@ def _build_state_text(
     symbols = [str(symbol).strip() for symbol in focus_symbols if str(symbol).strip()]
     if symbols:
         lines.append(f"\nFocus symbols for this plan step: {', '.join(symbols)}")
+    if remapped_focus:
+        bits = [f"{src}→{dst}" for src, dst in remapped_focus.items()]
+        lines.append(
+            "Core focus typo remapped to on-disk names: " + ", ".join(bits)
+        )
+    if dropped_focus:
+        lines.append(
+            "Dropped unknown focus_symbols (not on disk — do not SITE them; "
+            "insert new helpers via MODE+ANCHOR under an existing symbol): "
+            + ", ".join(dropped_focus)
+        )
     return "\n".join(lines)
 
 
 class DecisionEditTool(Tool):
     name = "decision_edit"
     description = (
-        "Apply edits to exactly one file when STEP EVIDENCE shows edit_ready:yes "
-        "and the change is grounded in loaded code anchors. One call per plan step "
-        "and target file: pass intent, focus_symbols, and context_window from Core; "
-        "Decision LLM consumes them in a single patch generation and validate pass. "
-        "Split multi-step work across multiple decision_edit calls at the Core/plan "
-        "layer — do not expect internal symbol batching inside this tool. "
-        "Do NOT use to inspect, grep, or load code."
+        "Apply one 小步 edit to exactly one file when edit_ready:yes. "
+        "A 小步 is one decision_edit job from the Core edit_queue (one target_file; "
+        f"prefer {PREFERRED_PATCH_BLOCKS_PER_MINOR_STEP} SITE/symbol edit, "
+        f"hard max {MAX_PATCH_BLOCKS_PER_MINOR_STEP}). "
+        "EditLLM emits SITE+REPLACE only; harness fills SEARCH from disk. "
+        "大步 are checklist outcomes; Core expands each 大步 into multiple 小步. "
+        "Mechanical failures retry inside Edit (E1/E2); exhausted or E4/E5/E6 return "
+        "to Core. Do NOT use to inspect, grep, or load code."
     )
     risk_level = RiskLevel.MODERATE
     parameters = {
@@ -182,8 +338,9 @@ class DecisionEditTool(Tool):
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "本步要改的符号名（函数/类/helper）。列出当前 step 涉及的全部符号；"
-                    "Decision LLM 一次消费，不在工具内再分批。"
+                    "本步要改的、磁盘上已存在的符号名（1–3 个，必填）。"
+                    "必须来自 STEP EVIDENCE available_symbols / loaded anchors。"
+                    "不要把尚未写入的新函数名放进来；新符号由 EditLLM 用 MODE+ANCHOR 插入。"
                 ),
             },
             "context_window": {
@@ -229,7 +386,7 @@ class DecisionEditTool(Tool):
                 "description": "任务执行约束条件。"
             }
         },
-        "required": ["target_file", "intent", "context_window"]
+        "required": ["target_file", "intent", "focus_symbols", "context_window"]
     }
 
     def __init__(
@@ -250,16 +407,28 @@ class DecisionEditTool(Tool):
             if isinstance(configured_timeout, (int, float))
             else 120.0
         )
-        configured_patch_retries = getattr(settings, "cursor_decision_patch_retries", 2)
+        configured_patch_retries = getattr(settings, "cursor_decision_patch_retries", 1)
         self.patch_retry_max = (
             int(configured_patch_retries)
             if isinstance(configured_patch_retries, int)
-            else 2
+            else 1
         )
-        self.patch_retry_max = max(0, min(self.patch_retry_max, 3))
+        self.patch_retry_max = max(0, min(self.patch_retry_max, 2))
+
+        configured_max_blocks = getattr(settings, "cursor_decision_max_patch_blocks", 3)
+        max_blocks = (
+            int(configured_max_blocks)
+            if isinstance(configured_max_blocks, int)
+            else 3
+        )
+        sequential = bool(getattr(settings, "edit_sequential_patch", False))
 
         self.decision = CursorDecisionLLM(self.decision_llm)
-        self.patch_applier = CursorPatchApplier(self.project_root)
+        self.patch_applier = CursorPatchApplier(
+            self.project_root,
+            sequential=sequential,
+            max_blocks=max_blocks,
+        )
         self.executor = CursorExecutor(self.project_root, self.patch_applier)
 
         validator_llm = self.decision_llm
@@ -299,6 +468,43 @@ class DecisionEditTool(Tool):
             params = {**params, "focus_symbols": []}
         return super().validate_params(params)
 
+    def _settings_int(self, name: str, default: int) -> int:
+        """Read a positive int setting; ignore MagicMock / non-numeric stand-ins.
+
+        ``unittest.mock.MagicMock.__int__`` returns 1, so never call ``int()``
+        on arbitrary attribute objects.
+        """
+        value = getattr(self.settings, name, default)
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return value if value > 0 else default
+        if isinstance(value, float):
+            parsed = int(value)
+            return parsed if parsed > 0 else default
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = int(value.strip(), 10)
+            except ValueError:
+                return default
+            return parsed if parsed > 0 else default
+        return default
+
+    def _edit_context_budgets(self) -> tuple[int, int, int]:
+        """Return (max_windows, chars_per_window, total_chars) for Edit LLM packs.
+
+        Settings ``cursor_max_context_files`` / ``cursor_context_chars_per_file``
+        were previously unused here, which let whole files (10k+ tokens) leak in.
+        Edit 小步 packs are capped tighter than retrieve.
+        """
+        max_files = self._settings_int("cursor_max_context_files", 3)
+        chars_per = self._settings_int("cursor_context_chars_per_file", 12_000)
+        max_windows = max(1, min(max_files, 3))
+        # Hard ceiling per window for Decision/Edit (retrieve may stay larger).
+        chars_per_window = max(1_500, min(chars_per, 6_000))
+        total_chars = max(chars_per_window, min(chars_per_window * max_windows, 12_000))
+        return max_windows, chars_per_window, total_chars
+
     def _read_file_span(self, file_path: str, start_line: int, end_line: int) -> str | None:
         abs_path = (self.project_root / file_path).resolve()
         if not abs_path.is_file():
@@ -318,20 +524,132 @@ class DecisionEditTool(Tool):
             )
             return None
 
+    def _clip_window_content(
+        self,
+        content: str,
+        *,
+        start_line: int,
+        max_chars: int,
+    ) -> tuple[str, int]:
+        """Clip content to max_chars; return (text, end_line_inclusive)."""
+        if len(content) <= max_chars:
+            return content, start_line + max(content.count("\n"), 0)
+        clipped = content[:max_chars]
+        # Prefer cutting on a line boundary.
+        last_nl = clipped.rfind("\n")
+        if last_nl > max_chars // 2:
+            clipped = clipped[:last_nl]
+        end_line = start_line + clipped.count("\n")
+        return clipped + "\n… (truncated for Edit LLM context budget)", end_line
+
+    def _spans_from_focus_symbols(
+        self,
+        target_file: str,
+        focus_symbols: list[str],
+        *,
+        max_chars: int,
+    ) -> list[tuple[str, int, int]]:
+        """Best-effort symbol windows when Core omitted / undersized context_window."""
+        if not focus_symbols:
+            return []
+        from src.agent.edit_materialize import locate_symbol_span
+
+        spans: list[tuple[str, int, int]] = []
+        window_lines = max(40, min(200, max_chars // 40))
+        for symbol in focus_symbols[:3]:
+            name = str(symbol).strip().split(".")[-1]
+            if not name:
+                continue
+            located = locate_symbol_span(self.project_root, target_file, name)
+            if located is not None:
+                start, end = located
+                # Pad a few lines after for insert_after ANCHOR visibility.
+                abs_path = (self.project_root / target_file).resolve()
+                try:
+                    n_lines = len(abs_path.read_text(encoding="utf-8").splitlines())
+                except OSError:
+                    n_lines = end
+                end = min(n_lines, max(end, start + window_lines - 1, end + 8))
+                spans.append((target_file, max(1, start - 2), end))
+                continue
+            # Fallback: regex line scan (non-Python / odd defs).
+            abs_path = (self.project_root / target_file).resolve()
+            if not abs_path.is_file():
+                continue
+            try:
+                lines = abs_path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            hit = -1
+            for index, line in enumerate(lines):
+                stripped = line.strip()
+                if (
+                    stripped.startswith(f"def {name}")
+                    or stripped.startswith(f"async def {name}")
+                    or stripped.startswith(f"class {name}")
+                ):
+                    hit = index
+                    break
+            if hit < 0:
+                continue
+            start = max(1, hit + 1 - 2)
+            end = min(len(lines), hit + window_lines)
+            spans.append((target_file, start, end))
+        return merge_context_spans(spans)
+
+    def _spans_from_search_cache(
+        self,
+        target_file: str,
+        search_cache: dict[str, Any] | None,
+    ) -> list[tuple[str, int, int]]:
+        if not search_cache:
+            return []
+        norm_target = _norm_file_path(target_file)
+        spans: list[tuple[str, int, int]] = []
+        for item in search_cache.get("raw_evidence_store") or []:
+            if not isinstance(item, dict):
+                continue
+            file_path = str(item.get("file") or "")
+            span = item.get("span")
+            if (
+                _norm_file_path(file_path) == norm_target
+                and isinstance(span, (list, tuple))
+                and len(span) >= 2
+            ):
+                spans.append((file_path or target_file, int(span[0]), int(span[1])))
+        for item in search_cache.get("symbol_projections") or []:
+            if not isinstance(item, dict):
+                continue
+            file_path = str(item.get("file") or "")
+            span = item.get("span")
+            if (
+                _norm_file_path(file_path) == norm_target
+                and isinstance(span, (list, tuple))
+                and len(span) >= 2
+            ):
+                spans.append((file_path or target_file, int(span[0]), int(span[1])))
+        return merge_context_spans(spans)
+
     def _build_context_pack(
         self,
         target_file: str,
         search_cache: dict[str, Any] | None = None,
         context_window: list[dict[str, Any]] | None = None,
+        focus_symbols: list[str] | None = None,
     ) -> ContextPack:
-        windows = []
+        max_windows, chars_per_window, total_chars = self._edit_context_budgets()
+        windows: list[ContextWindow] = []
 
         norm_target = _norm_file_path(target_file)
         target_spans: list[tuple[str, int, int]] = []
         reference_spans: list[tuple[str, int, int]] = []
 
-        if context_window is not None:
-            for item in context_window:
+        # validate_params defaults missing context_window to [] — treat empty
+        # the same as absent so we do not fall through to whole-file dumps.
+        effective_window = context_window if context_window else None
+
+        if effective_window is not None:
+            for item in effective_window:
                 file_path = item.get("file")
                 span = item.get("span")
                 if not file_path or not span or len(span) < 2:
@@ -346,40 +664,116 @@ class DecisionEditTool(Tool):
             target_spans = merge_context_spans(target_spans)
             reference_spans = merge_context_spans(reference_spans)
 
+        # Expand undersized Core spans to full focus-symbol bodies. A 2-line
+        # insert anchor caused EditLLM to delete strip_chat_noise while adding
+        # is_bot_mentioned — it never saw the surrounding function.
+        focus_spans = self._spans_from_focus_symbols(
+            target_file,
+            list(focus_symbols or []),
+            max_chars=chars_per_window,
+        )
+        if focus_spans:
+            from src.agent.edit_brief import MIN_FOCUS_CONTEXT_LINES
+
+            expanded: list[tuple[str, int, int]] = []
+            for file_path, start_line, end_line in target_spans:
+                span_lines = end_line - start_line + 1
+                if (
+                    _norm_file_path(file_path) == norm_target
+                    and span_lines < MIN_FOCUS_CONTEXT_LINES
+                ):
+                    # Prefer the focus symbol span that covers / is nearest.
+                    best = focus_spans[0]
+                    for cand in focus_spans:
+                        c_start, c_end = cand[1], cand[2]
+                        if c_start <= start_line <= c_end or start_line <= c_start <= end_line:
+                            best = cand
+                            break
+                    # Union Core tip with full symbol (+ pad for insert_after).
+                    abs_path = (self.project_root / target_file).resolve()
+                    try:
+                        n_lines = len(abs_path.read_text(encoding="utf-8").splitlines())
+                    except OSError:
+                        n_lines = best[2]
+                    expanded.append(
+                        (
+                            target_file,
+                            min(start_line, best[1]),
+                            min(n_lines, max(end_line, best[2] + 8)),
+                        )
+                    )
+                else:
+                    expanded.append((file_path, start_line, end_line))
+            if expanded:
+                target_spans = merge_context_spans(expanded)
+
+        if not target_spans:
+            target_spans = focus_spans
+        if not target_spans:
+            target_spans = self._spans_from_search_cache(target_file, search_cache)
+
+        def _append_window(
+            *,
+            file_path: str,
+            start_line: int,
+            end_line: int,
+            content: str,
+            role: str,
+            mode: str,
+        ) -> bool:
+            if len(windows) >= max_windows:
+                return False
+            used = sum(len(window.content) for window in windows)
+            budget = min(chars_per_window, total_chars - used)
+            if budget < 200:
+                return False
+            clipped, clipped_end = self._clip_window_content(
+                content, start_line=start_line, max_chars=budget
+            )
+            windows.append(
+                ContextWindow(
+                    file=file_path,
+                    start_line=start_line,
+                    end_line=min(end_line, clipped_end),
+                    content=clipped,
+                    symbols=(),
+                    semantic_tags=(),
+                    role=role,
+                    mode=mode,
+                )
+            )
+            return True
+
         if target_spans:
             for index, (file_path, start_line, end_line) in enumerate(target_spans):
                 content = self._read_file_span(file_path, start_line, end_line)
                 if content is None:
                     continue
-                windows.append(
-                    ContextWindow(
-                        file=file_path,
-                        start_line=start_line,
-                        end_line=end_line,
-                        content=content,
-                        symbols=(),
-                        semantic_tags=(),
-                        role="target" if index == 0 else "reference",
-                        mode="snippet",
-                    )
-                )
+                if not _append_window(
+                    file_path=file_path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    content=content,
+                    role="target" if index == 0 else "reference",
+                    mode="snippet",
+                ):
+                    break
         else:
+            # Last resort: capped file head — never ship unbounded mode=full.
             abs_target_path = (self.project_root / target_file).resolve()
             if abs_target_path.exists():
                 try:
                     lines = abs_target_path.read_text(encoding="utf-8").splitlines()
-                    content = "\n".join(lines)
-                    windows.append(
-                        ContextWindow(
-                            file=target_file,
-                            start_line=1,
-                            end_line=len(lines),
-                            content=content,
-                            symbols=(),
-                            semantic_tags=(),
-                            role="target",
-                            mode="full",
-                        )
+                    # ~chars_per_window lines of head only.
+                    max_lines = max(40, min(len(lines), chars_per_window // 40))
+                    content = "\n".join(lines[:max_lines])
+                    _append_window(
+                        file_path=target_file,
+                        start_line=1,
+                        end_line=max_lines,
+                        content=content,
+                        role="target",
+                        mode="snippet",
                     )
                 except Exception as exc:
                     log.warning("Failed to read target file %s: %s", target_file, exc)
@@ -388,61 +782,48 @@ class DecisionEditTool(Tool):
             content = self._read_file_span(file_path, start_line, end_line)
             if content is None:
                 continue
-            windows.append(
-                ContextWindow(
-                    file=file_path,
-                    start_line=start_line,
-                    end_line=end_line,
-                    content=content,
-                    symbols=(),
-                    semantic_tags=(),
-                    role="reference",
-                    mode="snippet",
-                )
-            )
+            if not _append_window(
+                file_path=file_path,
+                start_line=start_line,
+                end_line=end_line,
+                content=content,
+                role="reference",
+                mode="snippet",
+            ):
+                break
 
-        if context_window is None:
-            # Fall back to historical raw_evidence_store context loading (legacy behavior)
+        if effective_window is None and len(windows) < max_windows:
+            # Bounded legacy evidence — only when Core did not freeze spans.
             raw_evidence = []
             if search_cache and "raw_evidence_store" in search_cache:
                 raw_evidence = search_cache["raw_evidence_store"]
 
             for item in raw_evidence:
-                file_path = item["file"]
-                if file_path == target_file:
+                if not isinstance(item, dict):
                     continue
-
-                abs_path = (self.project_root / file_path).resolve()
-                start_line, end_line = item["span"]
-
-                content = None
-                if abs_path.is_file():
-                    try:
-                        lines = abs_path.read_text(encoding="utf-8").splitlines()
-                        start = max(1, start_line)
-                        end = min(len(lines), end_line)
-                        content = "\n".join(lines[start - 1 : end])
-                    except Exception as exc:
-                        log.warning("Failed to read span %s:%d-%d from disk: %s", file_path, start_line, end_line, exc)
-
+                file_path = str(item.get("file") or "")
+                span = item.get("span")
+                if not file_path or file_path == target_file:
+                    continue
+                if not isinstance(span, (list, tuple)) or len(span) < 2:
+                    continue
+                start_line, end_line = int(span[0]), int(span[1])
+                content = self._read_file_span(file_path, start_line, end_line)
                 if content is None:
-                    content = item["code"]
-
-                windows.append(
-                    ContextWindow(
-                        file=file_path,
-                        start_line=start_line,
-                        end_line=end_line,
-                        content=content,
-                        symbols=(),
-                        semantic_tags=(),
-                        role="reference",
-                        mode="snippet",
-                    )
-                )
+                    content = str(item.get("code") or "")
+                if not content:
+                    continue
+                if not _append_window(
+                    file_path=file_path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    content=content,
+                    role="reference",
+                    mode="snippet",
+                ):
+                    break
 
         return ContextPack(windows=tuple(windows))
-
     @staticmethod
     def _build_evidence_flag(
         target_file: str,
@@ -556,31 +937,16 @@ class DecisionEditTool(Tool):
         response = None
         content_chunks: list[str] = []
 
-        def count_diff_lines(text: str) -> tuple[int, int]:
-            normalized = text.replace("\\n", "\n")
-            added = 0
-            removed = 0
-            state = "normal"
-            for line in normalized.splitlines():
-                clean_line = line.strip().strip('"\'')
-                if "<<<<<<< SEARCH" in clean_line:
-                    state = "search"
-                elif "=======" in clean_line:
-                    state = "replace"
-                elif ">>>>>>> REPLACE" in clean_line:
-                    state = "normal"
-                else:
-                    if state == "search":
-                        removed += 1
-                    elif state == "replace":
-                        added += 1
-            return added, removed
-
+        prompt_chars = sum(
+            len(str(message.get("content") or ""))
+            for message in trimmed_messages
+            if isinstance(message, dict)
+        )
         label = f" {batch_label}" if batch_label else ""
         print(
             "[debug][decision-edit][decision-llm-start]"
-            f"{label} file={target_file} connect_timeout={connect_timeout:g}s"
-            f" idle_timeout={stream_idle_timeout:g}s",
+            f"{label} file={target_file} first_content_deadline={connect_timeout:g}s"
+            f" idle_timeout={stream_idle_timeout:g}s prompt_chars={prompt_chars}",
             flush=True,
         )
         first_chunk_at: float | None = None
@@ -591,7 +957,7 @@ class DecisionEditTool(Tool):
                 hasattr(self.harness, "progress_callback")
                 and self.harness.progress_callback
             ):
-                self.harness.progress_callback(f"正在编辑文件: {target_file}… [+0 -0]")
+                self.harness.progress_callback(format_edit_progress(target_file, 0, 0))
 
             stream_iter = self.decision_llm.chat_stream(
                 trimmed_messages,
@@ -609,13 +975,13 @@ class DecisionEditTool(Tool):
                     )
                 if content_chunk:
                     content_chunks.append(content_chunk)
-                    added, removed = count_diff_lines("".join(content_chunks))
+                    added, removed = count_stream_diff_lines("".join(content_chunks))
                     if (
                         hasattr(self.harness, "progress_callback")
                         and self.harness.progress_callback
                     ):
                         self.harness.progress_callback(
-                            f"正在编辑文件: {target_file}… [+{added} -{removed}]"
+                            format_edit_progress(target_file, added, removed)
                         )
                 if final_response is not None:
                     if getattr(final_response, "model", "") == "error":
@@ -681,11 +1047,23 @@ class DecisionEditTool(Tool):
                     session_id, subtask_id, "assistant", response.content or ""
                 )
 
-        parsed_decision = self.decision.parse(
-            response.content or "",
-            context_pack.candidate_files,
-            edit_only=True,
-        )
+        raw_content = response.content or ""
+        try:
+            parsed_decision = self.decision.parse(
+                raw_content,
+                context_pack.candidate_files,
+                edit_only=True,
+            )
+        except DecisionError as exc:
+            excerpt = raw_content.strip()
+            if len(excerpt) > _MAX_FAILED_PATCH_FEEDBACK_CHARS:
+                excerpt = (
+                    excerpt[:_MAX_FAILED_PATCH_FEEDBACK_CHARS]
+                    + "\n... (truncated raw response)"
+                )
+            raise DecisionError(
+                f"{exc}\nRaw response excerpt:\n```\n{excerpt}\n```"
+            ) from exc
         return parsed_decision, response
 
     async def execute(self, **params: Any) -> ToolResult:
@@ -697,10 +1075,25 @@ class DecisionEditTool(Tool):
         search_cache = params.get("_search_cache")
         context_window = params.get("context_window")
 
+        kept_focus, dropped_focus, remapped_focus = sanitize_focus_symbols(
+            self.project_root,
+            target_file,
+            focus_symbols,
+        )
+        if dropped_focus or remapped_focus:
+            print(
+                "[debug][decision-edit][focus-sanitize] "
+                f"file={target_file} "
+                f"kept={kept_focus} dropped={dropped_focus} remapped={remapped_focus}",
+                flush=True,
+            )
+        focus_symbols = kept_focus
+
         context_pack = self._build_context_pack(
             target_file,
             search_cache,
             context_window=context_window,
+            focus_symbols=focus_symbols,
         )
         context_chars = sum(len(window.content) for window in context_pack.windows)
         context_lines = sum(
@@ -717,7 +1110,7 @@ class DecisionEditTool(Tool):
             f"file={target_file} windows={len(context_pack.windows)} "
             f"lines={context_lines} chars={context_chars} spans={span_count} "
             f"focus_symbols={len(focus_symbols)} "
-            f"connect_timeout={effective_timeout:.0f}s "
+            f"first_content_deadline={effective_timeout:.0f}s "
             f"elapsed={time.monotonic() - started_at:.2f}s",
             flush=True,
         )
@@ -728,7 +1121,13 @@ class DecisionEditTool(Tool):
             context_pack,
             context_window=context_window,
         )
-        state_text = _build_state_text(target_file, intent, focus_symbols)
+        state_text = _build_state_text(
+            target_file,
+            intent,
+            focus_symbols,
+            dropped_focus=dropped_focus,
+            remapped_focus=remapped_focus,
+        )
         max_attempts = self.patch_retry_max + 1
         feedback_state = state_text
         parsed_decision = None
@@ -759,6 +1158,52 @@ class DecisionEditTool(Tool):
                     ),
                     metadata={"patch_attempts": patch_attempt},
                 )
+            except DecisionError as exc:
+                error_detail = f"invalid_patch: {exc}"
+                retries_left = patch_attempt < max_attempts
+                error_class = classify_edit_error(
+                    error_detail, apply_succeeded=False
+                )
+                owner = retry_owner_for(
+                    error_class, edit_retries_remaining=retries_left
+                )
+                can_retry = edit_inner_retry_allowed(
+                    error_detail,
+                    apply_succeeded=False,
+                    edit_retries_remaining=retries_left,
+                )
+                if can_retry and owner is RetryOwner.EDIT:
+                    print(
+                        "[debug][decision-edit][patch-retry] "
+                        f"file={target_file} attempt={patch_attempt}/{max_attempts} "
+                        f"error_class={error_class.value} "
+                        f"error={error_detail.splitlines()[0][:120]}",
+                        flush=True,
+                    )
+                    feedback_state = build_patch_retry_state_text(
+                        state_text,
+                        attempt=patch_attempt,
+                        max_attempts=max_attempts,
+                        error=error_detail,
+                        failed_patch=str(exc),
+                    )
+                    continue
+                return ToolResult(
+                    success=False,
+                    output=(
+                        f"❌ 【补丁生成失败】：对文件 `{target_file}` 的 Decision "
+                        f"输出无法解析。\n"
+                        f"ErrorClass={error_class.value} RetryOwner=core\n"
+                        f"具体错误：\n```\n{error_detail}\n```\n"
+                        f"👉 {core_hint_for(error_class)}"
+                    ),
+                    error=error_detail,
+                    metadata={
+                        "patch_attempts": patch_attempt,
+                        "error_class": error_class.value,
+                        "retry_owner": RetryOwner.CORE.value,
+                    },
+                )
             except Exception as exc:
                 return ToolResult(
                     success=False,
@@ -779,9 +1224,67 @@ class DecisionEditTool(Tool):
                     metadata={"patch_attempts": patch_attempt},
                 )
 
+            try:
+                concrete_patch = materialize_edit_patch(
+                    self.project_root,
+                    parsed_decision.target_file,
+                    parsed_decision.patch,
+                    focus_symbols=focus_symbols,
+                    context_window=list(context_window or []),
+                )
+            except MaterializeError as exc:
+                error_detail = str(exc)
+                retries_left = patch_attempt < max_attempts
+                error_class = classify_edit_error(
+                    error_detail,
+                    apply_succeeded=False,
+                )
+                owner = retry_owner_for(
+                    error_class, edit_retries_remaining=retries_left
+                )
+                can_retry = edit_inner_retry_allowed(
+                    error_detail,
+                    apply_succeeded=False,
+                    edit_retries_remaining=retries_left,
+                )
+                if can_retry and owner is RetryOwner.EDIT:
+                    print(
+                        "[debug][decision-edit][patch-retry] "
+                        f"file={target_file} attempt={patch_attempt}/{max_attempts} "
+                        f"error_class={error_class.value} "
+                        f"error={error_detail.splitlines()[0][:120]}",
+                        flush=True,
+                    )
+                    feedback_state = build_patch_retry_state_text(
+                        state_text,
+                        attempt=patch_attempt,
+                        max_attempts=max_attempts,
+                        error=error_detail,
+                        failed_patch=parsed_decision.patch,
+                    )
+                    continue
+                task_id = params.get("task_id")
+                task_label = f" 任务 `{task_id}`" if task_id else ""
+                retry_hint = f"\n\n👉 {core_hint_for(error_class)}"
+                return ToolResult(
+                    success=False,
+                    output=(
+                        f"Edit 小步失败{task_label}。"
+                        f"\nErrorClass={error_class.value}"
+                        f"\n{error_detail}"
+                        f"{retry_hint}"
+                    ),
+                    error=error_detail,
+                    metadata={
+                        "patch_attempts": patch_attempt,
+                        "error_class": error_class.value,
+                        "retry_owner": owner.value,
+                    },
+                )
+
             execution, validation, pipeline_metrics = await self.executor.execute_transaction(
                 parsed_decision.target_file,
-                parsed_decision.patch,
+                concrete_patch,
                 self.validator,
                 step=1,
                 layer1=None,
@@ -797,18 +1300,45 @@ class DecisionEditTool(Tool):
                 flush=True,
             )
 
-            if execution.success:
+            if execution.success and validation.success:
                 break
 
             error_detail = execution.error or ""
-            can_retry = (
-                patch_attempt < max_attempts
-                and is_mechanical_patch_error(error_detail)
+            attempted = getattr(execution, "attempted_content", "") or ""
+            format_validation_retry = (
+                execution.success
+                and not validation.success
+                and is_format_validation_retry(validation.error or "", attempted)
             )
-            if can_retry:
+            if format_validation_retry:
+                error_detail = (
+                    "invalid_patch: applied patch left SEARCH/REPLACE markers or "
+                    "format-corrupted syntax in the target file.\n"
+                    f"Validator: {validation.error or 'unknown'}"
+                )
+            elif execution.success and not validation.success:
+                error_detail = validation.error or error_detail or "validation failed"
+
+            retries_left = patch_attempt < max_attempts
+            error_class = classify_edit_error(
+                error_detail,
+                attempted_content=attempted,
+                apply_succeeded=bool(execution.success),
+            )
+            owner = retry_owner_for(
+                error_class, edit_retries_remaining=retries_left
+            )
+            can_retry = edit_inner_retry_allowed(
+                error_detail,
+                attempted_content=attempted,
+                apply_succeeded=bool(execution.success),
+                edit_retries_remaining=retries_left,
+            )
+            if can_retry and owner is RetryOwner.EDIT:
                 print(
                     "[debug][decision-edit][patch-retry] "
                     f"file={target_file} attempt={patch_attempt}/{max_attempts} "
+                    f"error_class={error_class.value} "
                     f"error={error_detail.splitlines()[0][:120]}",
                     flush=True,
                 )
@@ -821,32 +1351,25 @@ class DecisionEditTool(Tool):
                 )
                 continue
 
+            if execution.success and not validation.success:
+                # E3/E6 (or exhausted E1) — surface to Core; stop Edit inner loop.
+                break
+
             task_id = params.get("task_id")
             task_label = f" 任务 `{task_id}`" if task_id else ""
-            retry_hint = ""
-            if error_detail.startswith("mismatch:"):
-                retry_hint = (
-                    "\n\n重试建议：① SEARCH 必须是文件中**现有**代码的逐字复制，"
-                    "REPLACE 才是改后内容；② 同一文件多处修改请拆成多个互不重叠的 "
-                    "SEARCH/REPLACE 块；③ 对照 Diagnostic 核对缩进与引号；"
-                    "④ 缩小本步 focus_symbols 或拆成下一次 decision_edit plan step。"
-                )
-            elif "overlaps another block" in error_detail:
-                retry_hint = (
-                    "\n\n重试建议：① 每个 SEARCH/REPLACE 块的行范围必须互不重叠；"
-                    "② 每块只包 3–8 行定位代码；③ 若改动点过多，请让 Core 拆成多次 decision_edit。"
-                )
+            retry_hint = f"\n\n👉 {core_hint_for(error_class)}"
             inner_note = ""
             if patch_attempt > 1:
                 inner_note = (
-                    f"\n（Decision LLM 内层已重试 {patch_attempt - 1} 次，"
-                    "仍无法应用补丁。）"
+                    f"\n（Edit 内层已重试 {patch_attempt - 1} 次，"
+                    f"ErrorClass={error_class.value} → 交还 Core 拆/改 小步。）"
                 )
             return ToolResult(
                 success=False,
                 output=(
                     f"❌ 【补丁生成失败】：{task_label}对文件 `{target_file}` 的补丁无法匹配到物理内容。"
                     f"{inner_note}\n"
+                    f"ErrorClass={error_class.value} RetryOwner=core\n"
                     f"具体错误与诊断：\n```\n{error_detail}\n```"
                     f"{retry_hint}"
                 ),
@@ -856,6 +1379,8 @@ class DecisionEditTool(Tool):
                     "execution": execution,
                     "validation": validation,
                     "patch_attempts": patch_attempt,
+                    "error_class": error_class.value,
+                    "retry_owner": RetryOwner.CORE.value,
                 },
             )
 
@@ -871,12 +1396,20 @@ class DecisionEditTool(Tool):
             )
 
         if not validation.success:
+            attempted = getattr(execution, "attempted_content", "") or ""
+            error_class = classify_edit_error(
+                validation.error or "",
+                attempted_content=attempted,
+                apply_succeeded=True,
+            )
             return ToolResult(
                 success=False,
                 output=(
                     f"❌ 【自动化代码验证失败】：{task_label}对文件 `{target_file}` 的补丁导致编译、语法或测试错误。\n"
+                    f"ErrorClass={error_class.value} RetryOwner=core\n"
                     f"👉 已经自动将修改全部物理回滚（Rollback）。\n"
-                    f"👉 具体的验证器报错如下，请根据此错误重新构思修改指令：\n"
+                    f"👉 {core_hint_for(error_class)}\n"
+                    f"👉 验证器报错：\n"
                     f"```\n{validation.error}\n```"
                 ),
                 error=validation.error,
@@ -885,19 +1418,28 @@ class DecisionEditTool(Tool):
                     "execution": execution,
                     "validation": validation,
                     "patch_attempts": patch_attempt,
+                    "error_class": error_class.value,
+                    "retry_owner": RetryOwner.CORE.value,
                 },
             )
 
+        diff_summary = format_applied_diff_summary(
+            getattr(execution, "original_content", "") or "",
+            getattr(execution, "attempted_content", "") or "",
+            target_file=target_file,
+        )
         return ToolResult(
             success=True,
             output=(
                 f"✅ 【应用成功】：针对文件 `{target_file}`{task_label} "
-                f"的补丁已通过编译与自动化测试验证，修改已持久化提交（Committed）。"
+                f"的补丁已通过编译与自动化测试验证，修改已持久化提交（Committed）。\n"
+                f"{diff_summary}"
             ),
             metadata={
                 "pipeline_metrics": pipeline_metrics,
                 "execution": execution,
                 "validation": validation,
                 "patch_attempts": patch_attempt,
+                "applied_diff_summary": diff_summary,
             },
         )

@@ -323,7 +323,11 @@ class REPLSession:
                 spinner_cm = thinking_spinner(self._console)
                 status = spinner_cm.__enter__()
                 spinner_active = True
-            display_text = f"[dim cyan]{text}[/]"
+            # decision_edit progress already carries Rich markup (bold blue path/stats).
+            if "[/" in text and ("[bold" in text or "[dim" in text):
+                display_text = text
+            else:
+                display_text = f"[dim cyan]{text}[/]"
             if thinking_buffer:
                 import unicodedata
                 console_width = self._console.width if self._console.width else 80
@@ -365,7 +369,7 @@ class REPLSession:
                 for line in show_lines:
                     box_lines.append(f"  [dim]{escape(line)}[/]")
                 box_text = "\n".join(box_lines)
-                display_text = f"[dim cyan]{text}[/]\n{box_text}"
+                display_text = f"{display_text}\n{box_text}"
             status.update(display_text)
 
         def _dismiss_spinner() -> None:

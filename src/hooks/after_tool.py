@@ -4,7 +4,8 @@ from typing import Any
 
 from src.agent.types import ToolResult
 
-DEFAULT_MAX_TOOL_OUTPUT_CHARS = 12_000
+# L1 hard cap on tool stdout before it enters history / observations.
+DEFAULT_MAX_TOOL_OUTPUT_CHARS = 8_000
 DEFAULT_KEEP_HEAD_CHARS = 8_000
 DEFAULT_KEEP_TAIL_CHARS = 2_000
 

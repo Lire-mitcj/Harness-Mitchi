@@ -310,13 +310,10 @@ async def inspect_fact_locking_async(
     if tool_name == "view_symbol_code":
         requested_symbol = arguments.get("symbol")
         if requested_symbol:
-            # Bypass blocker if the target file or the symbol's file is modified (allowing verification)
-            # or if the manifest marks this target STALE (needs a fresh read).
-            bypass_blocker = (
-                is_target_modified
-                or requested_symbol in stale_symbols
-                or normalized_target_file in stale_files
-            )
+            # Bypass only when the target was modified this run (self-refresh).
+            # Raw STALE no longer exempts re-reads — tool_gate treats edit_ready
+            # stale as advisory; opening VIEW for partner STALE was the loop bug.
+            bypass_blocker = is_target_modified
             if not bypass_blocker and normalized_modified_files:
                 matching_files = set()
                 if context_anchors_code:
@@ -550,12 +547,10 @@ async def inspect_fact_locking_async(
 
         # Redundancy gating to prevent no-novelty grep loops. Tool-opening policy
         # (convergence / gravity) is owned by reallocate_tools, not fact locking.
-        # After a blocked edit or post-edit refresh window, allow recovery grep/view.
+        # After a blocked edit or just-landed edit, allow recovery grep once.
+        # Stale taxonomy / tool reopen lives in tool_gate — not has_stale here.
         post_edit_refresh = bool(
-            modified_files
-            and rounds_since_last_edit <= 1
-            and manifest is not None
-            and getattr(manifest, "has_stale", False)
+            modified_files and rounds_since_last_edit <= 1
         )
         if not has_compile_error and not edit_recovery and not post_edit_refresh:
             # C. Symbol Dominance Gate

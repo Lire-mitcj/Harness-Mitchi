@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 
 # Completed: [√] [✓] [x] [X] [v] [V]   Open: [ ]
+# Checklist lines are 大步 (major outcomes). Each open 大步 is expanded by Core
+# into edit_queue 小步 — see src.agent.edit_plan.
 _CHECKLIST_DONE_INNER = r"x|X|✓|√|v|V"
 _CHECKLIST_LINE = re.compile(
     rf"-\s+\[({_CHECKLIST_DONE_INNER}| )\]\s+(.*)",

@@ -31,6 +31,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Mapping
 
+from src.hooks.tool_gate import scorer_should_boost_view_for_stale
+
 GREP = "grep_search"
 VIEW = "view_symbol_code"
 EDIT = "decision_edit"
@@ -108,7 +110,7 @@ def _manifest_layer(ctx: ToolScoringContext) -> dict[str, float]:
         logits[GREP] += 0.9 * ctx.missing_ratio
         logits[RETRIEVE] += (0.5 if ctx.bootstrap else 0.2) * ctx.missing_ratio
         logits[EDIT] -= 0.8
-    if ctx.stale_ratio > 0.0:
+    if ctx.stale_ratio > 0.0 and scorer_should_boost_view_for_stale(ctx):
         logits[VIEW] += 0.9 * ctx.stale_ratio
         logits[GREP] += 0.1 * ctx.stale_ratio
     if ctx.wiring_gap:

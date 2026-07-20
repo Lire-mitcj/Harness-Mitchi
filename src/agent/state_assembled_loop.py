@@ -11,7 +11,7 @@ import textwrap
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 from src.state import StateLayer
 from src.state.decision_gravity import evaluate_search_intent
@@ -19,6 +19,26 @@ from src.agent.context_assembly import (
     ContextAssembly,
     build_runtime_state_block,
     build_turn_context_block,
+)
+from src.agent.context_compress import (
+    HOT_ANCHOR_AGE_STEPS,
+    anchor_to_locator,
+    format_code_locators_block,
+    hot_files_for_turn,
+    merge_locators,
+    microcompact_assistant_messages,
+    should_keep_verbatim,
+)
+from src.agent.edit_errors import RetryOwner
+from src.agent.edit_plan import (
+    EditPlanQueue,
+    EditPlanView,
+    edit_plan_view_from_queue,
+    edit_plan_view_halt,
+    format_edit_plan_evidence_lines,
+    format_edit_plan_runtime_card,
+    sync_edit_queue_from_core_turn,
+    validate_minor_step,
 )
 from src.agent.manifest import (
     Sufficiency,
@@ -99,6 +119,8 @@ class ContextAnchors:
     summaries: dict[str, str] = field(default_factory=dict)
     purposes: dict[str, str] = field(default_factory=dict)
     created_steps: dict[str, int] = field(default_factory=dict)
+    # L4 locator map: aged / demoted anchors without code bodies.
+    locators: tuple[dict[str, Any], ...] = ()
     file_contracts: dict[str, dict[str, Any]] = field(default_factory=dict)
     file_facts: dict[str, tuple[str, ...]] = field(default_factory=dict)
     schema_contracts: dict[str, str] = field(default_factory=dict)
@@ -109,6 +131,8 @@ class ContextAnchors:
 class AssembledState:
     """State tracking for StateAssembledLoop."""
     checklist: tuple[str, ...] = ()
+    edit_queue: EditPlanQueue = field(default_factory=EditPlanQueue)
+    edit_plan_view: EditPlanView = field(default_factory=EditPlanView)
     git_diff: str = ""
     messages_history: tuple[Message, ...] = ()
     search_cache: dict[str, Any] = field(default_factory=dict)
@@ -230,10 +254,30 @@ def _prepare_tool_arguments(
     arguments: dict[str, Any],
     *,
     hint_text: str,
+    project_root: Path | None = None,
 ) -> dict[str, Any]:
     args = dict(arguments)
     if tool_name == "grep_search":
         args = prepare_grep_search_args(args, hint_text=hint_text)
+    if tool_name == "decision_edit":
+        from src.agent.edit_brief import (
+            expand_decision_edit_to_steps,
+            tighten_decision_edit_context,
+        )
+
+        steps = expand_decision_edit_to_steps(args, project_root=project_root)
+        if steps:
+            # Run the first atomic step now; residual steps were enqueued by
+            # sync_edit_queue_from_core_turn / derive_edit_queue_followons.
+            first = dict(steps[0])
+            if args.get("task_id") and not first.get("task_id"):
+                first["task_id"] = args["task_id"]
+            if args.get("mode"):
+                first["mode"] = args["mode"]
+            if args.get("constraints") is not None:
+                first["constraints"] = args["constraints"]
+            args = first
+        args = tighten_decision_edit_context(args, project_root=project_root)
     return args
 
 
@@ -289,19 +333,19 @@ def _loaded_code_anchor_block(context_block: str) -> str:
 def _build_runtime_state_block(
     *,
     active_files: list[str],
-    checklist_str: str,
     git_diff: str,
     validation_error: str | None,
     last_tool_result: str | None,
     last_error: dict[str, Any] | None,
+    edit_plan_card: str = "",
 ) -> str:
     return build_runtime_state_block(
         active_files=active_files,
-        checklist_str=checklist_str,
         git_diff=git_diff,
         validation_error=validation_error,
         last_tool_result=last_tool_result,
         last_error=last_error,
+        edit_plan_card=edit_plan_card,
     )
 
 
@@ -776,6 +820,167 @@ def _collapse_retrieval_turn(
     )
 
 
+def _demote_aged_anchors_to_locators(
+    state: AssembledState,
+    *,
+    hot_files: set[str] | None = None,
+    hot_age: int = HOT_ANCHOR_AGE_STEPS,
+    eligible_ids: set[str] | None = None,
+    reason: str = "age",
+) -> AssembledState:
+    """L3/L4: strip non-hot verbatim into locator map (no snippet, no fat summary)."""
+    current_step = state.run_state.step
+    hot = hot_files if hot_files is not None else hot_files_for_turn(
+        active_files=list(state.run_state.active_files),
+        edit_plan_current_file=(
+            state.edit_plan_view.current_file
+            if state.edit_plan_view.status in {"draining", "halted"}
+            else ""
+        ),
+    )
+    keep_code: list[dict[str, Any]] = []
+    new_locators: list[dict[str, Any]] = []
+    demoted_ids: set[str] = set()
+    for item in state.context_anchors.code:
+        if not isinstance(item, dict):
+            continue
+        aid = _anchor_id(item)
+        created = state.context_anchors.created_steps.get(
+            aid,
+            state.context_anchors.last_updated_step or current_step,
+        )
+        force = eligible_ids is not None and aid in eligible_ids
+        if eligible_ids is not None:
+            keep = aid not in eligible_ids
+        else:
+            keep = should_keep_verbatim(
+                item,
+                current_step=current_step,
+                created_step=int(created),
+                hot_files=hot,
+                hot_age=hot_age,
+            )
+        if keep:
+            keep_code.append(item)
+            continue
+        if aid:
+            demoted_ids.add(aid)
+        new_locators.append(
+            anchor_to_locator(item, step=int(created), reason=reason)
+        )
+
+    if not demoted_ids and not new_locators:
+        return state
+
+    remaining_steps = {
+        key: value
+        for key, value in state.context_anchors.created_steps.items()
+        if key not in demoted_ids
+    }
+    remaining_summaries = {
+        key: value
+        for key, value in state.context_anchors.summaries.items()
+        if key not in demoted_ids
+        and not any(
+            key == loc.get("id") or key == loc.get("file")
+            for loc in new_locators
+        )
+    }
+    remaining_purposes = {
+        key: value
+        for key, value in state.context_anchors.purposes.items()
+        if key not in demoted_ids
+    }
+    locators = merge_locators(state.context_anchors.locators, new_locators)
+
+    # Drop demoted verbatim from search_cache working sets too.
+    cache = dict(state.search_cache)
+    for key in ("raw_evidence_store", "symbol_projections"):
+        items = cache.get(key)
+        if isinstance(items, list):
+            cache[key] = [
+                entry
+                for entry in items
+                if not isinstance(entry, dict) or _anchor_id(entry) not in demoted_ids
+            ]
+    encoded = cache.get("search_output")
+    if isinstance(encoded, str):
+        try:
+            payload = json.loads(encoded)
+            if isinstance(payload, list):
+                payload = [
+                    entry
+                    for entry in payload
+                    if not isinstance(entry, dict) or _anchor_id(entry) not in demoted_ids
+                ]
+                if payload:
+                    cache["search_output"] = json.dumps(
+                        payload, ensure_ascii=False, indent=2
+                    )
+                else:
+                    cache.pop("search_output", None)
+        except (TypeError, json.JSONDecodeError):
+            pass
+    cache.pop("context_projection", None)
+
+    messages = []
+    for msg in state.messages_history:
+        if msg.role == "tool":
+            try:
+                payload = json.loads(msg.content)
+            except Exception:
+                payload = None
+            is_single = isinstance(payload, dict)
+            items = [payload] if is_single else (payload if isinstance(payload, list) else [])
+            if any(
+                isinstance(x, dict)
+                and ("code" in x or "observation_code" in x or "verbatim_code" in x)
+                and _anchor_id(x) in demoted_ids
+                for x in items
+            ):
+                receipt = "\n".join(
+                    f"[ANCHOR → LOCATOR: {_anchor_id(x)}]"
+                    for x in items
+                    if isinstance(x, dict) and _anchor_id(x) in demoted_ids
+                )
+                fresh = [
+                    x
+                    for x in items
+                    if not isinstance(x, dict) or _anchor_id(x) not in demoted_ids
+                ]
+                if is_single:
+                    replacement = (
+                        json.dumps(fresh[0], ensure_ascii=False, indent=2)
+                        if fresh
+                        else receipt
+                    )
+                else:
+                    replacement = receipt
+                    if fresh:
+                        replacement += "\n\n" + json.dumps(
+                            fresh, ensure_ascii=False, indent=2
+                        )
+                messages.append(replace(msg, content=replacement))
+                continue
+        messages.append(msg)
+
+    context_anchors = replace(
+        state.context_anchors,
+        code=tuple(keep_code),
+        summaries=remaining_summaries,
+        purposes=remaining_purposes,
+        created_steps=remaining_steps,
+        locators=locators,
+        last_updated_step=max(remaining_steps.values()) if remaining_steps else None,
+    )
+    return replace(
+        state,
+        search_cache=cache,
+        context_anchors=context_anchors,
+        messages_history=tuple(messages),
+    )
+
+
 def _search_cache_view(state: AssembledState) -> dict[str, Any]:
     """Compatibility projection for context builders and tools; never stored."""
     view = dict(state.search_cache)
@@ -792,6 +997,8 @@ def _search_cache_view(state: AssembledState) -> dict[str, Any]:
         )
     if state.context_anchors.summaries:
         view["summary_anchors"] = dict(state.context_anchors.summaries)
+    if state.context_anchors.locators:
+        view["code_locators"] = list(state.context_anchors.locators)
     if state.context_anchors.purposes:
         view["retrieval_purposes"] = dict(state.context_anchors.purposes)
     if state.context_anchors.created_steps:
@@ -862,6 +1069,7 @@ def _microcompact_search_cache(search_cache: dict[str, Any]) -> dict[str, Any]:
 
 def _microcompact_context_state(state: AssembledState) -> AssembledState:
     messages_history = _microcompact_retrieval_history(state.messages_history)
+    messages_history = microcompact_assistant_messages(messages_history)
     search_cache = _microcompact_search_cache(state.search_cache)
     if messages_history is state.messages_history and search_cache is state.search_cache:
         return state
@@ -879,6 +1087,12 @@ def _tool_result_observation(result: ToolResult) -> str:
 
 
 def _tool_history_receipt(tool_call: ToolCall, result: ToolResult) -> str:
+    """Compact history text for a tool result.
+
+    Successful retrieval that stored verbatim code must NOT keep the body in
+    ``messages_history`` — the next turn re-injects it via LOADED CODE ANCHORS.
+    Returning ``llm_observation`` verbatim here is what caused double-paste.
+    """
     if tool_call.name in RETRIEVAL_TOOLS and is_duplicate_retrieval_result(
         tool_call.name, result
     ):
@@ -888,22 +1102,41 @@ def _tool_history_receipt(tool_call: ToolCall, result: ToolResult) -> str:
             arguments=tool_call.arguments,
         )
 
-    observation = _tool_result_observation(result).strip()
     metadata = result.metadata or {}
-    if observation and metadata.get("llm_observation"):
-        return observation
-    # Successful retrieval with novel evidence: code lands in LOADED CODE ANCHORS.
-    if result.success:
-        if tool_call.name in PARALLEL_RETRIEVAL_TOOLS:
+    if result.success and tool_call.name in RETRIEVAL_TOOLS:
+        raw_store = metadata.get("raw_evidence_store") or ()
+        locs: list[str] = []
+        if isinstance(raw_store, (list, tuple)):
+            for item in raw_store:
+                if not isinstance(item, Mapping):
+                    continue
+                file_path = str(item.get("file") or "").strip()
+                symbol = str(item.get("symbol") or "").strip()
+                span = item.get("span") or []
+                if file_path and isinstance(span, (list, tuple)) and len(span) >= 2:
+                    bit = f"{file_path}:{span[0]}-{span[1]}"
+                    if symbol:
+                        bit = f"{bit} {symbol}"
+                    locs.append(bit)
+                elif file_path:
+                    locs.append(file_path)
+        if locs or tool_call.name in PARALLEL_RETRIEVAL_TOOLS or raw_store:
+            loc_line = "; ".join(locs[:6]) if locs else "see LOADED CODE ANCHORS"
             return (
                 "[RETRIEVAL OK — NEW EVIDENCE STORED]\n"
-                "Verbatim code was added to LOADED CODE ANCHORS for the next turn."
+                f"Stored: {loc_line}\n"
+                "Verbatim code is in LOADED CODE ANCHORS for the next turn — "
+                "do not expect the full body in this tool message."
             )
         duplicate_replay = str(metadata.get("duplicate_anchor_replay") or "").strip()
-        return duplicate_replay or observation
-    error_text = (result.error or "").strip()
-    if error_text:
-        return f"{observation}\n\n[TOOL_ERROR]\n{error_text}".strip()
+        if duplicate_replay:
+            return duplicate_replay
+
+    observation = _tool_result_observation(result).strip()
+    if not result.success:
+        error_text = (result.error or "").strip()
+        if error_text:
+            return f"{observation}\n\n[TOOL_ERROR]\n{error_text}".strip()
     return observation
 
 
@@ -1237,22 +1470,49 @@ def _priority_anchor_files(
     return frozenset(priority)
 
 
+def _format_demoted_anchor_ref(item: dict[str, Any]) -> str:
+    """One-line pointer for completed-step code (no full body)."""
+    file_path = str(item.get("file") or "?")
+    symbol = str(item.get("symbol") or "")
+    span = item.get("span")
+    span_text = ""
+    if isinstance(span, (list, tuple)) and len(span) >= 2:
+        span_text = f":{int(span[0])}-{int(span[1])}"
+    label = f"`{file_path}{span_text}`"
+    if symbol:
+        label += f" `{symbol}`"
+    return f"- {label} — completed edit step (background; do not re-view unless patching this file again)"
+
+
 def _build_deduped_loaded_anchors_block(
     search_cache: dict[str, Any],
     *,
     edit_ready: bool = False,
     task_text: str = "",
     manifest: Any = None,
+    demote_files: frozenset[str] | None = None,
 ) -> str:
-    """Build one deduplicated loaded-code section for the Core LLM prompt."""
+    """Build one deduplicated loaded-code section for the Core LLM prompt.
+
+    ``demote_files``: already-edited paths whose full bodies are collapsed to
+    one-line refs so the next plan step is not crowded by step-1 code.
+    """
     seen: set[tuple[Any, ...]] = set()
     blocks: list[str] = []
+    demoted_blocks: list[str] = []
     projected_symbols: set[str] = set()
+    demote = {_norm_anchor_file(path) for path in (demote_files or ()) if path}
     priority_files = _priority_anchor_files(
         search_cache,
         task_text=task_text,
         manifest=manifest,
     )
+    # Next-step discovery: prefer non-demoted files so completed edits leave the
+    # primary LOADED section.
+    if demote and priority_files:
+        narrowed = frozenset(path for path in priority_files if path not in demote)
+        if narrowed:
+            priority_files = narrowed
 
     projections = search_cache.get("symbol_projections") or []
     if isinstance(projections, list):
@@ -1264,13 +1524,25 @@ def _build_deduped_loaded_anchors_block(
                 and _norm_anchor_file(str(item.get("file") or "")) in priority_files
             ]
             if not selected:
-                selected = list(projections)
+                selected = [
+                    item
+                    for item in projections
+                    if isinstance(item, dict)
+                    and _norm_anchor_file(str(item.get("file") or "")) not in demote
+                ] or list(projections)
         else:
             selected = list(projections[-2:])
 
         for item in selected:
+            if not isinstance(item, dict):
+                continue
             key = _anchor_key(item)
             if key in seen:
+                continue
+            file_path = _norm_anchor_file(str(item.get("file") or ""))
+            if file_path in demote:
+                seen.add(key)
+                demoted_blocks.append(_format_demoted_anchor_ref(item))
                 continue
             formatted = _format_symbol_slice(item)
             if not formatted:
@@ -1288,7 +1560,8 @@ def _build_deduped_loaded_anchors_block(
                 continue
             file_path = _norm_anchor_file(str(item.get("file") or ""))
             if edit_ready and priority_files and file_path not in priority_files:
-                continue
+                if file_path not in demote:
+                    continue
             sym = item.get("symbol")
             if sym and str(sym) in projected_symbols:
                 if not (edit_ready and priority_files and file_path in priority_files):
@@ -1296,13 +1569,38 @@ def _build_deduped_loaded_anchors_block(
             key = _anchor_key(item)
             if key in seen:
                 continue
+            if file_path in demote:
+                seen.add(key)
+                demoted_blocks.append(_format_demoted_anchor_ref(item))
+                continue
             code = str(item.get("code") or item.get("verbatim_code") or "").strip()
             if not code:
                 continue
             seen.add(key)
             blocks.append(_format_raw_anchor(item))
 
-    return "\n\n".join(blocks)
+    parts: list[str] = []
+    if blocks:
+        parts.append("\n\n".join(blocks))
+    if demoted_blocks:
+        # Deduplicate demoted one-liners while preserving order.
+        seen_refs: set[str] = set()
+        unique_refs: list[str] = []
+        for ref in demoted_blocks:
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            unique_refs.append(ref)
+        parts.append(
+            "### COMPLETED EDIT ANCHORS (background) ###\n" + "\n".join(unique_refs)
+        )
+    # L4 locator map (aged / budget-demoted; no bodies).
+    locators = search_cache.get("code_locators") or []
+    if isinstance(locators, list) and locators:
+        locator_block = format_code_locators_block(locators)
+        if locator_block:
+            parts.append(locator_block)
+    return "\n\n".join(parts)
 
 
 def _latest_symbol_slice_projection(search_cache: dict[str, Any]) -> str:
@@ -1623,6 +1921,183 @@ class StateAssembledLoop:
             return res
         finally:
             await queue.put(None)
+
+    async def _drain_edit_queue(self) -> AsyncIterator[AgentEvent]:
+        """Drain frozen edit_plan steps via decision_edit (no Core LLM between steps)."""
+        drained = 0
+        while not self.state.edit_queue.drained:
+            step = self.state.edit_queue.current
+            if step is None:
+                break
+            ok, reason = validate_minor_step(step)
+            if not ok:
+                print(
+                    f"[debug][edit-queue][invalid-step] {reason}",
+                    flush=True,
+                )
+                halt_view = edit_plan_view_halt(
+                    self.state.edit_queue,
+                    failed=step,
+                    error_class="E4_SPEC",
+                    fail_reason=reason,
+                    completed=self.state.edit_plan_view.completed,
+                )
+                self.state = replace(
+                    self.state,
+                    edit_queue=EditPlanQueue(
+                        major_steps=self.state.edit_queue.major_steps,
+                    ),
+                    edit_plan_view=halt_view,
+                    messages_history=self.state.messages_history
+                    + (
+                        tool_message(
+                            f"edit-queue-invalid-{drained}",
+                            f"❌ plan step 无效（交还 Core）：{reason}",
+                        ),
+                    ),
+                )
+                yield tool_result_event("decision_edit", reason, success=False)
+                break
+
+            from src.agent.edit_brief import tighten_decision_edit_context
+
+            args = tighten_decision_edit_context(
+                step.to_decision_edit_args(),
+                project_root=self.harness.project_root,
+            )
+            tc = ToolCall(
+                id=f"edit-queue-{self.state.edit_queue.cursor}-{drained}",
+                name="decision_edit",
+                arguments=args,
+            )
+            print(
+                "[debug][edit-queue][consume] "
+                f"cursor={self.state.edit_queue.cursor} "
+                f"file={step.target_file} intent={step.intent[:80]!r}",
+                flush=True,
+            )
+            yield tool_call_event(tc.name, tc.arguments)
+            yield AgentEvent(
+                type=EventType.STATUS,
+                content=get_tool_status_text(tc.name, tc.arguments),
+                data={"spinner_only": True, "phase": "executor"},
+            )
+
+            progress_queue: asyncio.Queue[Any] = asyncio.Queue()
+            self.harness.progress_callback = progress_queue.put_nowait
+            try:
+                tool_task = asyncio.create_task(
+                    self._run_tool_with_sentinel(tc.name, dict(args), progress_queue),
+                    name=f"edit-queue:{tc.id}",
+                )
+                while True:
+                    progress_text = await progress_queue.get()
+                    if progress_text is None:
+                        break
+                    yield AgentEvent(
+                        type=EventType.STATUS,
+                        content=progress_text,
+                        data={"phase": "executor", "spinner_only": True},
+                    )
+                result = await tool_task
+            except Exception as exc:
+                result = ToolResult(
+                    success=False,
+                    output="",
+                    error=f"edit_queue decision_edit failed: {type(exc).__name__}: {exc}",
+                )
+            finally:
+                if hasattr(self.harness, "progress_callback"):
+                    delattr(self.harness, "progress_callback")
+
+            result = apply_after_tool_output_limit(tc.name, result)
+            result = apply_post_tool_context_hook(tc.name, tc.arguments, result)
+            result = self._post_process_tool_result(tc.name, tc.arguments, result)
+            target = str(args.get("target_file") or "unknown")
+
+            if result.success:
+                self._dispatch_run_event(RunEvent("edit_applied", file=target))
+                self._dispatch_run_event(RunEvent("validation_finished"))
+                self._ingest_post_edit_observations(tc, target)
+                meta = result.metadata or {}
+                diff_line = str(meta.get("applied_diff_summary") or "").strip()
+                if not diff_line:
+                    diff_line = f"applied_diff_summary: [{target}] ok"
+                completed = tuple(self.state.edit_plan_view.completed) + (diff_line,)
+                advanced = self.state.edit_queue.advance()
+                plan_view = edit_plan_view_from_queue(advanced, completed=completed)
+                summary = (
+                    f"✅ plan step 完成：`{target}` — {step.intent}\n"
+                    f"(queue {self.state.edit_queue.cursor + 1}/"
+                    f"{len(self.state.edit_queue.minor_steps)})\n"
+                    f"{diff_line}"
+                )
+                self.state = replace(
+                    self.state,
+                    edit_queue=advanced,
+                    edit_plan_view=plan_view,
+                    messages_history=self.state.messages_history
+                    + (tool_message(tc.id, summary),),
+                )
+                drained += 1
+                yield tool_result_event(tc.name, summary, success=True)
+                continue
+
+            retry_owner = str(
+                (result.metadata or {}).get("retry_owner") or RetryOwner.CORE.value
+            )
+            error_class = (result.metadata or {}).get("error_class")
+            err_text = result.error or result.output or "decision_edit failed"
+            self._dispatch_run_event(
+                RunEvent(
+                    "tool_failed",
+                    tool_name="decision_edit",
+                    reason=str(err_text),
+                )
+            )
+            halt_view = edit_plan_view_halt(
+                self.state.edit_queue,
+                failed=step,
+                error_class=str(error_class or ""),
+                fail_reason=str(err_text),
+                completed=self.state.edit_plan_view.completed,
+            )
+            summary = (
+                f"❌ plan step 失败，交还 Core："
+                f"ErrorClass={error_class} RetryOwner={retry_owner}\n"
+                f"file=`{target}` intent={step.intent}\n{err_text}"
+            )
+            self.state = replace(
+                self.state,
+                edit_queue=EditPlanQueue(
+                    major_steps=self.state.edit_queue.major_steps,
+                ),
+                edit_plan_view=halt_view,
+                messages_history=self.state.messages_history
+                + (tool_message(tc.id, summary),),
+            )
+            yield tool_result_event(tc.name, summary, success=False)
+            print(
+                "[debug][edit-queue][halt-drain] "
+                f"error_class={error_class} retry_owner={retry_owner}",
+                flush=True,
+            )
+            break
+
+        if drained and self.state.edit_queue.drained and self.state.edit_plan_view.status != "halted":
+            self.state = replace(
+                self.state,
+                edit_plan_view=edit_plan_view_from_queue(
+                    self.state.edit_queue,
+                    completed=self.state.edit_plan_view.completed,
+                ),
+            )
+        if drained:
+            print(
+                f"[debug][edit-queue][drained] count={drained} "
+                f"remaining={len(self.state.edit_queue.remaining)}",
+                flush=True,
+            )
 
     def _repo_map_snapshot(self) -> Any:
         context_builder = getattr(self, "context_builder", None)
@@ -2202,13 +2677,19 @@ class StateAssembledLoop:
         system_prompt: str | None = None,
         user_context: str | None = None,
     ) -> None:
+        """L2 budget fold: demote oldest non-hot verbatim → L4 locators (not fat summaries)."""
         if system_prompt is None:
             system_prompt = self.context_assembly.load_system_prompt()
         if user_context is None:
             user_context = "test case query"
-        exempted_files = set(self.state.run_state.active_files)
+        exempted_files = {
+            _norm_anchor_file(path)
+            for path in self.state.run_state.active_files
+            if path
+        }
+        if self.state.edit_plan_view.current_file:
+            exempted_files.add(_norm_anchor_file(self.state.edit_plan_view.current_file))
 
-        # Helper to estimate current tokens
         def estimate_prompt_tokens() -> int:
             projected_search_cache = _search_cache_for_context(
                 _search_cache_view(self.state),
@@ -2217,11 +2698,9 @@ class StateAssembledLoop:
             shaped_active_files = RuntimeShaper().shape(
                 self.state, self.state.run_state.active_files
             )
-            shaped_checklist = MemoryShaper().shape(self.state, self.state.checklist)
             assembled_messages = self.context_assembly.assemble(
                 user_query=user_context,
                 active_files=list(shaped_active_files),
-                checklist=list(shaped_checklist),
                 git_diff=self.state.git_diff,
                 validation_error=self._validation_error(),
                 messages_history=list(self.state.messages_history),
@@ -2229,8 +2708,11 @@ class StateAssembledLoop:
                 last_tool_result=self._last_tool_result(),
                 last_error=self._last_error(),
                 modified_files=list(self.state.run_state.changes.files),
+                edit_plan_card=format_edit_plan_runtime_card(self.state.edit_plan_view),
             )
-            if hasattr(self.llm, "count_messages_tokens") and not hasattr(self.llm.count_messages_tokens, "assert_called"):
+            if hasattr(self.llm, "count_messages_tokens") and not hasattr(
+                self.llm.count_messages_tokens, "assert_called"
+            ):
                 try:
                     res = self.llm.count_messages_tokens(assembled_messages)
                     if isinstance(res, int):
@@ -2248,25 +2730,21 @@ class StateAssembledLoop:
         max_context = getattr(self.settings, "max_context_tokens", 128000)
         token_threshold = int(max_context * 0.70)
 
-        # 1. Below threshold check
         if estimate_prompt_tokens() <= token_threshold:
             return
 
-        # 2. Identify eligible anchors (non-exempted)
         eligible_anchors = [
             item for item in self.state.context_anchors.code
-            if item.get("file") not in exempted_files
+            if _norm_anchor_file(str(item.get("file") or "")) not in exempted_files
         ]
         if not eligible_anchors:
             return
 
-        # Group by file
         from collections import defaultdict
         anchors_by_file = defaultdict(list)
         for item in eligible_anchors:
             anchors_by_file[item.get("file")].append(item)
 
-        # Calculate file ages based on oldest anchor step
         file_ages = {}
         for file_path, file_anchors in anchors_by_file.items():
             min_step = min(
@@ -2277,90 +2755,24 @@ class StateAssembledLoop:
             )
             file_ages[file_path] = min_step
 
-        # Sort files by age (oldest step first)
         sorted_files = sorted(file_ages.keys(), key=lambda f: file_ages[f])
-
-        folded_eligible_ids = set()
-        new_summaries = {}
+        folded_eligible_ids: set[str] = set()
 
         for file_path in sorted_files:
-            file_anchors = anchors_by_file[file_path]
-            summary_parts = []
-            for item in file_anchors:
+            for item in anchors_by_file[file_path]:
                 aid = _anchor_id(item)
-                folded_eligible_ids.add(aid)
-                summary_parts.append(
-                    _collapse_summary(
-                        item,
-                        dict(self.state.context_anchors.purposes).get(aid, "为当前任务建立代码事实")
-                    )
-                )
-            summary_text = "\n\n".join(summary_parts)
-            new_summaries[file_path] = summary_text
+                if aid:
+                    folded_eligible_ids.add(aid)
 
-            # Apply temporary fold to state copy to check tokens
-            temp_summaries = dict(self.state.context_anchors.summaries)
-            temp_summaries[file_path] = summary_text
-            temp_remaining_code = tuple(
-                item for item in self.state.context_anchors.code if _anchor_id(item) not in folded_eligible_ids
+            self.state = _demote_aged_anchors_to_locators(
+                self.state,
+                hot_files=exempted_files,
+                hot_age=-1,
+                eligible_ids=set(folded_eligible_ids),
+                reason="budget",
             )
-            temp_remaining_steps = {
-                key: val for key, val in self.state.context_anchors.created_steps.items()
-                if key not in folded_eligible_ids
-            }
-            temp_context_anchors = replace(
-                self.state.context_anchors,
-                code=temp_remaining_code,
-                summaries=temp_summaries,
-                created_steps=temp_remaining_steps,
-            )
-            temp_state = replace(self.state, context_anchors=temp_context_anchors)
-
-            # Re-estimate with temp_state
-            def estimate_temp_tokens() -> int:
-                projected_search_cache = _search_cache_for_context(
-                    _search_cache_view(temp_state),
-                    current_step=temp_state.run_state.step,
-                )
-                shaped_active_files = RuntimeShaper().shape(
-                    temp_state, temp_state.run_state.active_files
-                )
-                shaped_checklist = MemoryShaper().shape(temp_state, temp_state.checklist)
-                assembled_messages = self.context_assembly.assemble(
-                    user_query=user_context,
-                    active_files=list(shaped_active_files),
-                    checklist=list(shaped_checklist),
-                    git_diff=temp_state.git_diff,
-                    validation_error=(
-                        "\n".join(temp_state.run_state.validation.issues) or None
-                    ),
-                    messages_history=list(temp_state.messages_history),
-                    search_cache=projected_search_cache,
-                    last_tool_result=self._last_tool_result(),
-                    last_error=self._last_error(),
-                    modified_files=list(temp_state.run_state.changes.files),
-                )
-                if hasattr(self.llm, "count_messages_tokens") and not hasattr(self.llm.count_messages_tokens, "assert_called"):
-                    try:
-                        res = self.llm.count_messages_tokens(assembled_messages)
-                        if isinstance(res, int):
-                            return res
-                    except Exception:
-                        pass
-                from src.context.window import count_tokens
-                total = 0
-                for m in assembled_messages:
-                    total += 4
-                    content = m.get("content") or ""
-                    total += count_tokens(content)
-                return total + 2
-
-            if estimate_temp_tokens() <= token_threshold:
+            if estimate_prompt_tokens() <= token_threshold:
                 break
-
-        # Finally, perform actual state update for all folded_eligible_ids
-        if folded_eligible_ids:
-            self.state = _collapse_retrieval_turn(self.state, folded_eligible_ids, new_summaries)
 
     async def run(self, user_msg: str) -> AsyncIterator[AgentEvent]:
         from src.harness.checkpoint.session_storage import SessionStorage
@@ -2438,6 +2850,17 @@ class StateAssembledLoop:
             step = self.state.run_state.step
             self.harness.current_step = step
             self._normalize_anchor_memory()
+            # L3→L4: demote aged non-hot verbatim to locator map before budget fold.
+            hot = hot_files_for_turn(
+                active_files=list(self.state.run_state.active_files),
+                edit_plan_current_file=self.state.edit_plan_view.current_file or None,
+            )
+            self.state = _demote_aged_anchors_to_locators(
+                self.state,
+                hot_files=hot,
+                hot_age=HOT_ANCHOR_AGE_STEPS,
+                reason="age",
+            )
             exempted_files = set(self.state.run_state.active_files)
             collapsible_count = sum(
                 1 for item in self.state.context_anchors.code
@@ -2553,7 +2976,6 @@ class StateAssembledLoop:
                 sliced_messages = []
 
             # Now build the messages payload for LiteLLM/OpenAI
-            checklist_str = "\n".join(f"- {item}" for item in shaped_checklist) or "- No checklist items"
             if ready_final:
                 context_block = _response_evidence_summary(self.state)
             else:
@@ -2562,11 +2984,26 @@ class StateAssembledLoop:
                     Sufficiency.SUFFICIENT_FOR_EDIT,
                     Sufficiency.SUFFICIENT_FOR_VERIFY,
                 }
+                # After a landed edit, collapse that file's full bodies so the
+                # next plan step is not crowded by step-1 code (still addressable
+                # via COMPLETED EDIT ANCHORS one-liners).
+                demote_files: frozenset[str] = frozenset()
+                if (
+                    self.state.run_state.changes.files
+                    and self.state.run_state.validation.status == "passed"
+                    and not self.state.run_state.edit_patch_failed
+                ):
+                    demote_files = frozenset(
+                        _norm_anchor_file(path)
+                        for path in self.state.run_state.changes.files
+                        if path
+                    )
                 context_block = _build_deduped_loaded_anchors_block(
                     projected_search_cache,
                     edit_ready=edit_ready,
                     task_text=self._task_text,
                     manifest=manifest,
+                    demote_files=demote_files,
                 )
 
             rules_block = (
@@ -2577,11 +3014,11 @@ class StateAssembledLoop:
 
             runtime_state_block = _build_runtime_state_block(
                 active_files=list(shaped_active_files),
-                checklist_str=checklist_str,
                 git_diff=self.state.git_diff,
                 validation_error=self._validation_error(),
                 last_tool_result=self._last_tool_result(),
                 last_error=self._last_error(),
+                edit_plan_card=format_edit_plan_runtime_card(self.state.edit_plan_view),
             )
 
             turn_context_block = ""
@@ -2612,6 +3049,7 @@ class StateAssembledLoop:
                     view_last_round_all_duplicate=(
                         self.state.run_state.view_last_round_all_duplicate
                     ),
+                    edit_plan_view=self.state.edit_plan_view,
                     verification_mode=verification_active,
                     preferred_tool=tool_allocation.preferred,
                     tool_probabilities=tool_allocation.probabilities,
@@ -2770,19 +3208,79 @@ class StateAssembledLoop:
             # proves the transport/model pair recovered.
             protocol_failures = 0
 
-            # Update checklist from thoughts/response dynamically
+            # Freeze the Core-emitted edit_plan; checklist prose is not control state.
             from src.agent.checklist import parse_checklist_lines
 
             checklist_items = parse_checklist_lines(response_text)
             if checklist_items:
                 self.state = replace(self.state, checklist=checklist_items)
+            edit_args = tuple(
+                dict(tc.arguments)
+                for tc in (response.tool_calls or [])
+                if tc.name == "decision_edit" and isinstance(tc.arguments, dict)
+            )
+            prev_view = self.state.edit_plan_view
+            new_queue = sync_edit_queue_from_core_turn(
+                response_text=response_text or "",
+                decision_edit_args=edit_args,
+                checklist=self.state.checklist,
+                previous=self.state.edit_queue,
+                project_root=self.harness.project_root,
+            )
+            if not new_queue.drained:
+                # Fresh or continuing plan — drop halt card; keep completed only
+                # when still draining the same frozen queue.
+                keep_completed = (
+                    prev_view.completed
+                    if prev_view.status == "draining"
+                    and new_queue.cursor > 0
+                    else ()
+                )
+                plan_view = edit_plan_view_from_queue(
+                    new_queue, completed=keep_completed
+                )
+            elif prev_view.status == "halted":
+                plan_view = prev_view
+            elif prev_view.status == "complete" or prev_view.completed:
+                plan_view = EditPlanView(
+                    status="complete" if prev_view.completed else "empty",
+                    cursor=prev_view.total,
+                    total=prev_view.total,
+                    completed=prev_view.completed,
+                )
+            else:
+                plan_view = EditPlanView()
+            self.state = replace(
+                self.state,
+                edit_queue=new_queue,
+                edit_plan_view=plan_view,
+            )
+            if not self.state.edit_queue.drained:
+                print(
+                    "[debug][edit-queue][synced] "
+                    f"remaining={len(self.state.edit_queue.remaining)} "
+                    f"cursor={self.state.edit_queue.cursor}",
+                    flush=True,
+                )
 
-            # Process actions (tool calls)
+            # Process actions (tool calls) and/or frozen edit_plan steps.
+            ran_tools_or_queue = False
             if response.tool_calls:
+                ran_tools_or_queue = True
                 state_violations = 0
                 async for event in self._process_tool_calls(response):
                     yield event
+            elif (
+                not self.state.edit_queue.drained
+                and "decision_edit" in self._current_step_tools
+            ):
+                # Core published edit_plan without an in-turn decision_edit —
+                # drain the frozen plan directly.
+                ran_tools_or_queue = True
+                async for event in self._drain_edit_queue():
+                    yield event
 
+            if ran_tools_or_queue:
                 # Save checkpoint after executing step
                 cp_id = await self.harness.save_checkpoint(
                     f"assembled_step_{step}", self.agent_telemetry
@@ -2968,6 +3466,8 @@ class StateAssembledLoop:
         round_view_error = ""
         round_suggested_views: list[dict[str, Any]] = []
         edit_applied_this_round = False
+        last_decision_edit_ok = False
+        edit_queue_halted = False
 
         # Classify and batch tools: parallelizable tools run in parallel, sequential tools run one-by-one
         batches: list[list[ToolCall]] = []
@@ -3000,6 +3500,7 @@ class StateAssembledLoop:
                         tc.name,
                         dict(tc.arguments),
                         hint_text=self._task_text,
+                        project_root=self.harness.project_root,
                     )
                     yield tool_call_event(tc.name, prepared_args)
                     yield AgentEvent(
@@ -3015,6 +3516,7 @@ class StateAssembledLoop:
                         tc.name,
                         dict(tc.arguments),
                         hint_text=self._task_text,
+                        project_root=self.harness.project_root,
                     )
                     tool_cache = _search_cache_view(self.state)
                     if tool_cache:
@@ -3145,6 +3647,7 @@ class StateAssembledLoop:
                         tc.name,
                         dict(tc.arguments),
                         hint_text=self._task_text,
+                        project_root=self.harness.project_root,
                     )
                     executed_tool_signals.append(
                         _retrieval_tool_signal(tc, result, arguments=norm_args)
@@ -3251,6 +3754,7 @@ class StateAssembledLoop:
                     tc.name,
                     dict(tc.arguments),
                     hint_text=self._task_text,
+                    project_root=self.harness.project_root,
                 )
                 yield tool_call_event(tc.name, prepared_args)
                 yield AgentEvent(
@@ -3298,6 +3802,7 @@ class StateAssembledLoop:
                     tc.name,
                     dict(tc.arguments),
                     hint_text=self._task_text,
+                    project_root=self.harness.project_root,
                 )
                 tool_cache = _search_cache_view(self.state)
                 if tool_cache:
@@ -3404,12 +3909,9 @@ class StateAssembledLoop:
                 if permission_event_started:
                     self._dispatch_run_event(RunEvent("permission_granted"))
 
-                # Yield dynamic thinking / loading status for this tool
-                yield AgentEvent(
-                    type=EventType.STATUS,
-                    content=get_tool_status_text(tc.name, tc.arguments),
-                    data={"spinner_only": True, "phase": "executor"},
-                )
+                # NOTE: the spinner status for this tool was already yielded right
+                # after tool_call_event (mirroring the parallel branch). Do not
+                # emit it again here — a second identical STATUS double-counts.
 
                 self.harness.phase_metrics.start(
                     f"tool_{tc.name}", subtask_id=str(self.state.run_state.step)
@@ -3461,20 +3963,21 @@ class StateAssembledLoop:
                 display_output = result.output if result.success else f"Error: {result.error}"
                 task_completion = self._apply_context_update(result)
                 if tc.name == "decision_edit" and result.success:
-                    from src.agent.manifest import cross_file_partner_files
+                    from src.hooks.tool_gate import files_to_invalidate
 
-                    partners = cross_file_partner_files(
-                        self.state.run_state.manifest,
+                    invalidate = files_to_invalidate(
                         str(tc.arguments.get("target_file") or ""),
+                        self.state.run_state.manifest,
                     )
-                    if partners:
-                        self._invalidate_context_files(set(partners))
+                    if invalidate:
+                        self._invalidate_context_files(set(invalidate))
                 self._trace_tool_result(tc.name, display_output, success=result.success)
 
                 norm_args = _prepare_tool_arguments(
                     tc.name,
                     dict(tc.arguments),
                     hint_text=self._task_text,
+                    project_root=self.harness.project_root,
                 )
                 executed_tool_signals.append(
                     _retrieval_tool_signal(tc, result, arguments=norm_args)
@@ -3566,44 +4069,83 @@ class StateAssembledLoop:
                         ))
                         self._dispatch_run_event(RunEvent("validation_finished"))
                         self._ingest_post_edit_observations(tc, str(target))
-                        import difflib
+                        # Prefer compact applied_diff_summary for Core history —
+                        # full unified diffs encourage mid-大步 re-view.
                         diff_text = ""
-                        # Default: treat a validated edit as a real change. Only a
-                        # positively-detected empty diff (the LLM abusing edit as a
-                        # pseudo-viewer) is excluded so rounds_since_last_edit can
-                        # advance and reopen real verification tools next round.
                         edit_produced_change = True
-                        exec_res = result.metadata.get("execution") if result.metadata else None
-                        if exec_res:
-                            orig = getattr(exec_res, "original_content", "") or (exec_res.get("original_content", "") if isinstance(exec_res, dict) else "")
-                            attempted = getattr(exec_res, "attempted_content", "") or (exec_res.get("attempted_content", "") if isinstance(exec_res, dict) else "")
-                            if orig and attempted:
-                                orig_lines = orig.splitlines(keepends=True)
-                                att_lines = attempted.splitlines(keepends=True)
-                                diff_lines = list(difflib.unified_diff(
-                                    orig_lines,
-                                    att_lines,
-                                    fromfile=f"a/{target}",
-                                    tofile=f"b/{target}",
-                                ))
-                                if diff_lines:
-                                    diff_text = "\n\nApplied Diff:\n```diff\n" + "".join(diff_lines) + "\n```"
-                                else:
-                                    edit_produced_change = False
+                        meta = result.metadata or {}
+                        summary = str(meta.get("applied_diff_summary") or "").strip()
+                        if summary:
+                            diff_text = f"\n\n{summary}"
+                            if "no textual change" in summary:
+                                edit_produced_change = False
+                        else:
+                            exec_res = meta.get("execution")
+                            if exec_res:
+                                orig = getattr(exec_res, "original_content", "") or (
+                                    exec_res.get("original_content", "")
+                                    if isinstance(exec_res, dict)
+                                    else ""
+                                )
+                                attempted = getattr(exec_res, "attempted_content", "") or (
+                                    exec_res.get("attempted_content", "")
+                                    if isinstance(exec_res, dict)
+                                    else ""
+                                )
+                                if orig and attempted:
+                                    from src.agent.edit_brief import (
+                                        format_applied_diff_summary,
+                                    )
+
+                                    built = format_applied_diff_summary(
+                                        orig,
+                                        attempted,
+                                        target_file=str(target),
+                                    )
+                                    diff_text = f"\n\n{built}"
+                                    if "no textual change" in built:
+                                        edit_produced_change = False
                         edit_applied_this_round = edit_applied_this_round or edit_produced_change
 
-                        diff_suffix = f"\n\n{diff_text}" if diff_text else ""
+                        diff_suffix = diff_text
                         if task_completion:
-                            summary = json.dumps(task_completion, ensure_ascii=False) + diff_suffix
+                            summary_msg = (
+                                json.dumps(task_completion, ensure_ascii=False)
+                                + diff_suffix
+                            )
                         else:
-                            summary = f"decision_edit applied to {target}: validation passed.{diff_suffix}"
+                            summary_msg = (
+                                f"decision_edit applied to {target}: "
+                                f"validation passed.{diff_suffix}"
+                            )
+                        completed_line = (
+                            str(meta.get("applied_diff_summary") or "").strip()
+                            or diff_text.strip()
+                            or f"applied_diff_summary: [{target}] ok"
+                        )
+                        completed = tuple(self.state.edit_plan_view.completed) + (
+                            completed_line,
+                        )
+                        if not self.state.edit_queue.drained:
+                            plan_view = edit_plan_view_from_queue(
+                                self.state.edit_queue, completed=completed
+                            )
+                        else:
+                            plan_view = EditPlanView(
+                                status="complete" if completed else "empty",
+                                cursor=len(completed),
+                                total=len(completed),
+                                completed=completed[-8:],
+                            )
                         self.state = replace(
                             self.state,
+                            edit_plan_view=plan_view,
                             messages_history=self.state.messages_history + (
-                                tool_message(tc.id, summary),
+                                tool_message(tc.id, summary_msg),
                             )
                         )
                         display_output = "decision_edit validation passed."
+                        last_decision_edit_ok = True
                     else:
                         self.state = replace(
                             self.state,
@@ -3613,9 +4155,41 @@ class StateAssembledLoop:
                         )
                 else:
                     if tc.name == "decision_edit":
+                        last_decision_edit_ok = False
                         exec_res = result.metadata.get("execution") if result.metadata else None
                         val_res = result.metadata.get("validation") if result.metadata else None
                         is_validation_failure = (exec_res and exec_res.success) and (val_res and not val_res.success)
+                        retry_owner = str(
+                            (result.metadata or {}).get("retry_owner") or ""
+                        ).strip().casefold()
+                        if retry_owner == RetryOwner.CORE.value or not result.success:
+                            # Stop auto-drain; Core must revise the plan.
+                            halt_view = edit_plan_view_halt(
+                                self.state.edit_queue,
+                                failed=tc.arguments if isinstance(tc.arguments, dict) else {},
+                                error_class=str(
+                                    (result.metadata or {}).get("error_class") or ""
+                                ),
+                                fail_reason=str(
+                                    result.error or result.output or "decision_edit failed"
+                                ),
+                                completed=self.state.edit_plan_view.completed,
+                                failed_was_queue_current=False,
+                            )
+                            self.state = replace(
+                                self.state,
+                                edit_queue=EditPlanQueue(
+                                    major_steps=self.state.edit_queue.major_steps,
+                                ),
+                                edit_plan_view=halt_view,
+                            )
+                            edit_queue_halted = True
+                            print(
+                                "[debug][edit-queue][halt] "
+                                f"retry_owner={retry_owner or 'fail'} "
+                                f"error_class={(result.metadata or {}).get('error_class')}",
+                                flush=True,
+                            )
 
                         if is_validation_failure:
                             target = str(tc.arguments.get("target_file") or "unknown")
@@ -3661,6 +4235,15 @@ class StateAssembledLoop:
                         )
 
                 yield tool_result_event(tc.name, display_output, success=result.success)
+
+        # Auto-drain remaining frozen edit_plan steps without another Core LLM turn.
+        if (
+            last_decision_edit_ok
+            and not edit_queue_halted
+            and not self.state.edit_queue.drained
+        ):
+            async for event in self._drain_edit_queue():
+                yield event
 
         # Keep display projections while RunState remains the sole flow controller.
         last_tool_result = "; ".join(executed_tool_signals) if executed_tool_signals else None
@@ -4059,6 +4642,13 @@ class StateAssembledLoop:
     ) -> None:
         """Print the projected manifest that governs this step's tool access."""
         metrics = manifest_metrics(manifest)
+        items = tuple(getattr(manifest, "required_items", ()) or ())
+        observed_stale = sum(
+            1 for item in items if getattr(item, "status", None) == "STALE"
+        )
+        observed_satisfied = sum(
+            1 for item in items if getattr(item, "status", None) == "SATISFIED"
+        )
         snapshot = {
             "step": getattr(manifest, "updated_at_step", None),
             "step_id": getattr(manifest, "step_id", ""),
@@ -4067,6 +4657,8 @@ class StateAssembledLoop:
             "required_coverage": round(metrics.coverage, 3),
             "missing_ratio": round(metrics.missing_ratio, 3),
             "stale_ratio": round(metrics.stale_ratio, 3),
+            "observed_satisfied": observed_satisfied,
+            "observed_stale": observed_stale,
             "retrieval_no_gain_rounds": retrieval_no_gain_rounds,
             "items": [
                 {

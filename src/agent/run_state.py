@@ -371,11 +371,11 @@ def reduce_run_state(
     if event.kind == "edit_applied":
         files = tuple(dict.fromkeys((*state.changes.files, event.file or "")))
         files = tuple(item for item in files if item)
-        edited = _norm_path(event.file or "")
-        stale_targets = {edited} if edited else set()
-        from src.agent.manifest import cross_file_partner_files
+        from src.hooks.tool_gate import files_to_invalidate
 
-        stale_targets |= set(cross_file_partner_files(state.manifest, edited))
+        stale_targets = set(
+            files_to_invalidate(event.file or "", state.manifest)
+        )
         manifest = _mark_stale_for_files(
             state.manifest,
             stale_targets,

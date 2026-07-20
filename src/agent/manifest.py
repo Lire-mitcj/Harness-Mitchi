@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from src.agent.evidence_slots import rule_matches, slot_def, slot_satisfy_rule
 from src.agent.grep_discovery import discovery_hint_lines
@@ -51,6 +51,11 @@ ItemRole = Literal["required", "observed"]
 StepKind = Literal["retrieval", "edit", "verify", "answer"]
 
 FAILURE_TYPES: frozenset[str] = frozenset({"test_failure", "tool_error"})
+
+# Max symbols listed in the STEP EVIDENCE "loaded" inventory. Must comfortably
+# exceed the number of slices a multi-step edit accumulates; otherwise the Core
+# LLM cannot see everything it already holds and re-fetches the hidden overflow.
+_LOADED_INVENTORY_CAP = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,16 +348,15 @@ def grep_pending_caller_loads(
 
 
 def cross_file_partner_files(manifest: StepManifest, edited_file: str) -> frozenset[str]:
-    """Other observed symbol files in a multi-file bootstrap — refresh after one is edited."""
-    edited = _norm_file(edited_file)
-    symbol_files = {
-        _norm_file(item.file)
-        for item in manifest.observed_items
-        if item.file and item.type == "symbol" and item.status in {"SATISFIED", "STALE"}
-    }
-    if len(symbol_files) < 2 or not edited:
-        return frozenset()
-    return frozenset(path for path in symbol_files if path and path != edited)
+    """Files to additionally mark STALE after editing ``edited_file``.
+
+    Always empty: blanket partner invalidation caused yaml/config edits to mark
+    every observed ``.py`` anchor STALE and reopen VIEW while ``edit_ready: yes``.
+    Invalidate scope is owned by ``src.hooks.tool_gate.files_to_invalidate``
+    (edited file only). Cross-file refresh uses wiring_gap / verification mode.
+    """
+    _ = manifest, edited_file
+    return frozenset()
 
 
 def _cross_file_observed_ready(
@@ -1106,6 +1110,7 @@ def execution_card(
     preferred_tool: str | None = None,
     tool_probabilities: Mapping[str, float] | None = None,
     project_root: Path | None = None,
+    edit_plan_view: Any = None,
 ) -> str:
     """Render the STEP EVIDENCE card for the Core LLM."""
     edit_ready = manifest.sufficiency in {
@@ -1184,14 +1189,30 @@ def execution_card(
         targets = primary_edit_target_files(manifest, task_text)
         if targets:
             lines.append(
-                f"edit_target: {targets[0]} — decision_edit applies here after wiring "
-                "context is loaded; do not decision_edit caller files for inspection"
+                f"edit_target: {targets[0]} — decision_edit applies here; "
+                "wiring_gap lines above are advisory (use LOADED CODE ANCHORS); "
+                "do not decision_edit caller files for inspection"
             )
+    if edit_ready and project_root is not None:
+        from src.agent.edit_brief import available_symbols_lines
+
+        targets = primary_edit_target_files(manifest, task_text)
+        if not targets:
+            # Fall back to files that already have loaded symbols.
+            targets = sorted(
+                {
+                    str(item.file)
+                    for item in manifest.required_items
+                    if item.file
+                    and item.symbol
+                    and item.status in {"SATISFIED", "STALE"}
+                }
+            )[:3]
+        lines.extend(available_symbols_lines(project_root, targets))
     if edit_burst:
         lines.append(
-            "edit_burst: continue decision_edit on remaining plan files; "
-            "do not re-fetch or verify already-edited files mid-plan — "
-            "batch verification after all planned edits complete"
+            "edit_burst: the frozen edit_plan is draining — do not re-fetch edited "
+            "files; verify only after the plan drains."
         )
     elif edit_patch_failed:
         lines.append(
@@ -1208,6 +1229,20 @@ def execution_card(
             "wiring_duplicate: last view replayed a loaded symbol on the wrong file — "
             "use pending_wiring above (different file/symbol), not decision_edit to read"
         )
+    if edit_plan_view is not None:
+        from src.agent.edit_plan import format_edit_plan_evidence_lines
+
+        lines.extend(format_edit_plan_evidence_lines(edit_plan_view))
+    # Event-gated mechanical rules (plan contract / drain / ErrorClass) — not in system.
+    from src.agent.edit_plan import mechanical_rule_lines_for_turn
+
+    lines.extend(
+        mechanical_rule_lines_for_turn(
+            edit_ready=edit_ready,
+            edit_plan_view=edit_plan_view,
+            edit_burst=edit_burst,
+        )
+    )
     tools_set = frozenset(tools_available)
     retrieval_closed = edit_ready and tools_set == frozenset({"decision_edit"})
     if retrieval_closed:
@@ -1240,15 +1275,15 @@ def execution_card(
             )
         else:
             lines.append(
-                "edit_ready: prefer decision_edit; retrieval is closed unless "
-                "missing/stale items appear below"
+                "edit_ready: prefer decision_edit; retrieval remains open only for "
+                "missing/stale refresh or verification — wiring_gap is advisory"
             )
     if verification_mode:
         lines.append(
             "verification: plan edits complete — use view_symbol_code (or grep_search) "
             "to read disk; do not decision_edit for inspection"
         )
-    loaded: list[EvidenceItem] = []
+    unique_loaded: list[EvidenceItem] = []
     seen_loaded: set[tuple[str | None, tuple[int, int] | None, str | None]] = set()
     load_candidates = [
         item for item in manifest.required_items if item.status == "SATISFIED"
@@ -1264,14 +1299,22 @@ def execution_card(
         if identity in seen_loaded:
             continue
         seen_loaded.add(identity)
-        loaded.append(item)
-        if len(loaded) == 8:
-            break
+        unique_loaded.append(item)
+    # Cap must exceed the typical loaded-symbol count: an under-cap hides slices
+    # the agent already holds, so the Core LLM re-views/greps them (duplicate
+    # anchors) and burns rounds. Keep the full inventory visible.
+    loaded = unique_loaded[:_LOADED_INVENTORY_CAP]
     if loaded:
-        lines.append("loaded (reuse; do not re-fetch):")
+        lines.append(
+            "loaded (already in LOADED CODE ANCHORS — reuse; do NOT "
+            "view_symbol_code/grep_search these again):"
+        )
         for item in loaded:
             symbol = f"  symbol={item.symbol}" if item.symbol else ""
             lines.append(f"- {_item_locator(item)}{symbol}")
+        remaining = len(unique_loaded) - len(loaded)
+        if remaining > 0:
+            lines.append(f"- … (+{remaining} more already loaded — also do not re-fetch)")
     missing = manifest.missing_items[:5]
     if missing:
         lines.append("missing:")

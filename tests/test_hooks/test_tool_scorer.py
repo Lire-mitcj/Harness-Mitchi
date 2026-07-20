@@ -119,8 +119,7 @@ def _verification_state() -> SimpleNamespace:
                     file="main.py",
                     span=(1, 80),
                     symbol="create_app",
-                    status="STALE",
-                    stale_reason="file modified by decision_edit",
+                    status="SATISFIED",
                 ),
                 EvidenceItem(
                     id="observed.symbol:list.py:build_router",
@@ -140,7 +139,7 @@ def _verification_state() -> SimpleNamespace:
         retrieval_no_gain_rounds=1,
         view_last_round_all_duplicate=False,
         edit_patch_failed=False,
-        rounds_since_last_edit=0,
+        rounds_since_last_edit=1,
     )
     return SimpleNamespace(run_state=run_state, checklist=())
 

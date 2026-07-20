@@ -246,7 +246,8 @@ def test_sufficient_for_edit_is_edit_only_when_no_gaps() -> None:
     assert allowed == frozenset({"decision_edit"})
 
 
-def test_sufficient_for_edit_keeps_primary_retrieval_open_after_edit() -> None:
+def test_sufficient_for_edit_stays_edit_only_immediately_after_edit() -> None:
+    """Right after a landed edit (rounds=0), stay in edit_burst — not verification."""
     state = _make_state(
         task_mode="edit",
         sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
@@ -256,9 +257,101 @@ def test_sufficient_for_edit_keeps_primary_retrieval_open_after_edit() -> None:
     )
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
+    assert allowed == frozenset({"decision_edit"})
+
+
+def test_empty_checklist_reopens_discovery_after_non_edit_round() -> None:
+    """No structured checklist: one non-edit round may reopen retrieval for next files."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="grounded",
+                    need="grounded target",
+                    status="SATISFIED",
+                    file="list.py",
+                    symbol="target",
+                ),
+            ),
+            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        ),
+        validation=SimpleNamespace(status="passed"),
+        changes=SimpleNamespace(files=("list.py",)),
+        edit_patch_failed=False,
+        rounds_since_last_edit=1,
+        retrieval_no_gain_rounds=0,
+        view_last_round_all_duplicate=False,
+    )
+    state = SimpleNamespace(run_state=run_state, checklist=())
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
     assert "view_symbol_code" in allowed
     assert "grep_search" in allowed
     assert "decision_edit" in allowed
+
+
+def test_unbounded_retrieval_after_edit_is_capped_to_edit_only() -> None:
+    """No checklist + model keeps loading NEW symbols each round (no_gain stays 0):
+    after the retrieval-rounds cap, force edit-only instead of looping forever."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="grounded",
+                    need="grounded target",
+                    status="SATISFIED",
+                    file="list.py",
+                    symbol="target",
+                ),
+            ),
+            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        ),
+        validation=SimpleNamespace(status="passed"),
+        changes=SimpleNamespace(files=("list.py",)),
+        edit_patch_failed=False,
+        rounds_since_last_edit=3,
+        retrieval_no_gain_rounds=0,
+        view_last_round_all_duplicate=False,
+    )
+    state = SimpleNamespace(run_state=run_state, checklist=())
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == frozenset({"decision_edit"})
+
+
+def test_retrieval_cap_does_not_apply_when_plan_complete() -> None:
+    """A verifiably complete checklist still gets verification retrieval, not a
+    forced edit, even past the retrieval-rounds cap."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="grounded",
+                    need="grounded target",
+                    status="SATISFIED",
+                    file="list.py",
+                    symbol="target",
+                ),
+            ),
+            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        ),
+        validation=SimpleNamespace(status="passed"),
+        changes=SimpleNamespace(files=("list.py",)),
+        edit_patch_failed=False,
+        rounds_since_last_edit=5,
+        retrieval_no_gain_rounds=0,
+        view_last_round_all_duplicate=False,
+    )
+    state = SimpleNamespace(run_state=run_state, checklist=("[√] done",))
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert "view_symbol_code" in allowed
 
 
 def test_one_no_gain_round_is_edit_only_without_stale_gaps() -> None:
@@ -284,7 +377,8 @@ def test_one_no_gain_all_view_duplicate_keeps_grep_only() -> None:
     assert allowed == frozenset({"decision_edit"})
 
 
-def test_stale_reopens_exact_reader_after_no_gain() -> None:
+def test_stale_is_advisory_under_edit_ready_after_no_gain() -> None:
+    """edit_ready + STALE must stay edit-only; use context_window spans, not VIEW."""
     state = _make_state(
         task_mode="edit",
         sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
@@ -293,7 +387,7 @@ def test_stale_reopens_exact_reader_after_no_gain() -> None:
     )
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
-    assert allowed == frozenset({"decision_edit", "view_symbol_code"})
+    assert allowed == frozenset({"decision_edit"})
 
 
 def test_two_no_gain_rounds_force_grounded_edit() -> None:
@@ -307,7 +401,7 @@ def test_two_no_gain_rounds_force_grounded_edit() -> None:
     assert allowed == frozenset({"decision_edit"})
 
 
-def test_sufficient_for_edit_with_stale_reopens_retrieval() -> None:
+def test_sufficient_for_edit_with_stale_stays_edit_only() -> None:
     state = _make_state(
         task_mode="edit",
         sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
@@ -315,8 +409,8 @@ def test_sufficient_for_edit_with_stale_reopens_retrieval() -> None:
     )
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
-    assert "decision_edit" in allowed
-    assert "view_symbol_code" in allowed
+    assert allowed == frozenset({"decision_edit"})
+    assert "view_symbol_code" not in allowed
 
 
 def test_diagnose_answer_when_sufficient_and_fresh() -> None:
@@ -550,7 +644,8 @@ def test_edit_burst_continues_edit_only_when_edited_file_is_stale() -> None:
     assert allowed == frozenset({"decision_edit"})
 
 
-def test_edit_burst_reopens_view_for_external_stale_file() -> None:
+def test_edit_burst_keeps_edit_only_despite_external_stale_when_edit_ready() -> None:
+    """edit_ready: yes → partner/external STALE is advisory; do not reopen VIEW."""
     state = _make_state(
         task_mode="edit",
         sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
@@ -561,8 +656,8 @@ def test_edit_burst_reopens_view_for_external_stale_file() -> None:
     )
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
-    assert "decision_edit" in allowed
-    assert "view_symbol_code" in allowed
+    assert allowed == frozenset({"decision_edit"})
+    assert "view_symbol_code" not in allowed
 
 
 def test_edit_burst_reopens_retrieval_on_validation_failure() -> None:
@@ -640,8 +735,51 @@ def test_duplicate_view_round_closes_retrieval_when_edit_ready() -> None:
     assert allowed == frozenset({"decision_edit"})
 
 
-def test_duplicate_view_keeps_retrieval_open_when_wiring_gap() -> None:
-    """Wrong-file duplicate view must not force edit-only while caller wiring is missing."""
+def test_sufficient_closes_retrieval_even_with_wiring_gap() -> None:
+    """Scheme B: wiring_gap is advisory once sufficiency is already edit-ready."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:main.py:sqlalchemy_error_handler",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="main.py",
+                    span=(49, 55),
+                    symbol="sqlalchemy_error_handler",
+                    status="SATISFIED",
+                ),
+                EvidenceItem(
+                    id="observed.symbol:list.py:build_router",
+                    need="handler",
+                    type="symbol",
+                    role="observed",
+                    file="list.py",
+                    span=(16, 350),
+                    symbol="build_router",
+                    status="SATISFIED",
+                ),
+            ),
+            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        ),
+        validation=SimpleNamespace(status="not_run"),
+        changes=SimpleNamespace(files=()),
+        retrieval_no_gain_rounds=0,
+        view_last_round_all_duplicate=False,
+        edit_patch_failed=False,
+        task_text="wire list.py router into main.py include_router",
+    )
+    state = SimpleNamespace(run_state=run_state)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == frozenset({"decision_edit"})
+
+
+def test_duplicate_view_closes_retrieval_when_wiring_gap_present() -> None:
+    """Duplicate replay + sufficient evidence → edit-only even if wiring_gap remains."""
     run_state = SimpleNamespace(
         task_mode="edit",
         phase=RunPhase.ACTING,
@@ -673,50 +811,6 @@ def test_duplicate_view_keeps_retrieval_open_when_wiring_gap() -> None:
         validation=SimpleNamespace(status="not_run"),
         changes=SimpleNamespace(files=()),
         retrieval_no_gain_rounds=1,
-        view_last_round_all_duplicate=True,
-        edit_patch_failed=False,
-    )
-    state = SimpleNamespace(run_state=run_state)
-    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
-
-    assert "grep_search" in allowed
-    assert "decision_edit" in allowed
-    assert "view_symbol_code" not in allowed
-
-
-def test_duplicate_view_closes_retrieval_when_wiring_gap_saturated() -> None:
-    """After repeated duplicate views, drop retrieval even if wiring_gap remains."""
-    run_state = SimpleNamespace(
-        task_mode="edit",
-        phase=RunPhase.ACTING,
-        manifest=StepManifest(
-            required_items=(
-                EvidenceItem(
-                    id="observed.symbol:main.py:sqlalchemy_error_handler",
-                    need="handler",
-                    type="symbol",
-                    role="observed",
-                    file="main.py",
-                    span=(49, 55),
-                    symbol="sqlalchemy_error_handler",
-                    status="SATISFIED",
-                ),
-                EvidenceItem(
-                    id="observed.symbol:list.py:build_router",
-                    need="handler",
-                    type="symbol",
-                    role="observed",
-                    file="list.py",
-                    span=(16, 350),
-                    symbol="build_router",
-                    status="SATISFIED",
-                ),
-            ),
-            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
-        ),
-        validation=SimpleNamespace(status="not_run"),
-        changes=SimpleNamespace(files=()),
-        retrieval_no_gain_rounds=2,
         view_last_round_all_duplicate=True,
         edit_patch_failed=False,
         task_text="wire list.py router into main.py include_router",
@@ -909,7 +1003,7 @@ def test_verification_converges_to_edit_only_on_duplicate_view() -> None:
 
 
 def test_post_edit_verification_opens_when_plan_edits_complete() -> None:
-    """After a cross-file edit, partner-file staleness reopens view for verification."""
+    """After edits land and a non-edit round passes, verification reopens view."""
     run_state = SimpleNamespace(
         task_mode="edit",
         phase=RunPhase.ACTING,
@@ -923,8 +1017,7 @@ def test_post_edit_verification_opens_when_plan_edits_complete() -> None:
                     file="main.py",
                     span=(1, 80),
                     symbol="create_app",
-                    status="STALE",
-                    stale_reason="file modified by decision_edit",
+                    status="SATISFIED",
                 ),
                 EvidenceItem(
                     id="observed.symbol:list.py:build_router",
@@ -944,7 +1037,7 @@ def test_post_edit_verification_opens_when_plan_edits_complete() -> None:
         retrieval_no_gain_rounds=1,
         view_last_round_all_duplicate=False,
         edit_patch_failed=False,
-        rounds_since_last_edit=0,
+        rounds_since_last_edit=1,
     )
     state = SimpleNamespace(run_state=run_state, checklist=())
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
@@ -1016,6 +1109,84 @@ def test_edit_burst_stays_edit_only_when_plan_still_open() -> None:
     assert allowed == frozenset({"decision_edit"})
 
 
+def test_edit_burst_stays_edit_only_when_open_checklist_despite_rounds() -> None:
+    """Mid-plan: rounds_since_last_edit must not reopen verification over edit_burst."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:noise_policy.py:NoisePolicy",
+                    need="policy",
+                    type="symbol",
+                    role="observed",
+                    file="agentmesh_orchestrator/app/infrastructure/noise_policy.py",
+                    span=(79, 146),
+                    symbol="NoisePolicy",
+                    status="STALE",
+                    stale_reason="file modified by decision_edit",
+                ),
+            ),
+            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        ),
+        validation=SimpleNamespace(status="passed"),
+        changes=SimpleNamespace(
+            files=("agentmesh_orchestrator/app/infrastructure/noise_policy.py",)
+        ),
+        edit_patch_failed=False,
+        rounds_since_last_edit=1,
+        retrieval_no_gain_rounds=0,
+        view_last_round_all_duplicate=False,
+    )
+    checklist = (
+        "[√] Add bot_nicknames field to NoisePolicy",
+        "[ ] Update YAML config",
+        "[ ] Wire mention detection",
+    )
+    state = SimpleNamespace(run_state=run_state, checklist=checklist)
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == frozenset({"decision_edit"})
+
+
+def test_self_stale_on_edited_file_does_not_count_as_actionable_stale() -> None:
+    """Self-inflicted STALE after decision_edit must not reopen retrieval by itself."""
+    run_state = SimpleNamespace(
+        task_mode="edit",
+        phase=RunPhase.ACTING,
+        manifest=StepManifest(
+            required_items=(
+                EvidenceItem(
+                    id="observed.symbol:noise_policy.py:NoisePolicy",
+                    need="policy",
+                    type="symbol",
+                    role="observed",
+                    file="noise_policy.py",
+                    span=(79, 146),
+                    symbol="NoisePolicy",
+                    status="STALE",
+                    stale_reason="file modified by decision_edit",
+                ),
+            ),
+            sufficiency=Sufficiency.SUFFICIENT_FOR_EDIT,
+        ),
+        validation=SimpleNamespace(status="passed"),
+        changes=SimpleNamespace(files=("noise_policy.py",)),
+        edit_patch_failed=False,
+        rounds_since_last_edit=0,
+        retrieval_no_gain_rounds=0,
+        view_last_round_all_duplicate=False,
+    )
+    state = SimpleNamespace(
+        run_state=run_state,
+        checklist=("[ ] next step still open",),
+    )
+    allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
+
+    assert allowed == frozenset({"decision_edit"})
+
+
 def test_missing_dependency_does_not_reopen_retrieval_without_manifest_gap() -> None:
     state = _make_state(
         task_mode="edit",
@@ -1032,7 +1203,8 @@ def test_missing_dependency_does_not_reopen_retrieval_without_manifest_gap() -> 
     assert allowed == frozenset({"decision_edit"})
 
 
-def test_grep_pending_mount_keeps_view_open_after_large_symbol_loaded() -> None:
+def test_grep_pending_does_not_reopen_retrieval_when_sufficient() -> None:
+    """Scheme B: grep mount hints stay on the card; tools close to edit-only."""
     manifest = StepManifest(
         required_items=(
             EvidenceItem(
@@ -1068,5 +1240,4 @@ def test_grep_pending_mount_keeps_view_open_after_large_symbol_loaded() -> None:
     state = SimpleNamespace(run_state=run_state, checklist=())
     allowed = determine_allowed_tools(state, MagicMock(), DEFAULT_TOOLS)
 
-    assert "view_symbol_code" in allowed
-    assert allowed != frozenset({"decision_edit"})
+    assert allowed == frozenset({"decision_edit"})

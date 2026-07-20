@@ -35,6 +35,13 @@ _EDIT_TOOLS = frozenset({"decision_edit"})
 _GREP_TOOLS = frozenset({"grep_search"})
 _VIEW_TOOLS = frozenset({"view_symbol_code"})
 
+# After a landed edit, cap how many consecutive non-edit (retrieval) rounds the
+# model may take while evidence is already sufficient. Without a checklist, the
+# post-edit heuristic reopens retrieval and the model keeps loading *new* symbols
+# every round, so no_gain/duplicate saturation never fires — it explores forever.
+# This bounds that loop and forces the next edit.
+_MAX_RETRIEVAL_ROUNDS_AFTER_EDIT = 3
+
 
 def _split_tool_groups(default_tools: frozenset[str]) -> tuple[frozenset[str], frozenset[str]]:
     edit = _EDIT_TOOLS & default_tools
@@ -185,8 +192,8 @@ def _insufficient_allowed_tools(
             Sufficiency.SUFFICIENT_FOR_EDIT,
             Sufficiency.SUFFICIENT_FOR_VERIFY,
         }
-        and not _has_wiring_gap(manifest, task_text=task_text)
     ):
+        # wiring_gap is advisory once evidence is already sufficient.
         return edit_tools or default_tools
 
     retrieval = _insufficient_retrieval_tools(
@@ -296,11 +303,28 @@ def _validation_recovery_tools(
 
 
 def _manifest_state(run_state: Any) -> tuple[str, bool, bool]:
+    """Return (sufficiency, has_missing, has_actionable_stale).
+
+    Stale taxonomy is owned by ``tool_gate.actionable_stale`` — self-stale and
+    edit_ready advisory stale must not reopen retrieval.
+    """
+    from src.hooks.tool_gate import has_actionable_stale
+
     manifest = getattr(run_state, "manifest", None)
     sufficiency = str(getattr(manifest, "sufficiency", Sufficiency.INSUFFICIENT))
     has_missing = bool(getattr(manifest, "missing_items", ()))
-    has_stale = bool(stale_needing_refresh(manifest)) if manifest is not None else False
-    return sufficiency, has_missing, has_stale
+    if manifest is None:
+        return sufficiency, has_missing, False
+    return (
+        sufficiency,
+        has_missing,
+        has_actionable_stale(
+            run_state,
+            manifest,
+            sufficiency=sufficiency,
+            has_missing=has_missing,
+        ),
+    )
 
 
 def _blocks_edit(
@@ -354,8 +378,12 @@ def _plan_edits_complete(
     *,
     checklist: tuple[str, ...] = (),
 ) -> bool:
-    """True when no manifest/checklist signal says another file still needs editing."""
-    if _checklist_has_open_items(checklist):
+    """True when a non-empty checklist is fully done and no partner gaps remain.
+
+    An empty checklist must not mean "plan complete" — Core often keeps the plan
+    only in prose; assuming done after the first edit reopens verification too early.
+    """
+    if not checklist or _checklist_has_open_items(checklist):
         return False
     manifest = getattr(run_state, "manifest", None)
     changes = getattr(run_state, "changes", None)
@@ -372,12 +400,19 @@ def _plan_edits_complete(
     return True
 
 
+def _self_stale_only(run_state: Any, manifest: Any) -> bool:
+    """True when every stale-needing-refresh item is on an already-edited file."""
+    from src.hooks.tool_gate import self_stale_only
+
+    return self_stale_only(run_state, manifest)
+
+
 def _post_edit_verification_ready(
     run_state: Any,
     *,
     checklist: tuple[str, ...] = (),
 ) -> bool:
-    """Reopen retrieval after planned edits land (checklist done or pause after edit)."""
+    """Reopen retrieval after planned edits finish — never mid open-checklist burst."""
     if str(getattr(run_state, "task_mode", "")) != "edit":
         return False
     phase = getattr(run_state, "phase", None)
@@ -392,12 +427,17 @@ def _post_edit_verification_ready(
         return False
     if getattr(run_state, "edit_patch_failed", False):
         return False
+    # Open checklist items mean the multi-step plan is still editing — keep
+    # edit_burst; do not reopen grep/view just because rounds_since_last_edit>0.
+    if _checklist_has_open_items(checklist):
+        return False
     if checklist_plan_complete(checklist):
         return True
     if _plan_edits_complete(run_state, checklist=checklist):
         return True
+    # No structured checklist: allow next-step discovery after one non-edit round.
     rounds = int(getattr(run_state, "rounds_since_last_edit", 0) or 0)
-    return rounds >= 1
+    return rounds >= 1 and not checklist
 
 
 def _external_stale_blocks_edit_burst(manifest: Any, edited_files: tuple[str, ...]) -> bool:
@@ -440,17 +480,12 @@ def _edit_burst_active(
     manifest = getattr(run_state, "manifest", None)
     if manifest is not None and manifest.failure_items:
         return False
-    if manifest is not None:
-        edited = {_norm_file(path) for path in edited_files if path}
-        partner_stale = [
-            item
-            for item in stale_needing_refresh(manifest)
-            if item.file and _norm_file(item.file) not in edited
-        ]
-        if partner_stale:
-            return False
+    # Partner STALE is advisory under edit_ready (tool_gate.actionable_stale).
+    # Do not kill edit_burst solely because another observed file was marked STALE.
     if _external_stale_blocks_edit_burst(manifest, edited_files):
-        return False
+        # Only block burst when sufficiency is still INSUFFICIENT.
+        if manifest is not None and str(manifest.sufficiency) == Sufficiency.INSUFFICIENT:
+            return False
     return True
 
 
@@ -484,8 +519,8 @@ def determine_allowed_tools(
       (B) manifest failure items     -> edit (+ refresh when stale/missing)
       (C) INSUFFICIENT               -> manifest-justified retrieval only
       (D) diagnose + sufficient      -> no tools only once phase is RESPONDING
-      (E) open manifest gaps         -> retrieval profile (+ edit when allowed)
-      (F) saturated edit-ready       -> edit + saturation-throttled retrieval
+      (E) sufficient + no missing/stale -> edit only (wiring_gap is advisory)
+      (F) open missing/stale gaps    -> retrieval profile (+ edit when allowed)
     """
     run_state = getattr(state, "run_state", None)
     checklist = tuple(getattr(state, "checklist", ()) or ())
@@ -515,15 +550,19 @@ def determine_allowed_tools(
     concrete_error = (validation_error or "").strip()
 
     if concrete_error or has_compile_error:
+        # Validation/compile recovery may re-read even advisory STALE anchors.
+        raw_stale = bool(
+            stale_needing_refresh(manifest) if manifest is not None else ()
+        )
         return _validation_recovery_tools(
             default_tools,
             manifest,
-            needs_evidence_refresh=(has_missing or has_stale),
+            needs_evidence_refresh=(has_missing or has_stale or raw_stale),
             no_gain_rounds=no_gain_rounds,
             view_last_round_all_duplicate=view_last_round_all_duplicate,
             task_mode=task_mode,
             has_missing=has_missing,
-            has_stale=has_stale,
+            has_stale=has_stale or raw_stale,
             task_text=task_text,
         )
 
@@ -542,18 +581,46 @@ def determine_allowed_tools(
         )
 
     if validation_status == "failed":
+        # Validation failure always warrants refresh — including re-reading the
+        # file we just patched (self-stale is still actionable here).
         return _recovery_allowed_tools(
             task_mode=task_mode,
             manifest=manifest,
             default_tools=default_tools,
             edit_tools=edit_tools,
             has_missing=has_missing,
-            has_stale=has_stale,
+            has_stale=True,
             no_gain_rounds=no_gain_rounds,
             view_last_round_all_duplicate=view_last_round_all_duplicate,
-            needs_retrieval=has_missing or has_stale,
+            needs_retrieval=True,
             task_text=task_text,
         )
+
+    # Bounded retrieval after a landed edit. When evidence is already sufficient
+    # and the plan is not verifiably complete, do not let the model reopen
+    # retrieval for unbounded rounds: it keeps loading NEW symbols each round so
+    # the no_gain / duplicate saturation never fires. Force edit-only to make
+    # progress. A completed plan (or RESPONDING phase) still gets verification.
+    rounds_since_last_edit = int(
+        getattr(run_state, "rounds_since_last_edit", 0) or 0
+    )
+    phase = getattr(run_state, "phase", None)
+    if (
+        task_mode == "edit"
+        and phase != RunPhase.RESPONDING
+        and rounds_since_last_edit >= _MAX_RETRIEVAL_ROUNDS_AFTER_EDIT
+        and not has_missing
+        and not has_stale
+        and not blocks_edit
+        and not checklist_plan_complete(checklist)
+        and _edit_allowed(
+            task_mode=task_mode,
+            sufficiency=sufficiency,
+            has_missing=has_missing,
+            metrics=metrics,
+        )
+    ):
+        return edit_tools or default_tools
 
     # Post-plan verification reopens retrieval, but yields to duplicate-round
     # convergence: once the last view round replayed only cached evidence, the
@@ -574,10 +641,6 @@ def determine_allowed_tools(
         }
         and not has_missing
         and view_last_round_all_duplicate
-        and (
-            not _has_wiring_gap(manifest, task_text=task_text)
-            or int(getattr(run_state, "retrieval_no_gain_rounds", 0) or 0) >= 2
-        )
         and _edit_allowed(
             task_mode=task_mode,
             sufficiency=sufficiency,
@@ -585,6 +648,8 @@ def determine_allowed_tools(
             metrics=metrics,
         )
     ):
+        # Duplicate replay after sufficient evidence → edit only.
+        # wiring_gap / grep_pending are advisory and must not reopen retrieval.
         return edit_tools or default_tools
 
     if getattr(run_state, "edit_patch_failed", False):
@@ -663,26 +728,15 @@ def determine_allowed_tools(
             ) or default_tools
         return frozenset()
 
-    profile = (
-        retrieval_profile(manifest, task_text=task_text)
-        if manifest is not None
-        else None
-    )
-    has_wiring_gap = _has_wiring_gap(manifest, task_text=task_text)
-    grep_pending = (
-        grep_pending_caller_loads(manifest, grep_suggested_views)
-        if manifest is not None
-        else ()
-    )
-    has_grep_pending = bool(grep_pending)
+    # Scheme B: sufficient + no missing/stale => edit-only. wiring_gap and
+    # grep_pending stay on the STEP EVIDENCE card as soft hints only.
     edit_ready_closed = (
         sufficiency in {
             Sufficiency.SUFFICIENT_FOR_EDIT,
             Sufficiency.SUFFICIENT_FOR_VERIFY,
         }
         and not has_missing
-        and not has_wiring_gap
-        and not has_grep_pending
+        and not has_stale
         and not blocks_edit
         and _edit_allowed(
             task_mode=task_mode,
@@ -691,15 +745,7 @@ def determine_allowed_tools(
             metrics=metrics,
         )
     )
-    if (
-        edit_ready_closed
-        and not has_stale
-        and not has_grep_pending
-        and profile is not None
-        and not profile.needs_grep
-        and not profile.needs_view
-        and not profile.needs_heavy
-    ):
+    if edit_ready_closed:
         return edit_tools or default_tools
 
     retrieval = _retrieval_tools_from_profile(
@@ -709,14 +755,15 @@ def determine_allowed_tools(
         task_text=task_text,
     )
     if not blocks_edit and not has_missing:
+        # Only missing/stale reopen retrieval; wiring_gap is not a tool gate.
         retrieval = _apply_retrieval_saturation(
             retrieval or (PRIMARY_RETRIEVAL_TOOLS & default_tools),
             default_tools,
             manifest=manifest,
             no_gain_rounds=no_gain_rounds,
             view_last_round_all_duplicate=view_last_round_all_duplicate,
-            has_open_gaps=has_stale or has_wiring_gap,
-            wiring_gap_open=has_wiring_gap,
+            has_open_gaps=has_stale,
+            wiring_gap_open=False,
         )
 
     allowed = set(retrieval)

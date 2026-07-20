@@ -106,7 +106,7 @@ def test_reducer_tracks_consecutive_retrieval_rounds_without_new_observations() 
     assert state.retrieval_no_gain_rounds == 2
 
 
-def test_edit_applied_marks_cross_file_partner_files_stale() -> None:
+def test_edit_applied_marks_only_edited_file_stale() -> None:
     from src.agent.manifest import EvidenceItem, StepManifest
 
     manifest = StepManifest(
@@ -138,7 +138,7 @@ def test_edit_applied_marks_cross_file_partner_files_stale() -> None:
 
     statuses = {item.file: item.status for item in state.manifest.observed_items}
     assert statuses["list.py"] == "STALE"
-    assert statuses["main.py"] == "STALE"
+    assert statuses["main.py"] == "SATISFIED"
 
 
 def test_reducer_resets_rounds_since_last_edit_on_applied_edit() -> None:

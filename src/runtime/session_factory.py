@@ -89,6 +89,7 @@ def create_mitkii_session(
             model=model,
             request_timeout=float(settings.llm_request_timeout),
             stream_idle_timeout=float(settings.llm_stream_idle_timeout),
+            stream_reasoning_timeout=float(settings.llm_stream_reasoning_timeout),
             prompt_cache_enabled=settings.prompt_cache_enabled,
             prompt_cache_min_tokens=settings.prompt_cache_min_tokens,
             prompt_cache_ttl=cache_ttl,  # type: ignore[arg-type]

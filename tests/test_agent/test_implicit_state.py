@@ -418,7 +418,9 @@ async def test_decision_edit_preflight_validation() -> None:
     assert err is not None
     assert "Invalid decision_edit: missing required 'intent'" in err
 
-    # 2a. Read-only intent is forwarded to DecisionLLM (harness does not block).
+    # 2a. A whole-file read-only intent (no focus_symbols) is blocked: decision_edit
+    # is a patcher, not a file browser. The model must use view_symbol_code / LOADED
+    # CODE ANCHORS to read instead of dumping a whole file through decision_edit.
     err = await inspect_tool_request_async(
         "decision_edit",
         {
@@ -428,7 +430,8 @@ async def test_decision_edit_preflight_validation() -> None:
         },
         allowed_tools={"decision_edit", "view_symbol_code"},
     )
-    assert err is None
+    assert err is not None
+    assert "BLOCK: decision_edit is for applying patches" in err
 
     # 2b. An edit may mention inspection when it also specifies a mutation.
     err = await inspect_tool_request_async(
@@ -436,7 +439,8 @@ async def test_decision_edit_preflight_validation() -> None:
         {
             "target_file": "list.py",
             "intent": "Inspect the handler and add validation",
-            "context_window": [],
+            "focus_symbols": ["handler"],
+            "context_window": [{"file": "list.py", "span": [1, 20]}],
         },
         allowed_tools={"decision_edit"},
     )
